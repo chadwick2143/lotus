@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"github.com/filecoin-project/lotus/extern/sector-storage/storiface"
 	"image"
 	"image/color"
 	"image/png"
+	"io/ioutil"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"golang.org/x/xerrors"
@@ -38,6 +42,7 @@ var sectorsCmd = &cli.Command{
 		terminateSectorCmd,
 		terminateSectorPenaltyEstimationCmd,
 		visAllocatedSectorsCmd,
+		exportSectorPath,
 	},
 }
 
@@ -458,4 +463,140 @@ func rleToPng(rleBytes []byte) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+type SectorPath struct {
+	Sealed string
+	Cache  string
+}
+
+func (path SectorPath) String() string {
+	return fmt.Sprintf("{Sealed: %s, Cache: %s}", path.Sealed, path.Cache)
+}
+
+var exportSectorPath = &cli.Command{
+	Name:  "export-sector-path",
+	Usage: "",
+	Action: func(cctx *cli.Context) error {
+		nodeApi, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+
+		ctx := lcli.ReqContext(cctx)
+
+		api, acloser, err := lcli.GetStorageMinerAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer acloser()
+
+		maddr, err := api.ActorAddress(ctx)
+		if err != nil {
+			return err
+		}
+
+		mid, err := address.IDFromAddress(maddr)
+		if err != nil {
+			return err
+		}
+
+		ts, err := nodeApi.ChainHead(ctx)
+		if err != nil {
+			return err
+		}
+
+		sectors, err := nodeApi.StateMinerActiveSectors(ctx, maddr, ts.Key())
+		if err != nil {
+			return err
+		}
+
+		local, err := api.StorageLocal(ctx)
+		if err != nil {
+			return err
+		}
+
+		sectorPaths := map[abi.SectorNumber]*SectorPath{}
+		for _, sci := range sectors {
+			sid := abi.SectorID{
+				Miner:  abi.ActorID(mid),
+				Number: sci.SectorNumber,
+			}
+
+			sealed, err := api.StorageFindSector(ctx, sid, storiface.FTSealed, 0, false)
+			if err != nil {
+				return xerrors.Errorf("finding sealed: %w", err)
+			}
+
+			cache, err := api.StorageFindSector(ctx, sid, storiface.FTCache, 0, false)
+			if err != nil {
+				return xerrors.Errorf("finding cache: %w", err)
+			}
+
+			numSealed := len(sealed)
+			if numSealed == 0 {
+				fmt.Printf("No sealed paths found for sector %d, please check again.\n", sci.SectorNumber)
+			} else if numSealed > 1 {
+				fmt.Printf("More than one sealed paths found for sector %d, please check again.\n", sci.SectorNumber)
+			} else {
+				if localPath, exist := local[sealed[0].ID]; exist {
+					path, ok := sectorPaths[sci.SectorNumber]
+					if !ok {
+						path = &SectorPath{}
+						sectorPaths[sci.SectorNumber] = path
+					}
+
+					args := []string{localPath, "/sealed/s-t", maddr.String()[1:], fmt.Sprintf("-%d", sci.SectorNumber)}
+					path.Sealed = strings.Join(args, "")
+				}
+			}
+
+			numCache := len(cache)
+			if numCache == 0 {
+				fmt.Printf("No cache paths found for sector %d, please check again.\n", sci.SectorNumber)
+			} else if numCache > 1 {
+				fmt.Printf("More than one cache paths found for sector %d, please check again.\n", sci.SectorNumber)
+			} else {
+				if localPath, exist := local[cache[0].ID]; exist {
+					path, ok := sectorPaths[sci.SectorNumber]
+					if !ok {
+						path = &SectorPath{}
+						sectorPaths[sci.SectorNumber] = path
+					}
+
+					args := []string{localPath, "/cache/s-t", maddr.String()[1:], fmt.Sprintf("-%d", sci.SectorNumber)}
+					path.Cache = strings.Join(args, "")
+				}
+			}
+		}
+
+		//fmt.Printf("%+v", sectorPaths)
+		for key, val := range sectorPaths {
+			if val.Sealed == "" {
+				fmt.Printf("Sealed path for sector %d not found, please check again.\n", key)
+			} else if _, err := os.Stat(val.Sealed); os.IsNotExist(err) {
+				fmt.Printf("Sealed path for sector %d: %s found but not exist, please check again.\n", key, val.Sealed)
+			}
+
+			if val.Cache == "" {
+				fmt.Printf("Cache path for sector %d not found, please check again.\n", key)
+			} else if _, err := os.Stat(val.Cache); os.IsNotExist(err) {
+				fmt.Printf("Cache path for sector %d: %s found but not exist, please check again.\n", key, val.Cache)
+			}
+		}
+
+		b, err := json.MarshalIndent(sectorPaths, "", "  ")
+		if err != nil {
+			fmt.Println(fmt.Errorf("marshaling sector paths error: %w", err))
+			return err
+		}
+
+		if err := ioutil.WriteFile("sectorpaths.json", b, 0666); err != nil {
+			fmt.Println(fmt.Errorf("save sectorPaths to sectorpaths.json error: %w", err))
+			return err
+		}
+
+		return nil
+	},
 }

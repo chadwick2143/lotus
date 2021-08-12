@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/fatih/color"
 	"github.com/urfave/cli/v2"
@@ -32,6 +33,7 @@ var actorCmd = &cli.Command{
 		actorControl,
 		actorProposeChangeWorker,
 		actorConfirmChangeWorker,
+		actorCheckMinerSectors,
 	},
 }
 
@@ -733,6 +735,114 @@ var actorConfirmChangeWorker = &cli.Command{
 		}
 		if mi.Worker != newAddr {
 			return fmt.Errorf("Confirmed worker address change not reflected on chain: expected '%s', found '%s'", newAddr, mi.Worker)
+		}
+
+		return nil
+	},
+}
+
+var actorCheckMinerSectors = &cli.Command{
+	Name:  "check-miner-sectors",
+	Usage: "",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "actor",
+			Usage: "specify the address of miner actor",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		var maddr address.Address
+		if act := cctx.String("actor"); act != "" {
+			var err error
+			maddr, err = address.NewFromString(act)
+			if err != nil {
+				return fmt.Errorf("parsing address %s: %w", act, err)
+			}
+		}
+
+		nodeApi, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+
+		ctx := lcli.ReqContext(cctx)
+
+		if maddr.Empty() {
+			api, acloser, err := lcli.GetStorageMinerAPI(cctx)
+			if err != nil {
+				return err
+			}
+			defer acloser()
+
+			maddr, err = api.ActorAddress(ctx)
+			if err != nil {
+				return err
+			}
+		}
+
+		dlSectors := make([]uint64, 0)
+		for dlIdx := 0; dlIdx < 48; dlIdx++ {
+			partitions, err := nodeApi.StateMinerPartitions(ctx, maddr, uint64(dlIdx), types.EmptyTSK)
+			if err != nil {
+				return xerrors.Errorf("getting partitions for deadline %d: %w", dlIdx, err)
+			}
+
+			for _, partition := range partitions {
+				sectorCount, err := partition.AllSectors.Count()
+				if err != nil {
+					return err
+				}
+
+				sector, err := partition.AllSectors.All(sectorCount)
+				if err != nil {
+					return err
+				}
+
+				dlSectors = append(dlSectors, sector...)
+			}
+		}
+
+		sectorsInfo, err := nodeApi.StateMinerSectors(ctx, maddr, nil, types.EmptyTSK)
+		if err != nil {
+			return err
+		}
+
+		stSectors := make([]uint64, 0)
+		for _, s := range sectorsInfo {
+			stSectors = append(stSectors, uint64(s.SectorNumber))
+		}
+
+		sort.Slice(dlSectors, func(i, j int) bool {
+			return dlSectors[i] < dlSectors[j]
+		})
+		//fmt.Printf("dlSectors for %s: \n", maddr)
+		//fmt.Println(dlSectors)
+		//fmt.Println()
+
+		sort.Slice(stSectors, func(i, j int) bool {
+			return stSectors[i] < stSectors[j]
+		})
+		//fmt.Printf("stSectors for %s: \n", maddr)
+		//fmt.Println(stSectors)
+		//fmt.Println()
+
+		equal := true
+		if len(dlSectors) != len(stSectors) {
+			equal = false
+		} else {
+			for i, val := range dlSectors {
+				if val != stSectors[i] {
+					equal = false
+					break
+				}
+			}
+		}
+
+		if equal {
+			fmt.Println("dlSectors equal to stSectors")
+		} else {
+			fmt.Println("dlSectors not equal to stSectors")
 		}
 
 		return nil
