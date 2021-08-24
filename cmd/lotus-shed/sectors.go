@@ -537,8 +537,6 @@ var exportSectorPath = &cli.Command{
 			numSealed := len(sealed)
 			if numSealed == 0 {
 				fmt.Printf("No sealed paths found for sector %d, please check again.\n", sci.SectorNumber)
-			} else if numSealed > 1 {
-				fmt.Printf("More than one sealed paths found for sector %d, please check again.\n", sci.SectorNumber)
 			} else {
 				if localPath, exist := local[sealed[0].ID]; exist {
 					path, ok := sectorPaths[sci.SectorNumber]
@@ -555,8 +553,6 @@ var exportSectorPath = &cli.Command{
 			numCache := len(cache)
 			if numCache == 0 {
 				fmt.Printf("No cache paths found for sector %d, please check again.\n", sci.SectorNumber)
-			} else if numCache > 1 {
-				fmt.Printf("More than one cache paths found for sector %d, please check again.\n", sci.SectorNumber)
 			} else {
 				if localPath, exist := local[cache[0].ID]; exist {
 					path, ok := sectorPaths[sci.SectorNumber]
