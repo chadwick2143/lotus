@@ -21,6 +21,7 @@ import (
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
+	"github.com/filecoin-project/lotus/chain/gen"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
 	"github.com/filecoin-project/lotus/lib/tablewriter"
@@ -35,6 +36,7 @@ var actorCmd = &cli.Command{
 		actorControl,
 		actorProposeChangeWorker,
 		actorConfirmChangeWorker,
+		actorIsWinner,
 	},
 }
 
@@ -770,6 +772,114 @@ var actorConfirmChangeWorker = &cli.Command{
 		}
 		if mi.Worker != newAddr {
 			return fmt.Errorf("Confirmed worker address change not reflected on chain: expected '%s', found '%s'", newAddr, mi.Worker)
+		}
+
+		return nil
+	},
+}
+
+var actorIsWinner = &cli.Command{
+	Name:  "iswinner",
+	Usage: "Check if a miner is round winner at a epoch",
+	//ArgsUsage: "[address]",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "actor",
+			Usage: "specify the address of miner actor",
+		},
+		&cli.Uint64Flag{
+			Name:  "epoch",
+			Usage: "specify the epoch to check",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		var maddr address.Address
+		if act := cctx.String("actor"); act != "" {
+			var err error
+			maddr, err = address.NewFromString(act)
+			if err != nil {
+				fmt.Printf("parsing address %s error\n", act)
+				return fmt.Errorf("parsing address %s: %w", act, err)
+			}
+		}
+
+		nodeAPI, acloser, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			fmt.Printf("get fullnode api error\n")
+			return err
+		}
+		defer acloser()
+
+		ctx := lcli.ReqContext(cctx)
+
+		var round abi.ChainEpoch
+		if cctx.IsSet("epoch") {
+			round = abi.ChainEpoch(cctx.Uint64("epoch"))
+		} else {
+			head, err := nodeAPI.ChainHead(ctx)
+			if err != nil {
+				fmt.Printf("get chain head error\n")
+				return err
+			}
+
+			round = head.Height()
+		}
+
+		if maddr.Empty() {
+			minerAPI, closer, err := lcli.GetStorageMinerAPI(cctx)
+			if err != nil {
+				fmt.Printf("get miner api error\n")
+				return err
+			}
+			defer closer()
+
+			maddr, err = minerAPI.ActorAddress(ctx)
+			if err != nil {
+				fmt.Printf("get actor address error\n")
+				return err
+			}
+		}
+
+		ts, err := nodeAPI.ChainGetTipSetByHeight(ctx, round, types.EmptyTSK)
+		if err != nil {
+			fmt.Printf("chain get tipset by height error\n")
+			return err
+		}
+
+		mbi, err := nodeAPI.MinerGetBaseInfo(ctx, maddr, round, ts.Key())
+		if err != nil {
+			err = xerrors.Errorf("failed to get mining base info: %w", err)
+			fmt.Printf("failed to get mining base info\n")
+			return err
+		}
+		if mbi == nil {
+			fmt.Printf("mining base info is nil\n")
+			return nil
+		}
+
+		if !mbi.EligibleForMining {
+			// slashed or just have no power yet
+			fmt.Printf("miner %s is not EligibleForMining\n", maddr)
+			return nil
+		}
+
+		bvals := mbi.BeaconEntries
+		rbase := mbi.PrevBeaconEntry
+		if len(bvals) > 0 {
+			rbase = bvals[len(bvals)-1]
+		}
+
+		winner, err := gen.IsRoundWinner(ctx, nil, round, maddr, rbase, mbi, nodeAPI)
+		if err != nil {
+			err = xerrors.Errorf("failed to check if %s win at round %d: %w", maddr, round, err)
+			fmt.Printf("failed to check if %s win at round %d: %s\n", maddr, round, err)
+			return nil
+		}
+
+		if winner != nil {
+			fmt.Printf("miner %s is winner at round %d\n", maddr, round)
+		} else {
+			fmt.Printf("miner %s isn't winner at round %d\n", maddr, round)
 		}
 
 		return nil
