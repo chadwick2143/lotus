@@ -9,6 +9,15 @@ import (
 	reflect "reflect"
 	time "time"
 
+	gomock "github.com/golang/mock/gomock"
+	uuid "github.com/google/uuid"
+	blocks "github.com/ipfs/go-block-format"
+	cid "github.com/ipfs/go-cid"
+	metrics "github.com/libp2p/go-libp2p-core/metrics"
+	network0 "github.com/libp2p/go-libp2p-core/network"
+	peer "github.com/libp2p/go-libp2p-core/peer"
+	protocol "github.com/libp2p/go-libp2p-core/protocol"
+
 	address "github.com/filecoin-project/go-address"
 	bitfield "github.com/filecoin-project/go-bitfield"
 	datatransfer "github.com/filecoin-project/go-data-transfer"
@@ -22,6 +31,7 @@ import (
 	crypto "github.com/filecoin-project/go-state-types/crypto"
 	dline "github.com/filecoin-project/go-state-types/dline"
 	network "github.com/filecoin-project/go-state-types/network"
+
 	api "github.com/filecoin-project/lotus/api"
 	apitypes "github.com/filecoin-project/lotus/api/types"
 	v0api "github.com/filecoin-project/lotus/api/v0api"
@@ -31,14 +41,6 @@ import (
 	marketevents "github.com/filecoin-project/lotus/markets/loggers"
 	dtypes "github.com/filecoin-project/lotus/node/modules/dtypes"
 	imports "github.com/filecoin-project/lotus/node/repo/imports"
-	gomock "github.com/golang/mock/gomock"
-	uuid "github.com/google/uuid"
-	blocks "github.com/ipfs/go-block-format"
-	cid "github.com/ipfs/go-cid"
-	metrics "github.com/libp2p/go-libp2p-core/metrics"
-	network0 "github.com/libp2p/go-libp2p-core/network"
-	peer "github.com/libp2p/go-libp2p-core/peer"
-	protocol "github.com/libp2p/go-libp2p-core/protocol"
 )
 
 // MockFullNode is a mock of FullNode interface.
@@ -2168,6 +2170,21 @@ func (m *MockFullNode) StateAccountKey(arg0 context.Context, arg1 address.Addres
 func (mr *MockFullNodeMockRecorder) StateAccountKey(arg0, arg1, arg2 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateAccountKey", reflect.TypeOf((*MockFullNode)(nil).StateAccountKey), arg0, arg1, arg2)
+}
+
+// StateActorCodeCIDs mocks base method.
+func (m *MockFullNode) StateActorCodeCIDs(arg0 context.Context, arg1 network.Version) (map[string]cid.Cid, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "StateActorCodeCIDs", arg0, arg1)
+	ret0, _ := ret[0].(map[string]cid.Cid)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StateActorCodeCIDs indicates an expected call of StateActorCodeCIDs.
+func (mr *MockFullNodeMockRecorder) StateActorCodeCIDs(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateActorCodeCIDs", reflect.TypeOf((*MockFullNode)(nil).StateActorCodeCIDs), arg0, arg1)
 }
 
 // StateAllMinerFaults mocks base method.

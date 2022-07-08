@@ -13,13 +13,12 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/fatih/color"
-	"github.com/urfave/cli/v2"
-	"golang.org/x/xerrors"
-
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
-	protocol "github.com/libp2p/go-libp2p-core/protocol"
+	"github.com/libp2p/go-libp2p-core/protocol"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/urfave/cli/v2"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 
@@ -35,6 +34,7 @@ var NetCmd = &cli.Command{
 		NetPeers,
 		NetPing,
 		NetConnect,
+		NetDisconnect,
 		NetListen,
 		NetId,
 		NetFindPeer,
@@ -257,6 +257,37 @@ var NetListen = &cli.Command{
 
 		for _, peer := range addrs.Addrs {
 			fmt.Printf("%s/p2p/%s\n", peer, addrs.ID)
+		}
+		return nil
+	},
+}
+
+var NetDisconnect = &cli.Command{
+	Name:      "disconnect",
+	Usage:     "Disconnect from a peer",
+	ArgsUsage: "[peerID]",
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		ctx := ReqContext(cctx)
+
+		ids := cctx.Args().Slice()
+		for _, id := range ids {
+			pid, err := peer.Decode(id)
+			if err != nil {
+				fmt.Println("failure")
+				return err
+			}
+			fmt.Printf("disconnect %s: ", pid.Pretty())
+			err = api.NetDisconnect(ctx, pid)
+			if err != nil {
+				fmt.Println("failure")
+				return err
+			}
+			fmt.Println("success")
 		}
 		return nil
 	},

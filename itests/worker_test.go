@@ -7,24 +7,23 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/xerrors"
-
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/lotus/extern/sector-storage/sealtasks"
-	"github.com/filecoin-project/lotus/extern/sector-storage/stores"
-	"github.com/filecoin-project/lotus/extern/sector-storage/storiface"
 	"github.com/filecoin-project/lotus/itests/kit"
 	"github.com/filecoin-project/lotus/node"
 	"github.com/filecoin-project/lotus/node/impl"
 	"github.com/filecoin-project/lotus/node/repo"
-	"github.com/filecoin-project/lotus/storage"
-	storage2 "github.com/filecoin-project/specs-storage/storage"
+	"github.com/filecoin-project/lotus/storage/paths"
+	"github.com/filecoin-project/lotus/storage/sealer/sealtasks"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
+	"github.com/filecoin-project/lotus/storage/wdpost"
 )
 
 func TestWorkerPledge(t *testing.T) {
@@ -145,7 +144,7 @@ func TestWindowPostWorker(t *testing.T) {
 	di = di.NextNotElapsed()
 
 	t.Log("Running one proving period")
-	waitUntil := di.Open + di.WPoStChallengeWindow*2 + storage.SubmitConfidence
+	waitUntil := di.Open + di.WPoStChallengeWindow*2 + wdpost.SubmitConfidence
 	client.WaitTillChain(ctx, kit.HeightAtLeast(waitUntil))
 
 	t.Log("Waiting for post message")
@@ -206,7 +205,7 @@ func TestWindowPostWorker(t *testing.T) {
 
 		t.Logf("Drop sector %d; dl %d part %d", sid, di.Index+1, 0)
 
-		err = miner.BaseAPI.(*impl.StorageMinerAPI).IStorageMgr.Remove(ctx, storage2.SectorRef{
+		err = miner.BaseAPI.(*impl.StorageMinerAPI).IStorageMgr.Remove(ctx, storiface.SectorRef{
 			ID: abi.SectorID{
 				Miner:  abi.ActorID(mid),
 				Number: abi.SectorNumber(sid),
@@ -227,7 +226,7 @@ func TestWindowPostWorker(t *testing.T) {
 }
 
 type badWorkerStorage struct {
-	stores.Store
+	paths.Store
 
 	badsector   *uint64
 	notBadCount int
@@ -258,14 +257,14 @@ func TestWindowPostWorkerSkipBadSector(t *testing.T) {
 		kit.LatestActorsAt(-1),
 		kit.ThroughRPC(),
 		kit.WithTaskTypes([]sealtasks.TaskType{sealtasks.TTGenerateWindowPoSt}),
-		kit.WithWorkerStorage(func(store stores.Store) stores.Store {
+		kit.WithWorkerStorage(func(store paths.Store) paths.Store {
 			return &badWorkerStorage{
 				Store:     store,
 				badsector: &badsector,
 			}
 		}),
 		kit.ConstructorOpts(node.ApplyIf(node.IsType(repo.StorageMiner),
-			node.Override(new(stores.Store), func(store *stores.Remote) stores.Store {
+			node.Override(new(paths.Store), func(store *paths.Remote) paths.Store {
 				return &badWorkerStorage{
 					Store:       store,
 					badsector:   &badsector,
@@ -284,7 +283,7 @@ func TestWindowPostWorkerSkipBadSector(t *testing.T) {
 	di = di.NextNotElapsed()
 
 	t.Log("Running one proving period")
-	waitUntil := di.Open + di.WPoStChallengeWindow*2 + storage.SubmitConfidence
+	waitUntil := di.Open + di.WPoStChallengeWindow*2 + wdpost.SubmitConfidence
 	client.WaitTillChain(ctx, kit.HeightAtLeast(waitUntil))
 
 	t.Log("Waiting for post message")
