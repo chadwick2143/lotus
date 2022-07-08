@@ -1237,15 +1237,15 @@ var sectorsExtendCmd = &cli.Command{
 					}
 
 					// Set the new expiration to 48 hours less than the theoretical maximum lifetime
-					newExp = ml - (miner5.WPoStProvingPeriod * 2) + si.Activation
+					newExp = ml - (miner.WPoStProvingPeriod * 2) + si.Activation
 				} else { // for all-sectors
 					if si.SealProof < abi.RegisteredSealProof_StackedDrg2KiBV1_1 {
 						continue
 					}
 
 					newExp = abi.ChainEpoch(cctx.Int64("new-expiration"))
-					if newExp > (ml - (miner5.WPoStProvingPeriod * 2) + si.Activation) {
-						newExp = ml - (miner5.WPoStProvingPeriod * 2) + si.Activation
+					if newExp > (ml - (miner.WPoStProvingPeriod * 2) + si.Activation) {
+						newExp = ml - (miner.WPoStProvingPeriod * 2) + si.Activation
 					}
 				}
 
