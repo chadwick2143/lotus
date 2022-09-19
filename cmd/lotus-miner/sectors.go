@@ -1361,6 +1361,7 @@ var sectorsExtendCmd = &cli.Command{
 			return nil
 		}
 
+		fmt.Printf("will send %d message to extend all sectors\n", len(params))
 		mi, err := nodeAPI.StateMinerInfo(ctx, maddr, types.EmptyTSK)
 		if err != nil {
 			return xerrors.Errorf("getting miner info: %w", err)
@@ -1404,7 +1405,7 @@ var sectorsExtendCmd = &cli.Command{
 				return xerrors.Errorf("mpool push message: %w", err)
 			}
 
-			fmt.Println(smsg.Cid())
+			fmt.Printf("%d/%d\t\t%s\n", i+1, len(params), smsg.Cid())
 
 			// wait for it to get mined into a block
 			wait, err := nodeAPI.StateWaitMsg(ctx, smsg.Cid(), build.MessageConfidence)
