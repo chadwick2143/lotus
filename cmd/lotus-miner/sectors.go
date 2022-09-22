@@ -1283,21 +1283,40 @@ var sectorsExtendCmd = &cli.Command{
 				}
 			}
 
+			addressedMax, err := policy.GetAddressedSectorsMax(nv)
+			if err != nil {
+				return xerrors.Errorf("failed to get addressed sectors max")
+			}
+			addressedMax = int(float64(addressedMax) * cctx.Float64("sectors-discount"))
+
+			declMax, err := policy.GetDeclarationsMax(nv)
+			if err != nil {
+				return xerrors.Errorf("failed to get declarations max")
+			}
+
 			p := miner.ExtendSectorExpirationParams{}
 			scount := 0
 
 			for l, exts := range extensions {
 				for newExp, numbers := range exts {
+					for len(numbers) > addressedMax {
+						sectors := numbers[:addressedMax]
+						numbers = numbers[addressedMax:]
+
+						params = append(params, miner.ExtendSectorExpirationParams{
+							Extensions: []miner.ExpirationExtension{
+								{
+									Deadline:      l.Deadline,
+									Partition:     l.Partition,
+									Sectors:       bitfield.NewFromSet(sectors),
+									NewExpiration: newExp,
+								},
+							},
+						})
+					}
+
 					scount += len(numbers)
-					addressedMax, err := policy.GetAddressedSectorsMax(nv)
-					if err != nil {
-						return xerrors.Errorf("failed to get addressed sectors max")
-					}
-					declMax, err := policy.GetDeclarationsMax(nv)
-					if err != nil {
-						return xerrors.Errorf("failed to get declarations max")
-					}
-					if scount > int(float64(addressedMax)*cctx.Float64("sectors-discount")) || len(p.Extensions) == declMax {
+					if scount > addressedMax || len(p.Extensions) == declMax {
 						params = append(params, p)
 						p = miner.ExtendSectorExpirationParams{}
 						scount = len(numbers)
