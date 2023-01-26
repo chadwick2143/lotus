@@ -12,13 +12,14 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-bitfield"
 	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/go-state-types/builtin/v8/miner"
+	"github.com/filecoin-project/go-state-types/builtin/v9/miner"
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/dline"
 	"github.com/filecoin-project/go-state-types/network"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
+	lminer "github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/journal"
@@ -44,6 +45,7 @@ type NodeAPI interface {
 	StateMinerPartitions(context.Context, address.Address, uint64, types.TipSetKey) ([]api.Partition, error)
 	StateLookupID(context.Context, address.Address, types.TipSetKey) (address.Address, error)
 	StateAccountKey(context.Context, address.Address, types.TipSetKey) (address.Address, error)
+	StateSectorPartition(ctx context.Context, maddr address.Address, sectorNumber abi.SectorNumber, tok types.TipSetKey) (*lminer.SectorLocation, error)
 
 	MpoolPushMessage(context.Context, *types.Message, *api.MessageSendSpec) (*types.SignedMessage, error)
 
@@ -62,18 +64,19 @@ type NodeAPI interface {
 // WindowPoStScheduler watches the chain though the changeHandler, which in turn
 // turn calls the scheduler when the time arrives to do work.
 type WindowPoStScheduler struct {
-	api                             NodeAPI
-	feeCfg                          config.MinerFeeConfig
-	addrSel                         *ctladdr.AddressSelector
-	prover                          storiface.ProverPoSt
-	verifier                        storiface.Verifier
-	faultTracker                    sealer.FaultTracker
-	proofType                       abi.RegisteredPoStProof
-	partitionSectors                uint64
-	disablePreChecks                bool
-	maxPartitionsPerPostMessage     int
-	maxPartitionsPerRecoveryMessage int
-	ch                              *changeHandler
+	api                                     NodeAPI
+	feeCfg                                  config.MinerFeeConfig
+	addrSel                                 *ctladdr.AddressSelector
+	prover                                  storiface.ProverPoSt
+	verifier                                storiface.Verifier
+	faultTracker                            sealer.FaultTracker
+	proofType                               abi.RegisteredPoStProof
+	partitionSectors                        uint64
+	disablePreChecks                        bool
+	maxPartitionsPerPostMessage             int
+	maxPartitionsPerRecoveryMessage         int
+	singleRecoveringPartitionPerPostMessage bool
+	ch                                      *changeHandler
 
 	actor address.Address
 
@@ -100,19 +103,19 @@ func NewWindowedPoStScheduler(api NodeAPI,
 	}
 
 	return &WindowPoStScheduler{
-		api:                             api,
-		feeCfg:                          cfg,
-		addrSel:                         as,
-		prover:                          sp,
-		verifier:                        verif,
-		faultTracker:                    ft,
-		proofType:                       mi.WindowPoStProofType,
-		partitionSectors:                mi.WindowPoStPartitionSectors,
-		disablePreChecks:                pcfg.DisableWDPoStPreChecks,
-		maxPartitionsPerPostMessage:     pcfg.MaxPartitionsPerPoStMessage,
-		maxPartitionsPerRecoveryMessage: pcfg.MaxPartitionsPerRecoveryMessage,
-
-		actor: actor,
+		api:                                     api,
+		feeCfg:                                  cfg,
+		addrSel:                                 as,
+		prover:                                  sp,
+		verifier:                                verif,
+		faultTracker:                            ft,
+		proofType:                               mi.WindowPoStProofType,
+		partitionSectors:                        mi.WindowPoStPartitionSectors,
+		disablePreChecks:                        pcfg.DisableWDPoStPreChecks,
+		maxPartitionsPerPostMessage:             pcfg.MaxPartitionsPerPoStMessage,
+		maxPartitionsPerRecoveryMessage:         pcfg.MaxPartitionsPerRecoveryMessage,
+		singleRecoveringPartitionPerPostMessage: pcfg.SingleRecoveringPartitionPerPostMessage,
+		actor:                                   actor,
 		evtTypes: [...]journal.EventType{
 			evtTypeWdPoStScheduler:  j.RegisterEventType("wdpost", "scheduler"),
 			evtTypeWdPoStProofs:     j.RegisterEventType("wdpost", "proofs_processed"),

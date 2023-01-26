@@ -25,6 +25,7 @@ func (s *SplitStore) Check() error {
 	if !atomic.CompareAndSwapInt32(&s.compacting, 0, 1) {
 		return xerrors.Errorf("can't acquire compaction lock; compacting operation in progress")
 	}
+	s.compactType = check
 
 	if s.compactionIndex == 0 {
 		atomic.StoreInt32(&s.compacting, 0)
@@ -124,7 +125,7 @@ func (s *SplitStore) doCheck(curTs *types.TipSet) error {
 			}
 
 			return nil
-		})
+		}, func(cid.Cid) error { return nil })
 
 	if err != nil {
 		err = xerrors.Errorf("error walking chain: %w", err)
@@ -146,6 +147,8 @@ func (s *SplitStore) Info() map[string]interface{} {
 	info["base epoch"] = s.baseEpoch
 	info["warmup epoch"] = s.warmupEpoch
 	info["compactions"] = s.compactionIndex
+	info["prunes"] = s.pruneIndex
+	info["compacting"] = s.compacting == 1
 
 	sizer, ok := s.hot.(bstore.BlockstoreSize)
 	if ok {

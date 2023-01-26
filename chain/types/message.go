@@ -159,8 +159,16 @@ func (m *Message) ValidForBlockInclusion(minGas int64, version network.Version) 
 		return xerrors.New("invalid 'To' address")
 	}
 
+	if !abi.AddressValidForNetworkVersion(m.To, version) {
+		return xerrors.New("'To' address protocol unsupported for network version")
+	}
+
 	if m.From == address.Undef {
 		return xerrors.New("'From' address cannot be empty")
+	}
+
+	if !abi.AddressValidForNetworkVersion(m.From, version) {
+		return xerrors.New("'From' address protocol unsupported for network version")
 	}
 
 	if m.Value.Int == nil {
@@ -196,7 +204,7 @@ func (m *Message) ValidForBlockInclusion(minGas int64, version network.Version) 
 	}
 
 	if m.GasLimit > build.BlockGasLimit {
-		return xerrors.New("'GasLimit' field cannot be greater than a block's gas limit")
+		return xerrors.Errorf("'GasLimit' field cannot be greater than a block's gas limit (%d > %d)", m.GasLimit, build.BlockGasLimit)
 	}
 
 	// since prices might vary with time, this is technically semantic validation

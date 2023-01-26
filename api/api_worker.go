@@ -49,6 +49,7 @@ type Worker interface {
 	MoveStorage(ctx context.Context, sector storiface.SectorRef, types storiface.SectorFileType) (storiface.CallID, error)                                                                                   //perm:admin
 	UnsealPiece(context.Context, storiface.SectorRef, storiface.UnpaddedByteIndex, abi.UnpaddedPieceSize, abi.SealRandomness, cid.Cid) (storiface.CallID, error)                                             //perm:admin
 	Fetch(context.Context, storiface.SectorRef, storiface.SectorFileType, storiface.PathType, storiface.AcquireMode) (storiface.CallID, error)                                                               //perm:admin
+	DownloadSectorData(ctx context.Context, sector storiface.SectorRef, finalized bool, src map[storiface.SectorFileType]storiface.SectorLocation) (storiface.CallID, error)                                 //perm:admin
 
 	GenerateWinningPoSt(ctx context.Context, ppt abi.RegisteredPoStProof, mid abi.ActorID, sectors []storiface.PostSectorChallenge, randomness abi.PoStRandomness) ([]proof.PoStProof, error)                           //perm:admin
 	GenerateWindowPoSt(ctx context.Context, ppt abi.RegisteredPoStProof, mid abi.ActorID, sectors []storiface.PostSectorChallenge, partitionIdx int, randomness abi.PoStRandomness) (storiface.WindowPoStResult, error) //perm:admin
@@ -59,7 +60,11 @@ type Worker interface {
 	// Storage / Other
 	Remove(ctx context.Context, sector abi.SectorID) error //perm:admin
 
-	StorageAddLocal(ctx context.Context, path string) error //perm:admin
+	StorageLocal(ctx context.Context) (map[storiface.ID]string, error)                   //perm:admin
+	StorageAddLocal(ctx context.Context, path string) error                              //perm:admin
+	StorageDetachLocal(ctx context.Context, path string) error                           //perm:admin
+	StorageDetachAll(ctx context.Context) error                                          //perm:admin
+	StorageRedeclareLocal(ctx context.Context, id *storiface.ID, dropMissing bool) error //perm:admin
 
 	// SetEnabled marks the worker as enabled/disabled. Not that this setting
 	// may take a few seconds to propagate to task scheduler
@@ -76,6 +81,10 @@ type Worker interface {
 
 	// Like ProcessSession, but returns an error when worker is disabled
 	Session(context.Context) (uuid.UUID, error) //perm:admin
+
+	// Trigger shutdown
+	Shutdown(context.Context) error //perm:admin
+
 }
 
 var _ storiface.WorkerCalls = *new(Worker)

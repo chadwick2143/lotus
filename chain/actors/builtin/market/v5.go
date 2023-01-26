@@ -9,6 +9,7 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	verifregtypes "github.com/filecoin-project/go-state-types/builtin/v9/verifreg"
 	market5 "github.com/filecoin-project/specs-actors/v5/actors/builtin/market"
 	adt5 "github.com/filecoin-project/specs-actors/v5/actors/util/adt"
 
@@ -178,7 +179,14 @@ func (s *dealStates5) array() adt.Array {
 }
 
 func fromV5DealState(v5 market5.DealState) DealState {
-	return (DealState)(v5)
+
+	return DealState{
+		SectorStartEpoch: v5.SectorStartEpoch,
+		LastUpdatedEpoch: v5.LastUpdatedEpoch,
+		SlashEpoch:       v5.SlashEpoch,
+		VerifiedClaim:    0,
+	}
+
 }
 
 type dealProposals5 struct {
@@ -236,6 +244,7 @@ func (s *dealProposals5) array() adt.Array {
 func fromV5DealProposal(v5 market5.DealProposal) (DealProposal, error) {
 
 	label, err := labelFromGoString(v5.Label)
+
 	if err != nil {
 		return DealProposal{}, xerrors.Errorf("error setting deal label: %w", err)
 	}
@@ -286,4 +295,10 @@ func (r *publishStorageDealsReturn5) IsDealValid(index uint64) (bool, int, error
 
 func (r *publishStorageDealsReturn5) DealIDs() ([]abi.DealID, error) {
 	return r.IDs, nil
+}
+
+func (s *state5) GetAllocationIdForPendingDeal(dealId abi.DealID) (verifregtypes.AllocationId, error) {
+
+	return verifregtypes.NoAllocationID, xerrors.Errorf("unsupported before actors v9")
+
 }

@@ -7,16 +7,19 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-bitfield"
 	datatransfer "github.com/filecoin-project/go-data-transfer"
 	"github.com/filecoin-project/go-fil-markets/piecestore"
 	"github.com/filecoin-project/go-fil-markets/retrievalmarket"
 	"github.com/filecoin-project/go-fil-markets/storagemarket"
+	"github.com/filecoin-project/go-jsonrpc/auth"
 	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/go-state-types/builtin/v8/market"
-	"github.com/filecoin-project/go-state-types/builtin/v8/miner"
+	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/builtin/v9/market"
+	"github.com/filecoin-project/go-state-types/builtin/v9/miner"
 	abinetwork "github.com/filecoin-project/go-state-types/network"
 
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
@@ -46,6 +49,16 @@ type StorageMiner interface {
 
 	ActorSectorSize(context.Context, address.Address) (abi.SectorSize, error) //perm:read
 	ActorAddressConfig(ctx context.Context) (AddressConfig, error)            //perm:read
+
+	// WithdrawBalance allows to withdraw balance from miner actor to owner address
+	// Specify amount as "0" to withdraw full balance. This method returns a message CID
+	// and does not wait for message execution
+	ActorWithdrawBalance(ctx context.Context, amount abi.TokenAmount) (cid.Cid, error) //perm:admin
+
+	// BeneficiaryWithdrawBalance allows the beneficiary of a miner to withdraw balance from miner actor
+	// Specify amount as "0" to withdraw full balance. This method returns a message CID
+	// and does not wait for message execution
+	BeneficiaryWithdrawBalance(context.Context, abi.TokenAmount) (cid.Cid, error) //perm:admin
 
 	MiningBase(context.Context) (*types.TipSet, error) //perm:read
 
@@ -117,6 +130,23 @@ type StorageMiner interface {
 	// SectorAbortUpgrade can be called on sectors that are in the process of being upgraded to abort it
 	SectorAbortUpgrade(context.Context, abi.SectorNumber) error //perm:admin
 
+	// SectorNumAssignerMeta returns sector number assigner metadata - reserved/allocated
+	SectorNumAssignerMeta(ctx context.Context) (NumAssignerMeta, error) //perm:read
+	// SectorNumReservations returns a list of sector number reservations
+	SectorNumReservations(ctx context.Context) (map[string]bitfield.BitField, error) //perm:read
+	// SectorNumReserve creates a new sector number reservation. Will fail if any other reservation has colliding
+	// numbers or name. Set force to true to override safety checks.
+	// Valid characters for name: a-z, A-Z, 0-9, _, -
+	SectorNumReserve(ctx context.Context, name string, sectors bitfield.BitField, force bool) error //perm:admin
+	// SectorNumReserveCount creates a new sector number reservation for `count` sector numbers.
+	// by default lotus will allocate lowest-available sector numbers to the reservation.
+	// For restrictions on `name` see SectorNumReserve
+	SectorNumReserveCount(ctx context.Context, name string, count uint64) (bitfield.BitField, error) //perm:admin
+	// SectorNumFree drops a sector reservation
+	SectorNumFree(ctx context.Context, name string) error //perm:admin
+
+	SectorReceive(ctx context.Context, meta RemoteSectorMeta) error //perm:admin
+
 	// WorkerConnect tells the node to connect to workers RPC
 	WorkerConnect(context.Context, string) error                              //perm:admin retry:true
 	WorkerStats(context.Context) (map[uuid.UUID]storiface.WorkerStats, error) //perm:admin
@@ -139,27 +169,48 @@ type StorageMiner interface {
 	ReturnMoveStorage(ctx context.Context, callID storiface.CallID, err *storiface.CallError) error                                                       //perm:admin retry:true
 	ReturnUnsealPiece(ctx context.Context, callID storiface.CallID, err *storiface.CallError) error                                                       //perm:admin retry:true
 	ReturnReadPiece(ctx context.Context, callID storiface.CallID, ok bool, err *storiface.CallError) error                                                //perm:admin retry:true
+	ReturnDownloadSector(ctx context.Context, callID storiface.CallID, err *storiface.CallError) error                                                    //perm:admin retry:true
 	ReturnFetch(ctx context.Context, callID storiface.CallID, err *storiface.CallError) error                                                             //perm:admin retry:true
 
 	// SealingSchedDiag dumps internal sealing scheduler state
 	SealingSchedDiag(ctx context.Context, doSched bool) (interface{}, error) //perm:admin
 	SealingAbort(ctx context.Context, call storiface.CallID) error           //perm:admin
+	//SealingSchedRemove removes a request from sealing pipeline
+	SealingRemoveRequest(ctx context.Context, schedId uuid.UUID) error //perm:admin
 
-	// SectorIndex
-	StorageAttach(context.Context, storiface.StorageInfo, fsutil.FsStat) error                                                                                             //perm:admin
-	StorageInfo(context.Context, storiface.ID) (storiface.StorageInfo, error)                                                                                              //perm:admin
-	StorageReportHealth(context.Context, storiface.ID, storiface.HealthReport) error                                                                                       //perm:admin
-	StorageDeclareSector(ctx context.Context, storageID storiface.ID, s abi.SectorID, ft storiface.SectorFileType, primary bool) error                                     //perm:admin
-	StorageDropSector(ctx context.Context, storageID storiface.ID, s abi.SectorID, ft storiface.SectorFileType) error                                                      //perm:admin
+	// paths.SectorIndex
+	StorageAttach(context.Context, storiface.StorageInfo, fsutil.FsStat) error                                                         //perm:admin
+	StorageDetach(ctx context.Context, id storiface.ID, url string) error                                                              //perm:admin
+	StorageInfo(context.Context, storiface.ID) (storiface.StorageInfo, error)                                                          //perm:admin
+	StorageReportHealth(context.Context, storiface.ID, storiface.HealthReport) error                                                   //perm:admin
+	StorageDeclareSector(ctx context.Context, storageID storiface.ID, s abi.SectorID, ft storiface.SectorFileType, primary bool) error //perm:admin
+	StorageDropSector(ctx context.Context, storageID storiface.ID, s abi.SectorID, ft storiface.SectorFileType) error                  //perm:admin
+	// StorageFindSector returns list of paths where the specified sector files exist.
+	//
+	// If allowFetch is set, list of paths to which the sector can be fetched will also be returned.
+	// - Paths which have sector files locally (don't require fetching) will be listed first.
+	// - Paths which have sector files locally will not be filtered based on based on AllowTypes/DenyTypes.
+	// - Paths which require fetching will be filtered based on AllowTypes/DenyTypes. If multiple
+	//   file types are specified, each type will be considered individually, and a union of all paths
+	//   which can accommodate each file type will be returned.
 	StorageFindSector(ctx context.Context, sector abi.SectorID, ft storiface.SectorFileType, ssize abi.SectorSize, allowFetch bool) ([]storiface.SectorStorageInfo, error) //perm:admin
-	StorageBestAlloc(ctx context.Context, allocate storiface.SectorFileType, ssize abi.SectorSize, pathType storiface.PathType) ([]storiface.StorageInfo, error)           //perm:admin
-	StorageLock(ctx context.Context, sector abi.SectorID, read storiface.SectorFileType, write storiface.SectorFileType) error                                             //perm:admin
-	StorageTryLock(ctx context.Context, sector abi.SectorID, read storiface.SectorFileType, write storiface.SectorFileType) (bool, error)                                  //perm:admin
-	StorageList(ctx context.Context) (map[storiface.ID][]storiface.Decl, error)                                                                                            //perm:admin
-	StorageGetLocks(ctx context.Context) (storiface.SectorLocks, error)                                                                                                    //perm:admin
+	// StorageBestAlloc returns list of paths where sector files of the specified type can be allocated, ordered by preference.
+	// Paths with more weight and more % of free space are preferred.
+	// Note: This method doesn't filter paths based on AllowTypes/DenyTypes.
+	StorageBestAlloc(ctx context.Context, allocate storiface.SectorFileType, ssize abi.SectorSize, pathType storiface.PathType) ([]storiface.StorageInfo, error) //perm:admin
+	StorageLock(ctx context.Context, sector abi.SectorID, read storiface.SectorFileType, write storiface.SectorFileType) error                                   //perm:admin
+	StorageTryLock(ctx context.Context, sector abi.SectorID, read storiface.SectorFileType, write storiface.SectorFileType) (bool, error)                        //perm:admin
+	StorageList(ctx context.Context) (map[storiface.ID][]storiface.Decl, error)                                                                                  //perm:admin
+	StorageGetLocks(ctx context.Context) (storiface.SectorLocks, error)                                                                                          //perm:admin
 
 	StorageLocal(ctx context.Context) (map[storiface.ID]string, error)       //perm:admin
 	StorageStat(ctx context.Context, id storiface.ID) (fsutil.FsStat, error) //perm:admin
+
+	StorageAuthVerify(ctx context.Context, token string) ([]auth.Permission, error) //perm:read
+
+	StorageAddLocal(ctx context.Context, path string) error                              //perm:admin
+	StorageDetachLocal(ctx context.Context, path string) error                           //perm:admin
+	StorageRedeclareLocal(ctx context.Context, id *storiface.ID, dropMissing bool) error //perm:admin
 
 	MarketImportDealData(ctx context.Context, propcid cid.Cid, path string) error                                                                                                        //perm:write
 	MarketListDeals(ctx context.Context) ([]*MarketDeal, error)                                                                                                                          //perm:read
@@ -258,8 +309,6 @@ type StorageMiner interface {
 	DealsConsiderUnverifiedStorageDeals(context.Context) (bool, error)           //perm:admin
 	DealsSetConsiderUnverifiedStorageDeals(context.Context, bool) error          //perm:admin
 
-	StorageAddLocal(ctx context.Context, path string) error //perm:admin
-
 	PiecesListPieces(ctx context.Context) ([]cid.Cid, error)                                 //perm:read
 	PiecesListCidInfos(ctx context.Context) ([]cid.Cid, error)                               //perm:read
 	PiecesGetPieceInfo(ctx context.Context, pieceCid cid.Cid) (*piecestore.PieceInfo, error) //perm:read
@@ -271,9 +320,14 @@ type StorageMiner interface {
 	// the path specified when calling CreateBackup is within the base path
 	CreateBackup(ctx context.Context, fpath string) error //perm:admin
 
-	CheckProvable(ctx context.Context, pp abi.RegisteredPoStProof, sectors []storiface.SectorRef, expensive bool) (map[abi.SectorNumber]string, error) //perm:admin
+	CheckProvable(ctx context.Context, pp abi.RegisteredPoStProof, sectors []storiface.SectorRef) (map[abi.SectorNumber]string, error) //perm:admin
 
 	ComputeProof(ctx context.Context, ssi []builtin.ExtendedSectorInfo, rand abi.PoStRandomness, poStEpoch abi.ChainEpoch, nv abinetwork.Version) ([]builtin.PoStProof, error) //perm:read
+
+	// RecoverFault can be used to declare recoveries manually. It sends messages
+	// to the miner actor with details of recovered sectors and returns the CID of messages. It honors the
+	// maxPartitionsPerRecoveryMessage from the config
+	RecoverFault(ctx context.Context, sectors []abi.SectorNumber) ([]cid.Cid, error) //perm:admin
 }
 
 var _ storiface.WorkerReturn = *new(StorageMiner)
@@ -443,4 +497,120 @@ type DagstoreInitializeAllEvent struct {
 	Error   string
 	Total   int
 	Current int
+}
+
+type NumAssignerMeta struct {
+	Reserved  bitfield.BitField
+	Allocated bitfield.BitField
+
+	// ChainAllocated+Reserved+Allocated
+	InUse bitfield.BitField
+
+	Next abi.SectorNumber
+}
+
+type RemoteSectorMeta struct {
+	////////
+	// BASIC SECTOR INFORMATION
+
+	// State specifies the first state the sector will enter after being imported
+	// Must be one of the following states:
+	// * Packing
+	// * GetTicket
+	// * PreCommitting
+	// * SubmitCommit
+	// * Proving/Available
+	State SectorState
+
+	Sector abi.SectorID
+	Type   abi.RegisteredSealProof
+
+	////////
+	// SEALING METADATA
+	// (allows lotus to continue the sealing process)
+
+	// Required in Packing and later
+	Pieces []SectorPiece // todo better type?
+
+	// Required in PreCommitting and later
+	TicketValue   abi.SealRandomness
+	TicketEpoch   abi.ChainEpoch
+	PreCommit1Out storiface.PreCommit1Out // todo specify better
+
+	CommD *cid.Cid
+	CommR *cid.Cid // SectorKey
+
+	// Required in SubmitCommit and later
+	PreCommitInfo    *miner.SectorPreCommitInfo
+	PreCommitDeposit *big.Int
+	PreCommitMessage *cid.Cid
+	PreCommitTipSet  types.TipSetKey
+
+	SeedValue abi.InteractiveSealRandomness
+	SeedEpoch abi.ChainEpoch
+
+	CommitProof []byte
+
+	// Required in Proving/Available
+	CommitMessage *cid.Cid
+
+	// Optional sector metadata to import
+	Log []SectorLog
+
+	////////
+	// SECTOR DATA SOURCE
+
+	// Sector urls - lotus will use those for fetching files into local storage
+
+	// Required in all states
+	DataUnsealed *storiface.SectorLocation
+
+	// Required in PreCommitting and later
+	DataSealed *storiface.SectorLocation
+	DataCache  *storiface.SectorLocation
+
+	////////
+	// SEALING SERVICE HOOKS
+
+	// URL
+	// RemoteCommit1Endpoint is an URL of POST endpoint which lotus will call requesting Commit1 (seal_commit_phase1)
+	// request body will be json-serialized RemoteCommit1Params struct
+	RemoteCommit1Endpoint string
+
+	// RemoteCommit2Endpoint is an URL of POST endpoint which lotus will call requesting Commit2 (seal_commit_phase2)
+	// request body will be json-serialized RemoteCommit2Params struct
+	RemoteCommit2Endpoint string
+
+	// RemoteSealingDoneEndpoint is called after the sector exists the sealing pipeline
+	// request body will be json-serialized RemoteSealingDoneParams struct
+	RemoteSealingDoneEndpoint string
+}
+
+type RemoteCommit1Params struct {
+	Ticket, Seed []byte
+
+	Unsealed cid.Cid
+	Sealed   cid.Cid
+
+	ProofType abi.RegisteredSealProof
+}
+
+type RemoteCommit2Params struct {
+	Sector    abi.SectorID
+	ProofType abi.RegisteredSealProof
+
+	// todo spec better
+	Commit1Out storiface.Commit1Out
+}
+
+type RemoteSealingDoneParams struct {
+	// Successful is true if the sector has entered state considered as "successfully sealed"
+	Successful bool
+
+	// State is the state the sector has entered
+	// For example "Proving" / "Removing"
+	State string
+
+	// Optional commit message CID
+	CommitMessage *cid.Cid
 }

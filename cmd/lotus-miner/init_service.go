@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
 
@@ -17,7 +17,7 @@ import (
 	lcli "github.com/filecoin-project/lotus/cli"
 	cliutil "github.com/filecoin-project/lotus/cli/util"
 	"github.com/filecoin-project/lotus/node/config"
-	"github.com/filecoin-project/lotus/storage/paths"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
 const (
@@ -78,7 +78,7 @@ var serviceCmd = &cli.Command{
 			return xerrors.Errorf("please provide Lotus markets repo path via flag %s", FlagMarketsRepo)
 		}
 
-		if err := restore(ctx, cctx, repoPath, &paths.StorageConfig{}, func(cfg *config.StorageMiner) error {
+		if err := restore(ctx, cctx, repoPath, &storiface.StorageConfig{}, func(cfg *config.StorageMiner) error {
 			cfg.Subsystems.EnableMarkets = es.Contains(MarketsService)
 			cfg.Subsystems.EnableMining = false
 			cfg.Subsystems.EnableSealing = false

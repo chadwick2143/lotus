@@ -17,47 +17,14 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/proof"
 
+	"github.com/filecoin-project/lotus/lib/result"
 	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
 	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
-// LocalStorageMeta [path]/sectorstore.json
-type LocalStorageMeta struct {
-	ID storiface.ID
-
-	// A high weight means data is more likely to be stored in this path
-	Weight uint64 // 0 = readonly
-
-	// Intermediate data for the sealing process will be stored here
-	CanSeal bool
-
-	// Finalized sectors that will be proved over time will be stored here
-	CanStore bool
-
-	// MaxStorage specifies the maximum number of bytes to use for sector storage
-	// (0 = unlimited)
-	MaxStorage uint64
-
-	// List of storage groups this path belongs to
-	Groups []string
-
-	// List of storage groups to which data from this path can be moved. If none
-	// are specified, allow to all
-	AllowTo []string
-}
-
-// StorageConfig .lotusstorage/storage.json
-type StorageConfig struct {
-	StoragePaths []LocalPath
-}
-
-type LocalPath struct {
-	Path string
-}
-
 type LocalStorage interface {
-	GetStorage() (StorageConfig, error)
-	SetStorage(func(*StorageConfig)) error
+	GetStorage() (storiface.StorageConfig, error)
+	SetStorage(func(*storiface.StorageConfig)) error
 
 	Stat(path string) (fsutil.FsStat, error)
 
@@ -189,9 +156,13 @@ func (st *Local) OpenPath(ctx context.Context, p string) error {
 		return xerrors.Errorf("reading storage metadata for %s: %w", p, err)
 	}
 
-	var meta LocalStorageMeta
+	var meta storiface.LocalStorageMeta
 	if err := json.Unmarshal(mb, &meta); err != nil {
 		return xerrors.Errorf("unmarshalling storage metadata for %s: %w", p, err)
+	}
+
+	if p, exists := st.paths[meta.ID]; exists {
+		return xerrors.Errorf("path with ID %s already opened: '%s'", meta.ID, p.local)
 	}
 
 	// TODO: Check existing / dedupe
@@ -218,16 +189,37 @@ func (st *Local) OpenPath(ctx context.Context, p string) error {
 		CanStore:   meta.CanStore,
 		Groups:     meta.Groups,
 		AllowTo:    meta.AllowTo,
+		AllowTypes: meta.AllowTypes,
+		DenyTypes:  meta.DenyTypes,
 	}, fst)
 	if err != nil {
 		return xerrors.Errorf("declaring storage in index: %w", err)
 	}
 
-	if err := st.declareSectors(ctx, p, meta.ID, meta.CanStore); err != nil {
+	if err := st.declareSectors(ctx, p, meta.ID, meta.CanStore, false); err != nil {
 		return err
 	}
 
 	st.paths[meta.ID] = out
+
+	return nil
+}
+
+func (st *Local) ClosePath(ctx context.Context, id storiface.ID) error {
+	st.localLk.Lock()
+	defer st.localLk.Unlock()
+
+	if _, exists := st.paths[id]; !exists {
+		return xerrors.Errorf("path with ID %s isn't opened", id)
+	}
+
+	for _, url := range st.urls {
+		if err := st.index.StorageDetach(ctx, id, url); err != nil {
+			return xerrors.Errorf("dropping path (id='%s' url='%s'): %w", id, url, err)
+		}
+	}
+
+	delete(st.paths, id)
 
 	return nil
 }
@@ -250,7 +242,7 @@ func (st *Local) open(ctx context.Context) error {
 	return nil
 }
 
-func (st *Local) Redeclare(ctx context.Context) error {
+func (st *Local) Redeclare(ctx context.Context, filterId *storiface.ID, dropMissingDecls bool) error {
 	st.localLk.Lock()
 	defer st.localLk.Unlock()
 
@@ -260,7 +252,7 @@ func (st *Local) Redeclare(ctx context.Context) error {
 			return xerrors.Errorf("reading storage metadata for %s: %w", p.local, err)
 		}
 
-		var meta LocalStorageMeta
+		var meta storiface.LocalStorageMeta
 		if err := json.Unmarshal(mb, &meta); err != nil {
 			return xerrors.Errorf("unmarshalling storage metadata for %s: %w", p.local, err)
 		}
@@ -274,6 +266,9 @@ func (st *Local) Redeclare(ctx context.Context) error {
 			log.Errorf("storage path ID changed: %s; %s -> %s", p.local, id, meta.ID)
 			continue
 		}
+		if filterId != nil && *filterId != id {
+			continue
+		}
 
 		err = st.index.StorageAttach(ctx, storiface.StorageInfo{
 			ID:         id,
@@ -284,12 +279,14 @@ func (st *Local) Redeclare(ctx context.Context) error {
 			CanStore:   meta.CanStore,
 			Groups:     meta.Groups,
 			AllowTo:    meta.AllowTo,
+			AllowTypes: meta.AllowTypes,
+			DenyTypes:  meta.DenyTypes,
 		}, fst)
 		if err != nil {
 			return xerrors.Errorf("redeclaring storage in index: %w", err)
 		}
 
-		if err := st.declareSectors(ctx, p.local, meta.ID, meta.CanStore); err != nil {
+		if err := st.declareSectors(ctx, p.local, meta.ID, meta.CanStore, dropMissingDecls); err != nil {
 			return xerrors.Errorf("redeclaring sectors: %w", err)
 		}
 	}
@@ -297,9 +294,26 @@ func (st *Local) Redeclare(ctx context.Context) error {
 	return nil
 }
 
-func (st *Local) declareSectors(ctx context.Context, p string, id storiface.ID, primary bool) error {
+func (st *Local) declareSectors(ctx context.Context, p string, id storiface.ID, primary, dropMissing bool) error {
+	indexed := map[storiface.Decl]struct{}{}
+	if dropMissing {
+		decls, err := st.index.StorageList(ctx)
+		if err != nil {
+			return xerrors.Errorf("getting declaration list: %w", err)
+		}
+
+		for _, decl := range decls[id] {
+			for _, fileType := range decl.SectorFileType.AllSet() {
+				indexed[storiface.Decl{
+					SectorID:       decl.SectorID,
+					SectorFileType: fileType,
+				}] = struct{}{}
+			}
+		}
+	}
+
 	for _, t := range storiface.PathTypes {
-		ents, err := ioutil.ReadDir(filepath.Join(p, t.String()))
+		ents, err := os.ReadDir(filepath.Join(p, t.String()))
 		if err != nil {
 			if os.IsNotExist(err) {
 				if err := os.MkdirAll(filepath.Join(p, t.String()), 0755); err != nil { // nolint
@@ -321,8 +335,25 @@ func (st *Local) declareSectors(ctx context.Context, p string, id storiface.ID, 
 				return xerrors.Errorf("parse sector id %s: %w", ent.Name(), err)
 			}
 
+			delete(indexed, storiface.Decl{
+				SectorID:       sid,
+				SectorFileType: t,
+			})
+
 			if err := st.index.StorageDeclareSector(ctx, id, sid, t, primary); err != nil {
 				return xerrors.Errorf("declare sector %d(t:%d) -> %s: %w", sid, t, id, err)
+			}
+		}
+	}
+
+	if len(indexed) > 0 {
+		log.Warnw("index contains sectors which are missing in the storage path", "count", len(indexed), "dropMissing", dropMissing)
+	}
+
+	if dropMissing {
+		for decl := range indexed {
+			if err := st.index.StorageDropSector(ctx, id, decl.SectorID, decl.SectorFileType); err != nil {
+				return xerrors.Errorf("dropping sector %v from index: %w", decl, err)
 			}
 		}
 	}
@@ -503,6 +534,10 @@ func (st *Local) AcquireSector(ctx context.Context, sid storiface.SectorRef, exi
 			}
 
 			if (pathType == storiface.PathStorage) && !si.CanStore {
+				continue
+			}
+
+			if !fileType.Allowed(si.AllowTypes, si.DenyTypes) {
 				continue
 			}
 
@@ -724,20 +759,22 @@ func (st *Local) GenerateSingleVanillaProof(ctx context.Context, minerID abi.Act
 		ProofType: si.SealProof,
 	}
 
-	var cache string
-	var sealed string
+	var cache, sealed, cacheID, sealedID string
+
 	if si.Update {
-		src, _, err := st.AcquireSector(ctx, sr, storiface.FTUpdate|storiface.FTUpdateCache, storiface.FTNone, storiface.PathStorage, storiface.AcquireMove)
+		src, si, err := st.AcquireSector(ctx, sr, storiface.FTUpdate|storiface.FTUpdateCache, storiface.FTNone, storiface.PathStorage, storiface.AcquireMove)
 		if err != nil {
 			return nil, xerrors.Errorf("acquire sector: %w", err)
 		}
 		cache, sealed = src.UpdateCache, src.Update
+		cacheID, sealedID = si.UpdateCache, si.Update
 	} else {
-		src, _, err := st.AcquireSector(ctx, sr, storiface.FTSealed|storiface.FTCache, storiface.FTNone, storiface.PathStorage, storiface.AcquireMove)
+		src, si, err := st.AcquireSector(ctx, sr, storiface.FTSealed|storiface.FTCache, storiface.FTNone, storiface.PathStorage, storiface.AcquireMove)
 		if err != nil {
 			return nil, xerrors.Errorf("acquire sector: %w", err)
 		}
 		cache, sealed = src.Cache, src.Sealed
+		cacheID, sealedID = si.Cache, si.Sealed
 	}
 
 	if sealed == "" || cache == "" {
@@ -755,7 +792,22 @@ func (st *Local) GenerateSingleVanillaProof(ctx context.Context, minerID abi.Act
 		SealedSectorPath: sealed,
 	}
 
-	return ffi.GenerateSingleVanillaProof(psi, si.Challenge)
+	start := time.Now()
+
+	resCh := make(chan result.Result[[]byte], 1)
+	go func() {
+		resCh <- result.Wrap(ffi.GenerateSingleVanillaProof(psi, si.Challenge))
+	}()
+
+	select {
+	case r := <-resCh:
+		return r.Unwrap()
+	case <-ctx.Done():
+		log.Errorw("failed to generate valilla PoSt proof before context cancellation", "err", ctx.Err(), "duration", time.Now().Sub(start), "cache-id", cacheID, "sealed-id", sealedID, "cache", cache, "sealed", sealed)
+
+		// this will leave the GenerateSingleVanillaProof goroutine hanging, but that's still less bad than failing PoSt
+		return nil, xerrors.Errorf("failed to generate vanilla proof before context cancellation: %w", ctx.Err())
+	}
 }
 
 var _ Store = &Local{}

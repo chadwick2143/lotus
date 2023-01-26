@@ -12,9 +12,11 @@ import (
 	cid "github.com/ipfs/go-cid"
 
 	address "github.com/filecoin-project/go-address"
+	bitfield "github.com/filecoin-project/go-bitfield"
 	abi "github.com/filecoin-project/go-state-types/abi"
 	big "github.com/filecoin-project/go-state-types/big"
-	miner "github.com/filecoin-project/go-state-types/builtin/v8/miner"
+	miner "github.com/filecoin-project/go-state-types/builtin/v9/miner"
+	verifreg "github.com/filecoin-project/go-state-types/builtin/v9/verifreg"
 	crypto "github.com/filecoin-project/go-state-types/crypto"
 	dline "github.com/filecoin-project/go-state-types/dline"
 	network "github.com/filecoin-project/go-state-types/network"
@@ -107,6 +109,21 @@ func (mr *MockSealingAPIMockRecorder) MpoolPushMessage(arg0, arg1, arg2 interfac
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MpoolPushMessage", reflect.TypeOf((*MockSealingAPI)(nil).MpoolPushMessage), arg0, arg1, arg2)
 }
 
+// StateAccountKey mocks base method.
+func (m *MockSealingAPI) StateAccountKey(arg0 context.Context, arg1 address.Address, arg2 types.TipSetKey) (address.Address, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "StateAccountKey", arg0, arg1, arg2)
+	ret0, _ := ret[0].(address.Address)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StateAccountKey indicates an expected call of StateAccountKey.
+func (mr *MockSealingAPIMockRecorder) StateAccountKey(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateAccountKey", reflect.TypeOf((*MockSealingAPI)(nil).StateAccountKey), arg0, arg1, arg2)
+}
+
 // StateComputeDataCID mocks base method.
 func (m *MockSealingAPI) StateComputeDataCID(arg0 context.Context, arg1 address.Address, arg2 abi.RegisteredSealProof, arg3 []abi.DealID, arg4 types.TipSetKey) (cid.Cid, error) {
 	m.ctrl.T.Helper()
@@ -120,6 +137,21 @@ func (m *MockSealingAPI) StateComputeDataCID(arg0 context.Context, arg1 address.
 func (mr *MockSealingAPIMockRecorder) StateComputeDataCID(arg0, arg1, arg2, arg3, arg4 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateComputeDataCID", reflect.TypeOf((*MockSealingAPI)(nil).StateComputeDataCID), arg0, arg1, arg2, arg3, arg4)
+}
+
+// StateGetAllocationForPendingDeal mocks base method.
+func (m *MockSealingAPI) StateGetAllocationForPendingDeal(arg0 context.Context, arg1 abi.DealID, arg2 types.TipSetKey) (*verifreg.Allocation, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "StateGetAllocationForPendingDeal", arg0, arg1, arg2)
+	ret0, _ := ret[0].(*verifreg.Allocation)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StateGetAllocationForPendingDeal indicates an expected call of StateGetAllocationForPendingDeal.
+func (mr *MockSealingAPIMockRecorder) StateGetAllocationForPendingDeal(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateGetAllocationForPendingDeal", reflect.TypeOf((*MockSealingAPI)(nil).StateGetAllocationForPendingDeal), arg0, arg1, arg2)
 }
 
 // StateGetRandomnessFromBeacon mocks base method.
@@ -180,6 +212,21 @@ func (m *MockSealingAPI) StateMarketStorageDeal(arg0 context.Context, arg1 abi.D
 func (mr *MockSealingAPIMockRecorder) StateMarketStorageDeal(arg0, arg1, arg2 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateMarketStorageDeal", reflect.TypeOf((*MockSealingAPI)(nil).StateMarketStorageDeal), arg0, arg1, arg2)
+}
+
+// StateMinerAllocated mocks base method.
+func (m *MockSealingAPI) StateMinerAllocated(arg0 context.Context, arg1 address.Address, arg2 types.TipSetKey) (*bitfield.BitField, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "StateMinerAllocated", arg0, arg1, arg2)
+	ret0, _ := ret[0].(*bitfield.BitField)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StateMinerAllocated indicates an expected call of StateMinerAllocated.
+func (mr *MockSealingAPIMockRecorder) StateMinerAllocated(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateMinerAllocated", reflect.TypeOf((*MockSealingAPI)(nil).StateMinerAllocated), arg0, arg1, arg2)
 }
 
 // StateMinerAvailableBalance mocks base method.
@@ -390,4 +437,34 @@ func (m *MockSealingAPI) StateWaitMsg(arg0 context.Context, arg1 cid.Cid, arg2 u
 func (mr *MockSealingAPIMockRecorder) StateWaitMsg(arg0, arg1, arg2, arg3, arg4 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StateWaitMsg", reflect.TypeOf((*MockSealingAPI)(nil).StateWaitMsg), arg0, arg1, arg2, arg3, arg4)
+}
+
+// WalletBalance mocks base method.
+func (m *MockSealingAPI) WalletBalance(arg0 context.Context, arg1 address.Address) (big.Int, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "WalletBalance", arg0, arg1)
+	ret0, _ := ret[0].(big.Int)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// WalletBalance indicates an expected call of WalletBalance.
+func (mr *MockSealingAPIMockRecorder) WalletBalance(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WalletBalance", reflect.TypeOf((*MockSealingAPI)(nil).WalletBalance), arg0, arg1)
+}
+
+// WalletHas mocks base method.
+func (m *MockSealingAPI) WalletHas(arg0 context.Context, arg1 address.Address) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "WalletHas", arg0, arg1)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// WalletHas indicates an expected call of WalletHas.
+func (mr *MockSealingAPIMockRecorder) WalletHas(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WalletHas", reflect.TypeOf((*MockSealingAPI)(nil).WalletHas), arg0, arg1)
 }

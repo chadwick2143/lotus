@@ -7,7 +7,7 @@ USAGE:
    lotus-miner [global options] command [command options] [arguments...]
 
 VERSION:
-   1.17.1-dev
+   1.19.0
 
 COMMANDS:
    init     Initialize a lotus miner repo
@@ -71,7 +71,7 @@ OPTIONS:
    --create-worker-key          create separate worker key (default: false)
    --worker value, -w value     worker key to use (overrides --create-worker-key)
    --owner value, -o value      owner key to use
-   --sector-size value          specify sector size to use (default: "32GiB")
+   --sector-size value          specify sector size to use
    --pre-sealed-sectors value   specify set of presealed sectors for starting as a genesis miner  (accepts multiple inputs)
    --pre-sealed-metadata value  specify the metadata file for the presealed sectors
    --nosync                     don't check full-node sync status (default: false)
@@ -231,16 +231,18 @@ USAGE:
    lotus-miner actor command [command options] [arguments...]
 
 COMMANDS:
-   set-addresses, set-addrs  set addresses that your miner can be publicly dialed on
-   withdraw                  withdraw available balance
-   repay-debt                pay down a miner's debt
-   set-peer-id               set the peer id of your miner
-   set-owner                 Set owner address (this command should be invoked twice, first with the old owner as the senderAddress, and then with the new owner)
-   control                   Manage control addresses
-   propose-change-worker     Propose a worker address change
-   confirm-change-worker     Confirm a worker address change
-   compact-allocated         compact allocated sectors bitfield
-   help, h                   Shows a list of commands or help for one command
+   set-addresses, set-addrs    set addresses that your miner can be publicly dialed on
+   withdraw                    withdraw available balance to beneficiary
+   repay-debt                  pay down a miner's debt
+   set-peer-id                 set the peer id of your miner
+   set-owner                   Set owner address (this command should be invoked twice, first with the old owner as the senderAddress, and then with the new owner)
+   control                     Manage control addresses
+   propose-change-worker       Propose a worker address change
+   confirm-change-worker       Confirm a worker address change
+   compact-allocated           compact allocated sectors bitfield
+   propose-change-beneficiary  Propose a beneficiary address change
+   confirm-change-beneficiary  Confirm a beneficiary address change
+   help, h                     Shows a list of commands or help for one command
 
 OPTIONS:
    --help, -h  show help (default: false)
@@ -254,12 +256,13 @@ OPTIONS:
 ### lotus-miner actor withdraw
 ```
 NAME:
-   lotus-miner actor withdraw - withdraw available balance
+   lotus-miner actor withdraw - withdraw available balance to beneficiary
 
 USAGE:
    lotus-miner actor withdraw [command options] [amount (FIL)]
 
 OPTIONS:
+   --beneficiary       send withdraw message from the beneficiary address (default: false)
    --confidence value  number of block confirmations to wait for (default: 5)
    
 ```
@@ -386,6 +389,36 @@ OPTIONS:
    --mask-last-offset value  Mask sector IDs from 0 to 'higest_allocated - offset' (default: 0)
    --mask-upto-n value       Mask sector IDs from 0 to 'n' (default: 0)
    --really-do-it            Actually send transaction performing the action (default: false)
+   
+```
+
+### lotus-miner actor propose-change-beneficiary
+```
+NAME:
+   lotus-miner actor propose-change-beneficiary - Propose a beneficiary address change
+
+USAGE:
+   lotus-miner actor propose-change-beneficiary [command options] [beneficiaryAddress quota expiration]
+
+OPTIONS:
+   --actor value               specify the address of miner actor
+   --overwrite-pending-change  Overwrite the current beneficiary change proposal (default: false)
+   --really-do-it              Actually send transaction performing the action (default: false)
+   
+```
+
+### lotus-miner actor confirm-change-beneficiary
+```
+NAME:
+   lotus-miner actor confirm-change-beneficiary - Confirm a beneficiary address change
+
+USAGE:
+   lotus-miner actor confirm-change-beneficiary [command options] [minerAddress]
+
+OPTIONS:
+   --existing-beneficiary  send confirmation from the existing beneficiary address (default: false)
+   --new-beneficiary       send confirmation from the new beneficiary address (default: false)
+   --really-do-it          Actually send transaction performing the action (default: false)
    
 ```
 
@@ -1208,7 +1241,7 @@ NAME:
    lotus-miner net ping - Ping peers
 
 USAGE:
-   lotus-miner net ping [command options] [arguments...]
+   lotus-miner net ping [command options] [peerMultiaddr]
 
 OPTIONS:
    --count value, -c value     specify the number of times it should ping (default: 10)
@@ -1637,6 +1670,7 @@ COMMANDS:
    refs                  List References to sectors
    update-state          ADVANCED: manually update the state of a sector, this may aid in error recovery
    pledge                store random data in a sector
+   numbers               manage sector number assignments
    precommits            Print on-chain precommit info
    check-expire          Inspect expiring sectors
    expired               Get or cleanup expired sectors
@@ -1734,6 +1768,78 @@ OPTIONS:
    
 ```
 
+### lotus-miner sectors numbers
+```
+NAME:
+   lotus-miner sectors numbers - manage sector number assignments
+
+USAGE:
+   lotus-miner sectors numbers command [command options] [arguments...]
+
+COMMANDS:
+   info          view sector assigner state
+   reservations  list sector number reservations
+   reserve       create sector number reservations
+   free          remove sector number reservations
+   help, h       Shows a list of commands or help for one command
+
+OPTIONS:
+   --help, -h  show help (default: false)
+   
+```
+
+#### lotus-miner sectors numbers info
+```
+NAME:
+   lotus-miner sectors numbers info - view sector assigner state
+
+USAGE:
+   lotus-miner sectors numbers info [command options] [arguments...]
+
+OPTIONS:
+   --help, -h  show help (default: false)
+   
+```
+
+#### lotus-miner sectors numbers reservations
+```
+NAME:
+   lotus-miner sectors numbers reservations - list sector number reservations
+
+USAGE:
+   lotus-miner sectors numbers reservations [command options] [arguments...]
+
+OPTIONS:
+   --help, -h  show help (default: false)
+   
+```
+
+#### lotus-miner sectors numbers reserve
+```
+NAME:
+   lotus-miner sectors numbers reserve - create sector number reservations
+
+USAGE:
+   lotus-miner sectors numbers reserve [command options] [reservation name] [reserved ranges]
+
+OPTIONS:
+   --force  skip duplicate reservation checks (note: can lead to damaging other reservations on free) (default: false)
+   
+```
+
+#### lotus-miner sectors numbers free
+```
+NAME:
+   lotus-miner sectors numbers free - remove sector number reservations
+
+USAGE:
+   lotus-miner sectors numbers free [command options] [reservation name]
+
+OPTIONS:
+   --help, -h  show help (default: false)
+   
+```
+
 ### lotus-miner sectors precommits
 ```
 NAME:
@@ -1791,6 +1897,7 @@ OPTIONS:
    --from value            only consider sectors whose current expiration epoch is in the range of [from, to], <from> defaults to: now + 120 (1 hour) (default: 0)
    --max-fee value         use up to this amount of FIL for one message. pass this flag to avoid message congestion. (default: "0")
    --new-expiration value  try to extend selected sectors to this epoch, ignoring extension (default: 0)
+   --only-cc               only extend CC sectors (useful for making sector ready for snap upgrade) (default: false)
    --really-do-it          pass this flag to really renew sectors, otherwise will only print out json representation of parameters (default: false)
    --sector-file value     provide a file containing one sector number in each line, ignoring above selecting criteria
    --to value              only consider sectors whose current expiration epoch is in the range of [from, to], <to> defaults to: now + 92160 (32 days) (default: 0)
@@ -2028,14 +2135,15 @@ USAGE:
    lotus-miner proving command [command options] [arguments...]
 
 COMMANDS:
-   info       View current state information
-   deadlines  View the current proving period deadlines information
-   deadline   View the current proving period deadline information by its index
-   faults     View the currently known proving faulty sectors information
-   check      Check sectors provable
-   workers    list workers
-   compute    Compute simulated proving tasks
-   help, h    Shows a list of commands or help for one command
+   info            View current state information
+   deadlines       View the current proving period deadlines information
+   deadline        View the current proving period deadline information by its index
+   faults          View the currently known proving faulty sectors information
+   check           Check sectors provable
+   workers         list workers
+   compute         Compute simulated proving tasks
+   recover-faults  Manually recovers faulty sectors on chain
+   help, h         Shows a list of commands or help for one command
 
 OPTIONS:
    --help, -h  show help (default: false)
@@ -2064,7 +2172,7 @@ USAGE:
    lotus-miner proving deadlines [command options] [arguments...]
 
 OPTIONS:
-   --help, -h  show help (default: false)
+   --all, -a  Count all sectors (only live sectors are counted by default) (default: false)
    
 ```
 
@@ -2077,6 +2185,7 @@ USAGE:
    lotus-miner proving deadline [command options] <deadlineIdx>
 
 OPTIONS:
+   --bitfield, -b     Print partition bitfield stats (default: false)
    --sector-nums, -n  Print sector/fault numbers belonging to this deadline (default: false)
    
 ```
@@ -2144,6 +2253,19 @@ OPTIONS:
 ```
 ```
 
+### lotus-miner proving recover-faults
+```
+NAME:
+   lotus-miner proving recover-faults - Manually recovers faulty sectors on chain
+
+USAGE:
+   lotus-miner proving recover-faults [command options] <faulty sectors>
+
+OPTIONS:
+   --confidence value  number of block confirmations to wait for (default: 5)
+   
+```
+
 ## lotus-miner storage
 ```
 NAME:
@@ -2159,12 +2281,14 @@ DESCRIPTION:
    stored while moving through the sealing pipeline (references as 'seal').
 
 COMMANDS:
-   attach   attach local storage path
-   list     list local storage paths
-   find     find sector in the storage system
-   cleanup  trigger cleanup actions
-   locks    show active sector locks
-   help, h  Shows a list of commands or help for one command
+   attach     attach local storage path
+   detach     detach local storage path
+   redeclare  redeclare sectors in a local storage path
+   list       list local storage paths
+   find       find sector in the storage system
+   cleanup    trigger cleanup actions
+   locks      show active sector locks
+   help, h    Shows a list of commands or help for one command
 
 OPTIONS:
    --help, -h  show help (default: false)
@@ -2207,6 +2331,34 @@ OPTIONS:
    --seal               (for init) use path for sealing (default: false)
    --store              (for init) use path for long-term storage (default: false)
    --weight value       (for init) path weight (default: 10)
+   
+```
+
+### lotus-miner storage detach
+```
+NAME:
+   lotus-miner storage detach - detach local storage path
+
+USAGE:
+   lotus-miner storage detach [command options] [path]
+
+OPTIONS:
+   --really-do-it  (default: false)
+   
+```
+
+### lotus-miner storage redeclare
+```
+NAME:
+   lotus-miner storage redeclare - redeclare sectors in a local storage path
+
+USAGE:
+   lotus-miner storage redeclare [command options] [arguments...]
+
+OPTIONS:
+   --all           redeclare all storage paths (default: false)
+   --drop-missing  Drop index entries with missing files (default: false)
+   --id value      storage path ID
    
 ```
 
@@ -2350,7 +2502,7 @@ USAGE:
    lotus-miner sealing abort [command options] [callid]
 
 OPTIONS:
-   --help, -h  show help (default: false)
+   --sched  Specifies that the argument is UUID of the request to be removed from scheduler (default: false)
    
 ```
 

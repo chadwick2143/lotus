@@ -15,6 +15,7 @@ import (
 	provider "github.com/filecoin-project/index-provider"
 
 	"github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/lotus/api/v1api"
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/gen"
 	"github.com/filecoin-project/lotus/chain/gen/slashfilter"
@@ -77,6 +78,7 @@ func ConfigStorageMiner(c interface{}) Option {
 
 	return Options(
 
+		Override(new(v1api.FullNode), modules.MakeUuidWrapper),
 		// Needed to instantiate pubsub used by index provider via ConfigCommon
 		Override(new(dtypes.DrandSchedule), modules.BuiltinDrandConfig),
 		Override(new(dtypes.BootstrapPeers), modules.BuiltinBootstrap),
@@ -92,6 +94,10 @@ func ConfigStorageMiner(c interface{}) Option {
 		Override(new(paths.Store), From(new(*paths.Remote))),
 		Override(new(dtypes.RetrievalPricingFunc), modules.RetrievalPricingFunc(cfg.Dealmaking)),
 
+		If(cfg.Subsystems.EnableMining || cfg.Subsystems.EnableSealing,
+			Override(GetParamsKey, modules.GetParams(!cfg.Proving.DisableBuiltinWindowPoSt || !cfg.Proving.DisableBuiltinWinningPoSt || cfg.Storage.AllowCommit || cfg.Storage.AllowProveReplicaUpdate2)),
+		),
+
 		If(!cfg.Subsystems.EnableMining,
 			If(cfg.Subsystems.EnableSealing, Error(xerrors.Errorf("sealing can only be enabled on a mining node"))),
 			If(cfg.Subsystems.EnableSectorStorage, Error(xerrors.Errorf("sealing can only be enabled on a mining node"))),
@@ -105,10 +111,6 @@ func ConfigStorageMiner(c interface{}) Option {
 			Override(new(storiface.Prover), ffiwrapper.ProofProver),
 			Override(new(storiface.ProverPoSt), From(new(sectorstorage.SectorManager))),
 
-			// Sealing (todo should be under EnableSealing, but storagefsm is currently bundled with storage.Miner)
-			Override(new(sealing.SectorIDCounter), modules.SectorIDCounter),
-			Override(GetParamsKey, modules.GetParams),
-
 			Override(new(dtypes.SetSealingConfigFunc), modules.NewSetSealConfigFunc),
 			Override(new(dtypes.GetSealingConfigFunc), modules.NewGetSealConfigFunc),
 
@@ -116,9 +118,11 @@ func ConfigStorageMiner(c interface{}) Option {
 			Override(new(*slashfilter.SlashFilter), modules.NewSlashFilter),
 			Override(new(*miner.Miner), modules.SetupBlockProducer),
 			Override(new(gen.WinningPoStProver), storage.NewWinningPoStProver),
-			Override(new(*storage.Miner), modules.StorageMiner(cfg.Fees)),
+			Override(PreflightChecksKey, modules.PreflightChecks),
+			Override(new(*sealing.Sealing), modules.SealingPipeline(cfg.Fees)),
+
 			Override(new(*wdpost.WindowPoStScheduler), modules.WindowPostScheduler(cfg.Fees, cfg.Proving)),
-			Override(new(sectorblocks.SectorBuilder), From(new(*storage.Miner))),
+			Override(new(sectorblocks.SectorBuilder), From(new(*sealing.Sealing))),
 		),
 
 		If(cfg.Subsystems.EnableSectorStorage,
@@ -220,7 +224,8 @@ func ConfigStorageMiner(c interface{}) Option {
 			Override(new(storagemarket.StorageProviderNode), storageadapter.NewProviderNodeAdapter(&cfg.Fees, &cfg.Dealmaking)),
 		),
 
-		Override(new(sectorstorage.Config), cfg.StorageManager()),
+		Override(new(config.SealerConfig), cfg.Storage),
+		Override(new(config.ProvingConfig), cfg.Proving),
 		Override(new(*ctladdr.AddressSelector), modules.AddressSelector(&cfg.Addresses)),
 	)
 }

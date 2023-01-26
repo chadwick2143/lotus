@@ -1,4 +1,4 @@
-//stm: #unit
+// stm: #unit
 package sealer
 
 import (
@@ -65,6 +65,10 @@ type schedTestWorker struct {
 
 	resources       storiface.WorkerResources
 	ignoreResources bool
+}
+
+func (s *schedTestWorker) DownloadSectorData(ctx context.Context, sector storiface.SectorRef, finalized bool, src map[storiface.SectorFileType]storiface.SectorLocation) (storiface.CallID, error) {
+	panic("implement me")
 }
 
 func (s *schedTestWorker) DataCid(ctx context.Context, pieceSize abi.UnpaddedPieceSize, pieceData storiface.Data) (storiface.CallID, error) {
@@ -226,7 +230,7 @@ func TestSchedStartStop(t *testing.T) {
 	require.NoError(t, err)
 	go sched.runSched()
 
-	addTestWorker(t, sched, paths.NewIndex(), "fred", nil, decentWorkerResources, false)
+	addTestWorker(t, sched, paths.NewIndex(nil), "fred", nil, decentWorkerResources, false)
 
 	require.NoError(t, sched.Close(context.TODO()))
 }
@@ -350,7 +354,7 @@ func TestSched(t *testing.T) {
 
 	testFunc := func(workers []workerSpec, tasks []task) func(t *testing.T) {
 		return func(t *testing.T) {
-			index := paths.NewIndex()
+			index := paths.NewIndex(nil)
 
 			sched, err := newScheduler("")
 			require.NoError(t, err)

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/go-multierror"
@@ -18,6 +20,7 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-statestore"
 
+	"github.com/filecoin-project/lotus/node/config"
 	"github.com/filecoin-project/lotus/storage/paths"
 	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper"
 	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
@@ -70,6 +73,8 @@ type Manager struct {
 	work   *statestore.StateStore
 
 	parallelCheckLimit        int
+	singleCheckTimeout        time.Duration
+	partitionCheckTimeout     time.Duration
 	disableBuiltinWindowPoSt  bool
 	disableBuiltinWinningPoSt bool
 	disallowRemoteFinalize    bool
@@ -89,54 +94,12 @@ type result struct {
 	err error
 }
 
-// ResourceFilteringStrategy is an enum indicating the kinds of resource
-// filtering strategies that can be configured for workers.
-type ResourceFilteringStrategy string
-
-const (
-	// ResourceFilteringHardware specifies that available hardware resources
-	// should be evaluated when scheduling a task against the worker.
-	ResourceFilteringHardware = ResourceFilteringStrategy("hardware")
-
-	// ResourceFilteringDisabled disables resource filtering against this
-	// worker. The scheduler may assign any task to this worker.
-	ResourceFilteringDisabled = ResourceFilteringStrategy("disabled")
-)
-
-type Config struct {
-	ParallelFetchLimit int
-
-	// Local worker config
-	AllowAddPiece            bool
-	AllowPreCommit1          bool
-	AllowPreCommit2          bool
-	AllowCommit              bool
-	AllowUnseal              bool
-	AllowReplicaUpdate       bool
-	AllowProveReplicaUpdate2 bool
-	AllowRegenSectorKey      bool
-
-	// ResourceFiltering instructs the system which resource filtering strategy
-	// to use when evaluating tasks against this worker. An empty value defaults
-	// to "hardware".
-	ResourceFiltering ResourceFilteringStrategy
-
-	// PoSt config
-	ParallelCheckLimit        int
-	DisableBuiltinWindowPoSt  bool
-	DisableBuiltinWinningPoSt bool
-
-	DisallowRemoteFinalize bool
-
-	Assigner string
-}
-
 type StorageAuth http.Header
 
 type WorkerStateStore *statestore.StateStore
 type ManagerStateStore *statestore.StateStore
 
-func New(ctx context.Context, lstor *paths.Local, stor paths.Store, ls paths.LocalStorage, si paths.SectorIndex, sc Config, wss WorkerStateStore, mss ManagerStateStore) (*Manager, error) {
+func New(ctx context.Context, lstor *paths.Local, stor paths.Store, ls paths.LocalStorage, si paths.SectorIndex, sc config.SealerConfig, pc config.ProvingConfig, wss WorkerStateStore, mss ManagerStateStore) (*Manager, error) {
 	prover, err := ffiwrapper.New(&readonlyProvider{stor: lstor, index: si})
 	if err != nil {
 		return nil, xerrors.Errorf("creating prover instance: %w", err)
@@ -160,9 +123,11 @@ func New(ctx context.Context, lstor *paths.Local, stor paths.Store, ls paths.Loc
 
 		localProver: prover,
 
-		parallelCheckLimit:        sc.ParallelCheckLimit,
-		disableBuiltinWindowPoSt:  sc.DisableBuiltinWindowPoSt,
-		disableBuiltinWinningPoSt: sc.DisableBuiltinWinningPoSt,
+		parallelCheckLimit:        pc.ParallelCheckLimit,
+		singleCheckTimeout:        time.Duration(pc.SingleCheckTimeout),
+		partitionCheckTimeout:     time.Duration(pc.PartitionCheckTimeout),
+		disableBuiltinWindowPoSt:  pc.DisableBuiltinWindowPoSt,
+		disableBuiltinWinningPoSt: pc.DisableBuiltinWinningPoSt,
 		disallowRemoteFinalize:    sc.DisallowRemoteFinalize,
 
 		work:       mss,
@@ -178,6 +143,9 @@ func New(ctx context.Context, lstor *paths.Local, stor paths.Store, ls paths.Loc
 
 	localTasks := []sealtasks.TaskType{
 		sealtasks.TTCommit1, sealtasks.TTProveReplicaUpdate1, sealtasks.TTFinalize, sealtasks.TTFetch, sealtasks.TTFinalizeReplicaUpdate,
+	}
+	if sc.AllowSectorDownload {
+		localTasks = append(localTasks, sealtasks.TTDownloadSector)
 	}
 	if sc.AllowAddPiece {
 		localTasks = append(localTasks, sealtasks.TTAddPiece, sealtasks.TTDataCid)
@@ -205,8 +173,9 @@ func New(ctx context.Context, lstor *paths.Local, stor paths.Store, ls paths.Loc
 	}
 
 	wcfg := WorkerConfig{
-		IgnoreResourceFiltering: sc.ResourceFiltering == ResourceFilteringDisabled,
+		IgnoreResourceFiltering: sc.ResourceFiltering == config.ResourceFilteringDisabled,
 		TaskTypes:               localTasks,
+		Name:                    sc.LocalWorkerName,
 	}
 	worker := NewLocalWorker(wcfg, stor, lstor, si, m, wss)
 	err = m.AddWorker(ctx, worker)
@@ -227,12 +196,64 @@ func (m *Manager) AddLocalStorage(ctx context.Context, path string) error {
 		return xerrors.Errorf("opening local path: %w", err)
 	}
 
-	if err := m.ls.SetStorage(func(sc *paths.StorageConfig) {
-		sc.StoragePaths = append(sc.StoragePaths, paths.LocalPath{Path: path})
+	if err := m.ls.SetStorage(func(sc *storiface.StorageConfig) {
+		sc.StoragePaths = append(sc.StoragePaths, storiface.LocalPath{Path: path})
 	}); err != nil {
 		return xerrors.Errorf("get storage config: %w", err)
 	}
 	return nil
+}
+
+func (m *Manager) DetachLocalStorage(ctx context.Context, path string) error {
+	path, err := homedir.Expand(path)
+	if err != nil {
+		return xerrors.Errorf("expanding local path: %w", err)
+	}
+
+	// check that we have the path opened
+	lps, err := m.localStore.Local(ctx)
+	if err != nil {
+		return xerrors.Errorf("getting local path list: %w", err)
+	}
+
+	var localPath *storiface.StoragePath
+	for _, lp := range lps {
+		if lp.LocalPath == path {
+			lp := lp // copy to make the linter happy
+			localPath = &lp
+			break
+		}
+	}
+	if localPath == nil {
+		return xerrors.Errorf("no local paths match '%s'", path)
+	}
+
+	// drop from the persisted storage.json
+	var found bool
+	if err := m.ls.SetStorage(func(sc *storiface.StorageConfig) {
+		out := make([]storiface.LocalPath, 0, len(sc.StoragePaths))
+		for _, storagePath := range sc.StoragePaths {
+			if storagePath.Path != path {
+				out = append(out, storagePath)
+				continue
+			}
+			found = true
+		}
+		sc.StoragePaths = out
+	}); err != nil {
+		return xerrors.Errorf("set storage config: %w", err)
+	}
+	if !found {
+		// maybe this is fine?
+		return xerrors.Errorf("path not found in storage.json")
+	}
+
+	// unregister locally, drop from sector index
+	return m.localStore.ClosePath(ctx, localPath.ID)
+}
+
+func (m *Manager) RedeclareLocalStorage(ctx context.Context, id *storiface.ID, dropMissing bool) error {
+	return m.localStore.Redeclare(ctx, id, dropMissing)
 }
 
 func (m *Manager) AddWorker(ctx context.Context, w Worker) error {
@@ -724,11 +745,6 @@ func (m *Manager) FinalizeReplicaUpdate(ctx context.Context, sector storiface.Se
 	move := func(types storiface.SectorFileType) error {
 		// get a selector for moving stuff into long-term storage
 		fetchSel := newMoveSelector(m.index, sector.ID, types, storiface.PathStorage, !m.disallowRemoteFinalize)
-		{
-			if len(keepUnsealed) == 0 {
-				moveUnsealed = storiface.FTNone
-			}
-		}
 
 		err = m.sched.Schedule(ctx, sector, sealtasks.TTFetch, fetchSel,
 			m.schedFetch(sector, types, storiface.PathStorage, storiface.AcquireMove),
@@ -744,7 +760,8 @@ func (m *Manager) FinalizeReplicaUpdate(ctx context.Context, sector storiface.Se
 
 	err = multierr.Append(move(storiface.FTUpdate|storiface.FTUpdateCache), move(storiface.FTCache))
 	err = multierr.Append(err, move(storiface.FTSealed)) // Sealed separate from cache just in case ReleaseSectorKey was already called
-	if moveUnsealed != storiface.FTNone {
+	// if we found unsealed files, AND have been asked to keep at least one, move unsealed
+	if moveUnsealed != storiface.FTNone && len(keepUnsealed) != 0 {
 		err = multierr.Append(err, move(moveUnsealed))
 	}
 
@@ -1029,6 +1046,78 @@ func (m *Manager) ProveReplicaUpdate2(ctx context.Context, sector storiface.Sect
 	return out, waitErr
 }
 
+func (m *Manager) DownloadSectorData(ctx context.Context, sector storiface.SectorRef, finalized bool, src map[storiface.SectorFileType]storiface.SectorLocation) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var toFetch storiface.SectorFileType
+
+	// get a sorted list of sectors files to make a consistent work key from
+	ents := make([]struct {
+		T storiface.SectorFileType
+		S storiface.SectorLocation
+	}, 0, len(src))
+	for fileType, data := range src {
+		if len(fileType.AllSet()) != 1 {
+			return xerrors.Errorf("sector data entry must be for a single file type")
+		}
+
+		toFetch |= fileType
+
+		ents = append(ents, struct {
+			T storiface.SectorFileType
+			S storiface.SectorLocation
+		}{T: fileType, S: data})
+	}
+	sort.Slice(ents, func(i, j int) bool {
+		return ents[i].T < ents[j].T
+	})
+
+	// get a work key
+	wk, wait, cancel, err := m.getWork(ctx, sealtasks.TTDownloadSector, sector, ents)
+	if err != nil {
+		return xerrors.Errorf("getWork: %w", err)
+	}
+	defer cancel()
+
+	var waitErr error
+	waitRes := func() {
+		_, werr := m.waitWork(ctx, wk)
+		if werr != nil {
+			waitErr = werr
+			return
+		}
+	}
+
+	if wait { // already in progress
+		waitRes()
+		return waitErr
+	}
+
+	ptype := storiface.PathSealing
+	if finalized {
+		ptype = storiface.PathStorage
+	}
+
+	selector := newAllocSelector(m.index, toFetch, ptype)
+
+	err = m.sched.Schedule(ctx, sector, sealtasks.TTDownloadSector, selector, schedNop, func(ctx context.Context, w Worker) error {
+		err := m.startWork(ctx, w, wk)(w.DownloadSectorData(ctx, sector, finalized, src))
+		if err != nil {
+			return err
+		}
+
+		waitRes()
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	return waitErr
+}
+
 func (m *Manager) ReturnDataCid(ctx context.Context, callID storiface.CallID, pi abi.PieceInfo, err *storiface.CallError) error {
 	return m.returnResult(ctx, callID, pi, err)
 }
@@ -1091,6 +1180,10 @@ func (m *Manager) ReturnUnsealPiece(ctx context.Context, callID storiface.CallID
 
 func (m *Manager) ReturnReadPiece(ctx context.Context, callID storiface.CallID, ok bool, err *storiface.CallError) error {
 	return m.returnResult(ctx, callID, ok, err)
+}
+
+func (m *Manager) ReturnDownloadSector(ctx context.Context, callID storiface.CallID, err *storiface.CallError) error {
+	return m.returnResult(ctx, callID, nil, err)
 }
 
 func (m *Manager) ReturnFetch(ctx context.Context, callID storiface.CallID, err *storiface.CallError) error {
@@ -1166,6 +1259,10 @@ func (m *Manager) SchedDiag(ctx context.Context, doSched bool) (interface{}, err
 	m.workLk.Unlock()
 
 	return i, nil
+}
+
+func (m *Manager) RemoveSchedRequest(ctx context.Context, schedId uuid.UUID) error {
+	return m.sched.RemoveRequest(ctx, schedId)
 }
 
 func (m *Manager) Close(ctx context.Context) error {

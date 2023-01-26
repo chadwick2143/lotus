@@ -11,13 +11,15 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/network"
+	rtt "github.com/filecoin-project/go-state-types/rt"
 	"github.com/filecoin-project/test-vectors/schema"
 
 	"github.com/filecoin-project/lotus/blockstore"
-	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/consensus/filcns"
 	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/stmgr"
@@ -158,7 +160,7 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 			return big.Zero(), nil
 		}
 
-		return vm.NewLegacyVM(ctx, vmopt)
+		return vm.NewVM(ctx, vmopt)
 	})
 
 	postcid, receiptsroot, err := tse.ApplyBlocks(context.Background(),
@@ -169,6 +171,7 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 		params.ExecEpoch,
 		params.Rand,
 		recordOutputs,
+		true,
 		params.BaseFee,
 		nil,
 	)
@@ -239,22 +242,38 @@ func (d *Driver) ExecuteMessage(bs blockstore.Blockstore, params ExecuteMessageP
 		LookbackState:  lookback,
 	}
 
-	lvm, err := vm.NewLegacyVM(context.TODO(), vmOpts)
-	if err != nil {
-		return nil, cid.Undef, err
-	}
-
-	invoker := filcns.NewActorRegistry()
-
-	// register the chaos actor if required by the vector.
+	var vmi vm.Interface
 	if chaosOn, ok := d.selector["chaos_actor"]; ok && chaosOn == "true" {
-		av, _ := actors.VersionForNetwork(params.NetworkVersion)
-		invoker.Register(av, nil, chaos.Actor{})
+		lvm, err := vm.NewLegacyVM(context.TODO(), vmOpts)
+		if err != nil {
+			return nil, cid.Undef, err
+		}
+
+		invoker := filcns.NewActorRegistry()
+		av, _ := actorstypes.VersionForNetwork(params.NetworkVersion)
+		registry := builtin.MakeRegistryLegacy([]rtt.VMActor{chaos.Actor{}})
+		invoker.Register(av, nil, registry)
+		lvm.SetInvoker(invoker)
+		vmi = lvm
+	} else {
+		if vmOpts.NetworkVersion >= network.Version16 {
+			fvm, err := vm.NewFVM(context.TODO(), vmOpts)
+			if err != nil {
+				return nil, cid.Undef, err
+			}
+			vmi = fvm
+		} else {
+			lvm, err := vm.NewLegacyVM(context.TODO(), vmOpts)
+			if err != nil {
+				return nil, cid.Undef, err
+			}
+			invoker := filcns.NewActorRegistry()
+			lvm.SetInvoker(invoker)
+			vmi = lvm
+		}
 	}
 
-	lvm.SetInvoker(invoker)
-
-	ret, err := lvm.ApplyMessage(d.ctx, toChainMsg(params.Message))
+	ret, err := vmi.ApplyMessage(d.ctx, toChainMsg(params.Message))
 	if err != nil {
 		return nil, cid.Undef, err
 	}
@@ -262,10 +281,10 @@ func (d *Driver) ExecuteMessage(bs blockstore.Blockstore, params ExecuteMessageP
 	var root cid.Cid
 	if d.vmFlush {
 		// flush the VM, committing the state tree changes and forcing a
-		// recursive copoy from the temporary blcokstore to the real blockstore.
-		root, err = lvm.Flush(d.ctx)
+		// recursive copy from the temporary blockstore to the real blockstore.
+		root, err = vmi.Flush(d.ctx)
 	} else {
-		root, err = lvm.StateTree().(*state.StateTree).Flush(d.ctx)
+		root, err = vmi.(*vm.LegacyVM).StateTree().(*state.StateTree).Flush(d.ctx)
 	}
 
 	return ret, root, err
@@ -275,7 +294,8 @@ func (d *Driver) ExecuteMessage(bs blockstore.Blockstore, params ExecuteMessageP
 // messages that originate from secp256k senders, leaving all
 // others untouched.
 // TODO: generate a signature in the DSL so that it's encoded in
-//  the test vector.
+//
+//	the test vector.
 func toChainMsg(msg *types.Message) (ret types.ChainMsg) {
 	ret = msg
 	if msg.From.Protocol() == address.SECP256K1 {
