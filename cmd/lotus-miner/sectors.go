@@ -26,7 +26,6 @@ import (
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/blockstore"
-	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	lminer "github.com/filecoin-project/lotus/chain/actors/builtin/miner"
@@ -1408,6 +1407,7 @@ var sectorsExtendCmd = &cli.Command{
 					break
 				}
 
+				fmt.Printf("%d/%d\t\t", i+1, len(params))
 				fmt.Println("current base fee", float64(curBaseFee.Int64())/1e9, "nanoFIL is higher than", cctx.Float64("max-base-fee"), "nanoFIL, just wait")
 				time.Sleep(30 * time.Second)
 			}
@@ -1427,7 +1427,7 @@ var sectorsExtendCmd = &cli.Command{
 			fmt.Printf("%d/%d\t\t%s\n", i+1, len(params), smsg.Cid())
 
 			// wait for it to get mined into a block
-			wait, err := nodeAPI.StateWaitMsg(ctx, smsg.Cid(), build.MessageConfidence)
+			wait, err := nodeAPI.StateWaitMsg(ctx, smsg.Cid(), 1)
 			if err != nil {
 				return err
 			}
