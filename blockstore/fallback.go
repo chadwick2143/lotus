@@ -5,10 +5,10 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/xerrors"
-
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	ipld "github.com/ipfs/go-ipld-format"
+	"golang.org/x/xerrors"
 )
 
 // UnwrapFallbackStore takes a blockstore, and returns the underlying blockstore
@@ -56,7 +56,7 @@ func (fbs *FallbackStore) getFallback(c cid.Cid) (blocks.Block, error) {
 
 		if fbs.missFn == nil {
 			log.Errorw("fallbackstore: missFn not configured yet")
-			return nil, ErrNotFound
+			return nil, ipld.ErrNotFound{Cid: c}
 		}
 	}
 
@@ -71,30 +71,30 @@ func (fbs *FallbackStore) getFallback(c cid.Cid) (blocks.Block, error) {
 	// chain bitswap puts blocks in temp blockstore which is cleaned up
 	// every few min (to drop any messages we fetched but don't want)
 	// in this case we want to keep this block around
-	if err := fbs.Put(b); err != nil {
+	if err := fbs.Put(ctx, b); err != nil {
 		return nil, xerrors.Errorf("persisting fallback-fetched block: %w", err)
 	}
 	return b, nil
 }
 
-func (fbs *FallbackStore) Get(c cid.Cid) (blocks.Block, error) {
-	b, err := fbs.Blockstore.Get(c)
-	switch err {
-	case nil:
+func (fbs *FallbackStore) Get(ctx context.Context, c cid.Cid) (blocks.Block, error) {
+	b, err := fbs.Blockstore.Get(ctx, c)
+	switch {
+	case err == nil:
 		return b, nil
-	case ErrNotFound:
+	case ipld.IsNotFound(err):
 		return fbs.getFallback(c)
 	default:
 		return b, err
 	}
 }
 
-func (fbs *FallbackStore) GetSize(c cid.Cid) (int, error) {
-	sz, err := fbs.Blockstore.GetSize(c)
-	switch err {
-	case nil:
+func (fbs *FallbackStore) GetSize(ctx context.Context, c cid.Cid) (int, error) {
+	sz, err := fbs.Blockstore.GetSize(ctx, c)
+	switch {
+	case err == nil:
 		return sz, nil
-	case ErrNotFound:
+	case ipld.IsNotFound(err):
 		b, err := fbs.getFallback(c)
 		if err != nil {
 			return 0, err

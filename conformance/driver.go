@@ -5,28 +5,34 @@ import (
 	gobig "math/big"
 	"os"
 
+	"github.com/ipfs/go-cid"
+	ds "github.com/ipfs/go-datastore"
+	cbor "github.com/ipfs/go-ipld-cbor"
+
+	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/crypto"
+	"github.com/filecoin-project/go-state-types/network"
+	rtt "github.com/filecoin-project/go-state-types/rt"
+	"github.com/filecoin-project/test-vectors/schema"
+
 	"github.com/filecoin-project/lotus/blockstore"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
+	"github.com/filecoin-project/lotus/chain/consensus"
+	"github.com/filecoin-project/lotus/chain/consensus/filcns"
+	"github.com/filecoin-project/lotus/chain/index"
 	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
 	"github.com/filecoin-project/lotus/conformance/chaos"
-	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
-
-	_ "github.com/filecoin-project/lotus/lib/sigs/bls"  // enable bls signatures
+	_ "github.com/filecoin-project/lotus/lib/sigs/bls" // enable bls signatures
+	_ "github.com/filecoin-project/lotus/lib/sigs/delegated"
 	_ "github.com/filecoin-project/lotus/lib/sigs/secp" // enable secp signatures
-
-	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/go-state-types/big"
-	"github.com/filecoin-project/go-state-types/crypto"
-
-	"github.com/filecoin-project/test-vectors/schema"
-
-	"github.com/filecoin-project/go-address"
-
-	"github.com/ipfs/go-cid"
-	ds "github.com/ipfs/go-datastore"
+	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper"
 )
 
 var (
@@ -101,9 +107,13 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 		tipset   = params.Tipset
 		syscalls = vm.Syscalls(ffiwrapper.ProofVerifier)
 
-		cs = store.NewChainStore(bs, bs, ds, syscalls, nil)
-		sm = stmgr.NewStateManager(cs)
+		cs      = store.NewChainStore(bs, bs, ds, filcns.Weight, nil)
+		tse     = consensus.NewTipSetExecutor(filcns.RewardFunc)
+		sm, err = stmgr.NewStateManager(cs, tse, syscalls, filcns.DefaultUpgradeSchedule(), nil, ds, index.DummyMsgIndex)
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	if params.Rand == nil {
 		params.Rand = NewFixedRand()
@@ -115,11 +125,10 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 
 	defer cs.Close() //nolint:errcheck
 
-	blocks := make([]store.BlockMessages, 0, len(tipset.Blocks))
+	blocks := make([]consensus.FilecoinBlockMessages, 0, len(tipset.Blocks))
 	for _, b := range tipset.Blocks {
 		sb := store.BlockMessages{
-			Miner:    b.MinerAddr,
-			WinCount: b.WinCount,
+			Miner: b.MinerAddr,
 		}
 		for _, m := range b.Messages {
 			msg, err := types.DecodeMessage(m)
@@ -138,26 +147,34 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 				sb.BlsMessages = append(sb.BlsMessages, msg)
 			}
 		}
-		blocks = append(blocks, sb)
+		blocks = append(blocks, consensus.FilecoinBlockMessages{
+			BlockMessages: sb,
+			WinCount:      b.WinCount,
+		})
 	}
 
-	var (
-		messages []*types.Message
-		results  []*vm.ApplyRet
-	)
-
-	recordOutputs := func(_ cid.Cid, msg *types.Message, ret *vm.ApplyRet) error {
-		messages = append(messages, msg)
-		results = append(results, ret)
-		return nil
+	recordOutputs := &outputRecorder{
+		messages: []*types.Message{},
+		results:  []*vm.ApplyRet{},
 	}
-	postcid, receiptsroot, err := sm.ApplyBlocks(context.Background(),
+
+	sm.SetVMConstructor(func(ctx context.Context, vmopt *vm.VMOpts) (vm.Interface, error) {
+		vmopt.CircSupplyCalc = func(context.Context, abi.ChainEpoch, *state.StateTree) (abi.TokenAmount, error) {
+			return big.Zero(), nil
+		}
+
+		return vm.NewVM(ctx, vmopt)
+	})
+
+	postcid, receiptsroot, err := tse.ApplyBlocks(context.Background(),
+		sm,
 		params.ParentEpoch,
 		params.Preroot,
 		blocks,
 		params.ExecEpoch,
 		params.Rand,
 		recordOutputs,
+		true,
 		params.BaseFee,
 		nil,
 	)
@@ -169,22 +186,29 @@ func (d *Driver) ExecuteTipset(bs blockstore.Blockstore, ds ds.Batching, params 
 	ret := &ExecuteTipsetResult{
 		ReceiptsRoot:    receiptsroot,
 		PostStateRoot:   postcid,
-		AppliedMessages: messages,
-		AppliedResults:  results,
+		AppliedMessages: recordOutputs.messages,
+		AppliedResults:  recordOutputs.results,
 	}
 	return ret, nil
 }
 
 type ExecuteMessageParams struct {
-	Preroot    cid.Cid
-	Epoch      abi.ChainEpoch
-	Message    *types.Message
-	CircSupply abi.TokenAmount
-	BaseFee    abi.TokenAmount
+	Preroot        cid.Cid
+	Epoch          abi.ChainEpoch
+	Message        *types.Message
+	CircSupply     abi.TokenAmount
+	BaseFee        abi.TokenAmount
+	NetworkVersion network.Version
 
 	// Rand is an optional vm.Rand implementation to use. If nil, the driver
 	// will use a vm.Rand that returns a fixed value for all calls.
 	Rand vm.Rand
+
+	// Lookback is the LookbackStateGetter; returns the state tree at a given epoch.
+	Lookback vm.LookbackStateGetter
+
+	// TipSetGetter returns the tipset key at any given epoch.
+	TipSetGetter vm.TipSetGetter
 }
 
 // ExecuteMessage executes a conformance test vector message in a temporary VM.
@@ -199,9 +223,27 @@ func (d *Driver) ExecuteMessage(bs blockstore.Blockstore, params ExecuteMessageP
 		params.Rand = NewFixedRand()
 	}
 
-	// dummy state manager; only to reference the GetNetworkVersion method,
-	// which does not depend on state.
-	sm := stmgr.NewStateManager(nil)
+	if params.TipSetGetter == nil {
+		// TODO: If/when we start writing conformance tests against the EVM, we'll need to
+		// actually implement this and (unfortunately) capture any tipsets looked up by
+		// messages.
+		params.TipSetGetter = func(context.Context, abi.ChainEpoch) (types.TipSetKey, error) {
+			return types.EmptyTSK, nil
+		}
+	}
+
+	if params.Lookback == nil {
+		// TODO: This lookback state returns the supplied precondition state tree, unconditionally.
+		//  This is obviously not correct, but the lookback state tree is only used to validate the
+		//  worker key when verifying a consensus fault. If the worker key hasn't changed in the
+		//  current finality window, this workaround is enough.
+		//  The correct solutions are documented in https://github.com/filecoin-project/ref-fvm/issues/381,
+		//  but they're much harder to implement, and the tradeoffs aren't clear.
+		params.Lookback = func(ctx context.Context, epoch abi.ChainEpoch) (*state.StateTree, error) {
+			cst := cbor.NewCborStore(bs)
+			return state.LoadStateTree(cst, params.Preroot)
+		}
+	}
 
 	vmOpts := &vm.VMOpts{
 		StateBase: params.Preroot,
@@ -211,37 +253,56 @@ func (d *Driver) ExecuteMessage(bs blockstore.Blockstore, params ExecuteMessageP
 		CircSupplyCalc: func(_ context.Context, _ abi.ChainEpoch, _ *state.StateTree) (abi.TokenAmount, error) {
 			return params.CircSupply, nil
 		},
-		Rand:        params.Rand,
-		BaseFee:     params.BaseFee,
-		NtwkVersion: sm.GetNtwkVersion,
+		Rand:           params.Rand,
+		BaseFee:        params.BaseFee,
+		NetworkVersion: params.NetworkVersion,
+		LookbackState:  params.Lookback,
+		TipSetGetter:   params.TipSetGetter,
 	}
 
-	lvm, err := vm.NewVM(context.TODO(), vmOpts)
-	if err != nil {
-		return nil, cid.Undef, err
-	}
-
-	invoker := vm.NewActorRegistry()
-
-	// register the chaos actor if required by the vector.
+	var vmi vm.Interface
 	if chaosOn, ok := d.selector["chaos_actor"]; ok && chaosOn == "true" {
-		invoker.Register(nil, chaos.Actor{})
+		lvm, err := vm.NewLegacyVM(context.TODO(), vmOpts)
+		if err != nil {
+			return nil, cid.Undef, err
+		}
+
+		invoker := consensus.NewActorRegistry()
+		av, _ := actorstypes.VersionForNetwork(params.NetworkVersion)
+		registry := builtin.MakeRegistryLegacy([]rtt.VMActor{chaos.Actor{}})
+		invoker.Register(av, nil, registry)
+		lvm.SetInvoker(invoker)
+		vmi = lvm
+	} else {
+		if vmOpts.NetworkVersion >= network.Version16 {
+			fvm, err := vm.NewFVM(context.TODO(), vmOpts)
+			if err != nil {
+				return nil, cid.Undef, err
+			}
+			vmi = fvm
+		} else {
+			lvm, err := vm.NewLegacyVM(context.TODO(), vmOpts)
+			if err != nil {
+				return nil, cid.Undef, err
+			}
+			invoker := consensus.NewActorRegistry()
+			lvm.SetInvoker(invoker)
+			vmi = lvm
+		}
 	}
 
-	lvm.SetInvoker(invoker)
-
-	ret, err := lvm.ApplyMessage(d.ctx, toChainMsg(params.Message))
+	ret, err := vmi.ApplyMessage(d.ctx, toChainMsg(params.Message))
 	if err != nil {
 		return nil, cid.Undef, err
 	}
 
 	var root cid.Cid
-	if d.vmFlush {
-		// flush the VM, committing the state tree changes and forcing a
-		// recursive copoy from the temporary blcokstore to the real blockstore.
-		root, err = lvm.Flush(d.ctx)
-	} else {
+	if lvm, ok := vmi.(*vm.LegacyVM); ok && !d.vmFlush {
 		root, err = lvm.StateTree().(*state.StateTree).Flush(d.ctx)
+	} else {
+		// flush the VM, committing the state tree changes and forcing a
+		// recursive copy from the temporary blockstore to the real blockstore.
+		root, err = vmi.Flush(d.ctx)
 	}
 
 	return ret, root, err
@@ -251,7 +312,8 @@ func (d *Driver) ExecuteMessage(bs blockstore.Blockstore, params ExecuteMessageP
 // messages that originate from secp256k senders, leaving all
 // others untouched.
 // TODO: generate a signature in the DSL so that it's encoded in
-//  the test vector.
+//
+//	the test vector.
 func toChainMsg(msg *types.Message) (ret types.ChainMsg) {
 	ret = msg
 	if msg.From.Protocol() == address.SECP256K1 {
@@ -283,4 +345,15 @@ func CircSupplyOrDefault(circSupply *gobig.Int) abi.TokenAmount {
 		return DefaultCirculatingSupply
 	}
 	return big.NewFromGo(circSupply)
+}
+
+type outputRecorder struct {
+	messages []*types.Message
+	results  []*vm.ApplyRet
+}
+
+func (o *outputRecorder) MessageApplied(ctx context.Context, ts *types.TipSet, mcid cid.Cid, msg *types.Message, ret *vm.ApplyRet, implicit bool) error {
+	o.messages = append(o.messages, msg)
+	o.results = append(o.results, ret)
+	return nil
 }

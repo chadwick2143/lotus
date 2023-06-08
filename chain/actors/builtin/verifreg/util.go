@@ -1,12 +1,15 @@
 package verifreg
 
 import (
+	"golang.org/x/xerrors"
+
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/specs-actors/v7/actors/builtin/verifreg"
+
 	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
-	"golang.org/x/xerrors"
 )
 
 // taking this as a function instead of asking the caller to call it helps reduce some of the error
@@ -49,4 +52,29 @@ func forEachCap(store adt.Store, ver actors.Version, root rootFunc, cb func(addr
 		}
 		return cb(a, dcap)
 	})
+}
+
+func getRemoveDataCapProposalID(store adt.Store, ver actors.Version, root rootFunc, verifier address.Address, client address.Address) (bool, uint64, error) {
+	if verifier.Protocol() != address.ID {
+		return false, 0, xerrors.Errorf("can only look up ID addresses")
+	}
+	if client.Protocol() != address.ID {
+		return false, 0, xerrors.Errorf("can only look up ID addresses")
+	}
+	vh, err := root()
+	if err != nil {
+		return false, 0, xerrors.Errorf("loading verifreg: %w", err)
+	}
+	if vh == nil {
+		return false, 0, xerrors.Errorf("remove data cap proposal hamt not found. you are probably using an incompatible version of actors")
+	}
+
+	var id verifreg.RmDcProposalID
+	if found, err := vh.Get(abi.NewAddrPairKey(verifier, client), &id); err != nil {
+		return false, 0, xerrors.Errorf("looking up addr pair: %w", err)
+	} else if !found {
+		return false, 0, nil
+	}
+
+	return true, id.ProposalID, nil
 }

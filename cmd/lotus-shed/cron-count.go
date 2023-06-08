@@ -3,11 +3,13 @@ package main
 import (
 	"fmt"
 
-	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/lotus/build"
-	lcli "github.com/filecoin-project/lotus/cli"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
+
+	"github.com/filecoin-project/go-address"
+
+	"github.com/filecoin-project/lotus/build"
+	lcli "github.com/filecoin-project/lotus/cli"
 )
 
 var cronWcCmd = &cli.Command{
@@ -60,7 +62,7 @@ func findDeadlineCrons(c *cli.Context) (map[address.Address]struct{}, error) {
 		// All miners have active cron before v4.
 		// v4 upgrade epoch is last epoch running v3 epoch and api.StateReadState reads
 		// parent state, so v4 state isn't read until upgrade epoch + 2
-		if ts.Height() <= build.UpgradeActorsV4Height+1 {
+		if ts.Height() <= build.UpgradeTurboHeight+1 {
 			activeMiners[mAddr] = struct{}{}
 			continue
 		}

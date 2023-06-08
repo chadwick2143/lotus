@@ -7,7 +7,6 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -16,32 +15,30 @@ import (
 	"strings"
 	"time"
 
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
-
-	miner2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/miner"
-
-	"github.com/filecoin-project/go-state-types/network"
-
 	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
-
 	"github.com/mitchellh/go-homedir"
 	"github.com/urfave/cli/v2"
-
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-bitfield"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/builtin"
+	minertypes "github.com/filecoin-project/go-state-types/builtin/v9/miner"
 	"github.com/filecoin-project/go-state-types/exitcode"
+	"github.com/filecoin-project/go-state-types/network"
+	miner2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/miner"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
+	lbuiltin "github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/market"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/lotus/tools/stats"
+	lcli "github.com/filecoin-project/lotus/cli"
+	"github.com/filecoin-project/lotus/tools/stats/sync"
 )
 
 var log = logging.Logger("main")
@@ -160,15 +157,15 @@ var findMinersCmd = &cli.Command{
 	},
 	Action: func(cctx *cli.Context) error {
 		ctx := context.Background()
-		api, closer, err := stats.GetFullNodeAPI(cctx.Context, cctx.String("lotus-path"))
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		defer closer()
 
 		if !cctx.Bool("no-sync") {
-			if err := stats.WaitForSyncComplete(ctx, api); err != nil {
-				log.Fatal(err)
+			if err := sync.SyncWait(ctx, api); err != nil {
+				return err
 			}
 		}
 
@@ -245,7 +242,7 @@ var recoverMinersCmd = &cli.Command{
 	},
 	Action: func(cctx *cli.Context) error {
 		ctx := context.Background()
-		api, closer, err := stats.GetFullNodeAPI(cctx.Context, cctx.String("lotus-path"))
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -266,8 +263,8 @@ var recoverMinersCmd = &cli.Command{
 		}
 
 		if !cctx.Bool("no-sync") {
-			if err := stats.WaitForSyncComplete(ctx, api); err != nil {
-				log.Fatal(err)
+			if err := sync.SyncWait(ctx, api); err != nil {
+				return err
 			}
 		}
 
@@ -420,14 +417,28 @@ var runCmd = &cli.Command{
 			Usage:   "messages with a prove cap larger than this will be skipped when processing pre commit messages",
 			Value:   "0.000000001",
 		},
+		&cli.StringFlag{
+			Name:  "http-server-timeout",
+			Value: "30s",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
+		timeout, err := time.ParseDuration(cctx.String("http-timeout"))
+		if err != nil {
+			return xerrors.Errorf("invalid time string %s: %x", cctx.String("http-timeout"), err)
+		}
+
 		go func() {
-			http.ListenAndServe(":6060", nil) //nolint:errcheck
+			server := &http.Server{
+				Addr:              ":6060",
+				ReadHeaderTimeout: timeout,
+			}
+
+			_ = server.ListenAndServe()
 		}()
 
 		ctx := context.Background()
-		api, closer, err := stats.GetFullNodeAPI(cctx.Context, cctx.String("lotus-path"))
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -448,12 +459,12 @@ var runCmd = &cli.Command{
 		}
 
 		if !cctx.Bool("no-sync") {
-			if err := stats.WaitForSyncComplete(ctx, api); err != nil {
-				log.Fatal(err)
+			if err := sync.SyncWait(ctx, api); err != nil {
+				return err
 			}
 		}
 
-		tipsetsCh, err := stats.GetTips(ctx, api, r.Height(), cctx.Int("head-delay"))
+		tipsetsCh, err := sync.BufferedTipsetChannel(ctx, api, r.Height(), cctx.Int("head-delay"))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -634,9 +645,9 @@ type refunderNodeApi interface {
 	ChainGetParentReceipts(ctx context.Context, blockCid cid.Cid) ([]*types.MessageReceipt, error)
 	ChainGetTipSetByHeight(ctx context.Context, epoch abi.ChainEpoch, tsk types.TipSetKey) (*types.TipSet, error)
 	ChainReadObj(context.Context, cid.Cid) ([]byte, error)
-	StateMinerInitialPledgeCollateral(ctx context.Context, addr address.Address, precommitInfo miner.SectorPreCommitInfo, tsk types.TipSetKey) (types.BigInt, error)
-	StateMinerInfo(context.Context, address.Address, types.TipSetKey) (miner.MinerInfo, error)
-	StateSectorPreCommitInfo(ctx context.Context, addr address.Address, sector abi.SectorNumber, tsk types.TipSetKey) (miner.SectorPreCommitOnChainInfo, error)
+	StateMinerInitialPledgeCollateral(ctx context.Context, addr address.Address, precommitInfo minertypes.SectorPreCommitInfo, tsk types.TipSetKey) (types.BigInt, error)
+	StateMinerInfo(context.Context, address.Address, types.TipSetKey) (api.MinerInfo, error)
+	StateSectorPreCommitInfo(ctx context.Context, addr address.Address, sector abi.SectorNumber, tsk types.TipSetKey) (minertypes.SectorPreCommitOnChainInfo, error)
 	StateMinerAvailableBalance(context.Context, address.Address, types.TipSetKey) (types.BigInt, error)
 	StateMinerSectors(ctx context.Context, addr address.Address, filter *bitfield.BitField, tsk types.TipSetKey) ([]*miner.SectorOnChainInfo, error)
 	StateMinerFaults(ctx context.Context, addr address.Address, tsk types.TipSetKey) (bitfield.BitField, error)
@@ -747,7 +758,7 @@ func (r *refunder) EnsureMinerMinimums(ctx context.Context, tipset *types.TipSet
 		return nil, err
 	}
 
-	w := ioutil.Discard
+	w := io.Discard
 	if len(output) != 0 {
 		f, err := os.Create(output)
 		if err != nil {
@@ -900,7 +911,7 @@ func (r *refunder) EnsureMinerMinimums(ctx context.Context, tipset *types.TipSet
 func (r *refunder) processTipsetStorageMarketActor(ctx context.Context, tipset *types.TipSet, msg api.Message, recp *types.MessageReceipt) (bool, string, types.BigInt, error) {
 
 	m := msg.Message
-	refundValue := types.NewInt(0)
+	var refundValue types.BigInt
 	var messageMethod string
 
 	switch m.Method {
@@ -927,7 +938,7 @@ func (r *refunder) processTipsetStorageMarketActor(ctx context.Context, tipset *
 func (r *refunder) processTipsetStorageMinerActor(ctx context.Context, tipset *types.TipSet, msg api.Message, recp *types.MessageReceipt) (bool, string, types.BigInt, error) {
 
 	m := msg.Message
-	refundValue := types.NewInt(0)
+	var refundValue types.BigInt
 	var messageMethod string
 
 	if _, found := r.blockmap[m.To]; found {
@@ -936,7 +947,7 @@ func (r *refunder) processTipsetStorageMinerActor(ctx context.Context, tipset *t
 	}
 
 	switch m.Method {
-	case miner.Methods.SubmitWindowedPoSt:
+	case builtin.MethodsMiner.SubmitWindowedPoSt:
 		if !r.windowedPoStEnabled {
 			return false, messageMethod, types.NewInt(0), nil
 		}
@@ -949,7 +960,7 @@ func (r *refunder) processTipsetStorageMinerActor(ctx context.Context, tipset *t
 		}
 
 		refundValue = types.BigMul(types.NewInt(uint64(recp.GasUsed)), tipset.Blocks()[0].ParentBaseFee)
-	case miner.Methods.ProveCommitSector:
+	case builtin.MethodsMiner.ProveCommitSector:
 		if !r.proveCommitEnabled {
 			return false, messageMethod, types.NewInt(0), nil
 		}
@@ -1010,7 +1021,7 @@ func (r *refunder) processTipsetStorageMinerActor(ctx context.Context, tipset *t
 		if r.refundPercent > 0 {
 			refundValue = types.BigMul(types.BigDiv(refundValue, types.NewInt(100)), types.NewInt(uint64(r.refundPercent)))
 		}
-	case miner.Methods.PreCommitSector:
+	case builtin.MethodsMiner.PreCommitSector:
 		if !r.preCommitEnabled {
 			return false, messageMethod, types.NewInt(0), nil
 		}
@@ -1032,7 +1043,7 @@ func (r *refunder) processTipsetStorageMinerActor(ctx context.Context, tipset *t
 			return false, messageMethod, types.NewInt(0), nil
 		}
 
-		var precommitInfo miner.SectorPreCommitInfo
+		var precommitInfo minertypes.SectorPreCommitInfo
 		if err := precommitInfo.UnmarshalCBOR(bytes.NewBuffer(m.Params)); err != nil {
 			log.Warnw("failed to decode precommit params", "err", err, "method", messageMethod, "cid", msg.Cid, "miner", m.To)
 			return false, messageMethod, types.NewInt(0), nil
@@ -1097,7 +1108,7 @@ func (r *refunder) ProcessTipset(ctx context.Context, tipset *types.TipSet, refu
 			processed, messageMethod, refundValue, err = r.processTipsetStorageMarketActor(ctx, tipset, msg, recps[i])
 		}
 
-		if builtin.IsStorageMinerActor(a.Code) {
+		if lbuiltin.IsStorageMinerActor(a.Code) {
 			processed, messageMethod, refundValue, err = r.processTipsetStorageMinerActor(ctx, tipset, msg, recps[i])
 		}
 
@@ -1287,7 +1298,7 @@ func loadChainEpoch(fn string) (abi.ChainEpoch, error) {
 		err = f.Close()
 	}()
 
-	raw, err := ioutil.ReadAll(f)
+	raw, err := io.ReadAll(f)
 	if err != nil {
 		return 0, err
 	}

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"text/template"
-	"unicode"
 
 	"golang.org/x/xerrors"
 )
@@ -71,9 +70,6 @@ func typeName(e ast.Expr, pkg string) (string, error) {
 		return t.X.(*ast.Ident).Name + "." + t.Sel.Name, nil
 	case *ast.Ident:
 		pstr := t.Name
-		if !unicode.IsLower(rune(pstr[0])) && pkg != "api" {
-			pstr = "api." + pstr // todo src pkg name
-		}
 		return pstr, nil
 	case *ast.ArrayType:
 		subt, err := typeName(t.Elt, pkg)
@@ -144,14 +140,14 @@ func generate(path, pkg, outpkg, outfile string) error {
 	ast.Walk(v, ap)
 
 	type methodInfo struct {
-		Name                                     string
+		Num                                      string
 		node                                     ast.Node
 		Tags                                     map[string][]string
 		NamedParams, ParamNames, Results, DefRes string
 	}
 
 	type strinfo struct {
-		Name    string
+		Num     string
 		Methods map[string]*methodInfo
 		Include []string
 	}
@@ -186,7 +182,7 @@ func generate(path, pkg, outpkg, outfile string) error {
 		for ifname, methods := range v.Methods {
 			if _, ok := m.Infos[ifname]; !ok {
 				m.Infos[ifname] = &strinfo{
-					Name:    ifname,
+					Num:     ifname,
 					Methods: map[string]*methodInfo{},
 					Include: v.Include[ifname],
 				}
@@ -243,7 +239,7 @@ func generate(path, pkg, outpkg, outfile string) error {
 					}
 
 					info.Methods[mname] = &methodInfo{
-						Name:        mname,
+						Num:         mname,
 						node:        node.node,
 						Tags:        map[string][]string{},
 						NamedParams: strings.Join(params, ", "),
@@ -263,7 +259,7 @@ func generate(path, pkg, outpkg, outfile string) error {
 						if len(tf) != 2 {
 							continue
 						}
-						if tf[0] != "perm" { // todo: allow more tag types
+						if tf[0] != "perm" && tf[0] != "rpc_method" && tf[0] != "notify" { // todo: allow more tag types
 							continue
 						}
 						info.Methods[mname].Tags[tf[0]] = tf
@@ -298,19 +294,25 @@ import (
 	}
 
 	err = doTemplate(w, m, `
+
+var ErrNotSupported = xerrors.New("method not supported")
+
 {{range .Infos}}
-type {{.Name}}Struct struct {
+type {{.Num}}Struct struct {
 {{range .Include}}
 	{{.}}Struct
 {{end}}
-	Internal struct {
-{{range .Methods}}
-		{{.Name}} func({{.NamedParams}}) ({{.Results}}) `+"`"+`{{range .Tags}}{{index . 0}}:"{{index . 1}}"{{end}}`+"`"+`
-{{end}}
-	}
+	Internal {{.Num}}Methods
 }
 
-type {{.Name}}Stub struct {
+type {{.Num}}Methods struct {
+{{range .Methods}}
+	{{.Num}} func({{.NamedParams}}) ({{.Results}}) `+"`"+`{{$first := true}}{{range .Tags}}{{if $first}}{{$first = false}}{{else}} {{end}}{{index . 0}}:"{{index . 1}}"{{end}}`+"`"+`
+
+{{end}}
+	}
+
+type {{.Num}}Stub struct {
 {{range .Include}}
 	{{.}}Stub
 {{end}}
@@ -318,19 +320,22 @@ type {{.Name}}Stub struct {
 {{end}}
 
 {{range .Infos}}
-{{$name := .Name}}
+{{$name := .Num}}
 {{range .Methods}}
-func (s *{{$name}}Struct) {{.Name}}({{.NamedParams}}) ({{.Results}}) {
-	return s.Internal.{{.Name}}({{.ParamNames}})
+func (s *{{$name}}Struct) {{.Num}}({{.NamedParams}}) ({{.Results}}) {
+	if s.Internal.{{.Num}} == nil {
+		return {{.DefRes}}ErrNotSupported
+	}
+	return s.Internal.{{.Num}}({{.ParamNames}})
 }
 
-func (s *{{$name}}Stub) {{.Name}}({{.NamedParams}}) ({{.Results}}) {
-	return {{.DefRes}}xerrors.New("method not supported")
+func (s *{{$name}}Stub) {{.Num}}({{.NamedParams}}) ({{.Results}}) {
+	return {{.DefRes}}ErrNotSupported
 }
 {{end}}
 {{end}}
 
-{{range .Infos}}var _ {{.Name}} = new({{.Name}}Struct)
+{{range .Infos}}var _ {{.Num}} = new({{.Num}}Struct)
 {{end}}
 
 `)

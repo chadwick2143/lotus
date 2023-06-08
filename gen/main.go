@@ -7,13 +7,15 @@ import (
 	gen "github.com/whyrusleeping/cbor-gen"
 
 	"github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/chain/exchange"
 	"github.com/filecoin-project/lotus/chain/market"
 	"github.com/filecoin-project/lotus/chain/types"
-	sectorstorage "github.com/filecoin-project/lotus/extern/sector-storage"
-	"github.com/filecoin-project/lotus/extern/sector-storage/storiface"
+	"github.com/filecoin-project/lotus/cmd/lotus-shed/shedgen"
 	"github.com/filecoin-project/lotus/node/hello"
 	"github.com/filecoin-project/lotus/paychmgr"
+	sectorstorage "github.com/filecoin-project/lotus/storage/sealer"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
 func main() {
@@ -24,13 +26,21 @@ func main() {
 		types.Message{},
 		types.SignedMessage{},
 		types.MsgMeta{},
-		types.Actor{},
-		types.MessageReceipt{},
+		types.ActorV4{},
+		types.ActorV5{},
+		// types.MessageReceipt{}, // Custom serde to deal with versioning.
 		types.BlockMsg{},
 		types.ExpTipSet{},
 		types.BeaconEntry{},
 		types.StateRoot{},
 		types.StateInfo0{},
+		types.Event{},
+		types.EventEntry{},
+		// Tracing
+		types.GasTrace{},
+		types.MessageTrace{},
+		types.ReturnTrace{},
+		types.ExecutionTrace{},
 	)
 	if err != nil {
 		fmt.Println(err)
@@ -53,6 +63,9 @@ func main() {
 		api.SealedRefs{},
 		api.SealTicket{},
 		api.SealSeed{},
+		api.PieceDealInfo{},
+		api.SectorPiece{},
+		api.DealSchedule{},
 	)
 	if err != nil {
 		fmt.Println(err)
@@ -87,18 +100,36 @@ func main() {
 		os.Exit(1)
 	}
 
-	err = gen.WriteMapEncodersToFile("./extern/sector-storage/storiface/cbor_gen.go", "storiface",
+	err = gen.WriteMapEncodersToFile("./storage/sealer/storiface/cbor_gen.go", "storiface",
 		storiface.CallID{},
+		storiface.SecDataHttpHeader{},
+		storiface.SectorLocation{},
 	)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 
-	err = gen.WriteMapEncodersToFile("./extern/sector-storage/cbor_gen.go", "sectorstorage",
+	err = gen.WriteMapEncodersToFile("./storage/sealer/cbor_gen.go", "sealer",
 		sectorstorage.Call{},
 		sectorstorage.WorkState{},
 		sectorstorage.WorkID{},
+	)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	err = gen.WriteMapEncodersToFile("./cmd/lotus-shed/shedgen/cbor_gen.go", "shedgen",
+		shedgen.CarbNode{},
+	)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	err = gen.WriteTupleEncodersToFile("./blockstore/cbor_gen.go", "blockstore",
+		blockstore.NetRpcReq{},
+		blockstore.NetRpcResp{},
+		blockstore.NetRpcErr{},
 	)
 	if err != nil {
 		fmt.Println(err)

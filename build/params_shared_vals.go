@@ -1,3 +1,4 @@
+//go:build !testground
 // +build !testground
 
 package build
@@ -9,7 +10,6 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/network"
-
 	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
 
 	"github.com/filecoin-project/lotus/chain/actors/policy"
@@ -25,8 +25,14 @@ const UnixfsLinksPerLevel = 1024
 // Consensus / Network
 
 const AllowableClockDriftSecs = uint64(1)
-const NewestNetworkVersion = network.Version11
-const ActorUpgradeNetworkVersion = network.Version4
+
+// Used by tests and some obscure tooling
+/* inline-gen template
+const TestNetworkVersion = network.Version{{.latestNetworkVersion}}
+/* inline-gen start */
+const TestNetworkVersion = network.Version20
+
+/* inline-gen end */
 
 // Epochs
 const ForkLengthThreshold = Finality
@@ -109,8 +115,9 @@ const VerifSigCacheSize = 32000
 // TODO: If this is gonna stay, it should move to specs-actors
 const BlockMessageLimit = 10000
 
-const BlockGasLimit = 10_000_000_000
-const BlockGasTarget = BlockGasLimit / 2
+var BlockGasLimit = int64(10_000_000_000)
+var BlockGasTarget = BlockGasLimit / 2
+
 const BaseFeeMaxChangeDenom = 8 // 12.5%
 const InitialBaseFee = 100e6
 const MinimumBaseFee = 100

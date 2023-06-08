@@ -3,23 +3,24 @@ package vm
 import (
 	"context"
 
-	"github.com/filecoin-project/go-state-types/network"
-
-	"github.com/filecoin-project/lotus/build"
-
-	"github.com/filecoin-project/go-state-types/big"
-	"github.com/filecoin-project/go-state-types/exitcode"
-	"github.com/filecoin-project/lotus/chain/actors"
-
 	"github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
 
+	"github.com/filecoin-project/go-address"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/exitcode"
+	"github.com/filecoin-project/go-state-types/network"
 	builtin0 "github.com/filecoin-project/specs-actors/actors/builtin"
 	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
 	builtin3 "github.com/filecoin-project/specs-actors/v3/actors/builtin"
 	builtin4 "github.com/filecoin-project/specs-actors/v4/actors/builtin"
+	builtin5 "github.com/filecoin-project/specs-actors/v5/actors/builtin"
+	builtin6 "github.com/filecoin-project/specs-actors/v6/actors/builtin"
+	builtin7 "github.com/filecoin-project/specs-actors/v7/actors/builtin"
 
-	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/aerrors"
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/account"
@@ -53,7 +54,12 @@ func TryCreateAccountActor(rt *Runtime, addr address.Address) (*types.Actor, add
 		return nil, address.Undef, aerrors.Escalate(err, "registering actor address")
 	}
 
-	act, aerr := makeActor(actors.VersionForNetwork(rt.NetworkVersion()), addr)
+	av, err := actorstypes.VersionForNetwork(rt.NetworkVersion())
+	if err != nil {
+		return nil, address.Undef, aerrors.Escalate(err, "unsupported network version")
+	}
+
+	act, aerr := makeAccountActor(av, addr)
 	if aerr != nil {
 		return nil, address.Undef, aerr
 	}
@@ -80,10 +86,10 @@ func TryCreateAccountActor(rt *Runtime, addr address.Address) (*types.Actor, add
 	return act, addrID, nil
 }
 
-func makeActor(ver actors.Version, addr address.Address) (*types.Actor, aerrors.ActorError) {
+func makeAccountActor(ver actorstypes.Version, addr address.Address) (*types.Actor, aerrors.ActorError) {
 	switch addr.Protocol() {
 	case address.BLS, address.SECP256K1:
-		return newAccountActor(ver), nil
+		return newAccountActor(ver, addr), nil
 	case address.ID:
 		return nil, aerrors.Newf(exitcode.SysErrInvalidReceiver, "no actor with given ID: %s", addr)
 	case address.Actor:
@@ -93,18 +99,24 @@ func makeActor(ver actors.Version, addr address.Address) (*types.Actor, aerrors.
 	}
 }
 
-func newAccountActor(ver actors.Version) *types.Actor {
+func newAccountActor(ver actorstypes.Version, addr address.Address) *types.Actor {
 	// TODO: ActorsUpgrade use a global actor registry?
 	var code cid.Cid
 	switch ver {
-	case actors.Version0:
+	case actorstypes.Version0:
 		code = builtin0.AccountActorCodeID
-	case actors.Version2:
+	case actorstypes.Version2:
 		code = builtin2.AccountActorCodeID
-	case actors.Version3:
+	case actorstypes.Version3:
 		code = builtin3.AccountActorCodeID
-	case actors.Version4:
+	case actorstypes.Version4:
 		code = builtin4.AccountActorCodeID
+	case actorstypes.Version5:
+		code = builtin5.AccountActorCodeID
+	case actorstypes.Version6:
+		code = builtin6.AccountActorCodeID
+	case actorstypes.Version7:
+		code = builtin7.AccountActorCodeID
 	default:
 		panic("unsupported actors version")
 	}
@@ -112,6 +124,7 @@ func newAccountActor(ver actors.Version) *types.Actor {
 		Code:    code,
 		Balance: types.NewInt(0),
 		Head:    EmptyObjectCid,
+		Address: &addr,
 	}
 
 	return nact

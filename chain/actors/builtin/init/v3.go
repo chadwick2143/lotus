@@ -1,19 +1,24 @@
 package init
 
 import (
-	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/go-state-types/abi"
+	"crypto/sha256"
+	"fmt"
+
 	"github.com/ipfs/go-cid"
 	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/lotus/chain/actors/adt"
-	"github.com/filecoin-project/lotus/node/modules/dtypes"
-
+	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/manifest"
 	builtin3 "github.com/filecoin-project/specs-actors/v3/actors/builtin"
-
 	init3 "github.com/filecoin-project/specs-actors/v3/actors/builtin/init"
 	adt3 "github.com/filecoin-project/specs-actors/v3/actors/util/adt"
+
+	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
+	"github.com/filecoin-project/lotus/node/modules/dtypes"
 )
 
 var _ State = (*state3)(nil)
@@ -24,6 +29,19 @@ func load3(store adt.Store, root cid.Cid) (State, error) {
 	if err != nil {
 		return nil, err
 	}
+	return &out, nil
+}
+
+func make3(store adt.Store, networkName string) (State, error) {
+	out := state3{store: store}
+
+	s, err := init3.ConstructState(store, networkName)
+	if err != nil {
+		return nil, err
+	}
+
+	out.State = *s
+
 	return &out, nil
 }
 
@@ -64,6 +82,11 @@ func (s *state3) SetNetworkName(name string) error {
 	return nil
 }
 
+func (s *state3) SetNextID(id abi.ActorID) error {
+	s.State.NextID = id
+	return nil
+}
+
 func (s *state3) Remove(addrs ...address.Address) (err error) {
 	m, err := adt3.AsMap(s.store, s.State.AddressMap, builtin3.DefaultHamtBitwidth)
 	if err != nil {
@@ -82,6 +105,43 @@ func (s *state3) Remove(addrs ...address.Address) (err error) {
 	return nil
 }
 
-func (s *state3) addressMap() (adt.Map, error) {
-	return adt3.AsMap(s.store, s.AddressMap, builtin3.DefaultHamtBitwidth)
+func (s *state3) SetAddressMap(mcid cid.Cid) error {
+	s.State.AddressMap = mcid
+	return nil
+}
+
+func (s *state3) GetState() interface{} {
+	return &s.State
+}
+
+func (s *state3) AddressMap() (adt.Map, error) {
+	return adt3.AsMap(s.store, s.State.AddressMap, builtin3.DefaultHamtBitwidth)
+}
+
+func (s *state3) AddressMapBitWidth() int {
+	return builtin3.DefaultHamtBitwidth
+}
+
+func (s *state3) AddressMapHashFunction() func(input []byte) []byte {
+	return func(input []byte) []byte {
+		res := sha256.Sum256(input)
+		return res[:]
+	}
+}
+
+func (s *state3) ActorKey() string {
+	return manifest.InitKey
+}
+
+func (s *state3) ActorVersion() actorstypes.Version {
+	return actorstypes.Version3
+}
+
+func (s *state3) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

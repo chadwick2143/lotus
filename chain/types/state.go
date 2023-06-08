@@ -13,8 +13,12 @@ const (
 	StateTreeVersion1
 	// StateTreeVersion2 corresponds to actors v3.
 	StateTreeVersion2
-	// StateTreeVersion3 corresponds to actors >= v4.
+	// StateTreeVersion3 corresponds to actors v4.
 	StateTreeVersion3
+	// StateTreeVersion4 corresponds to actors v5 and above.
+	StateTreeVersion4
+	// StateTreeVersion5 corresponds to actors v10 and above.
+	StateTreeVersion5
 )
 
 type StateRoot struct {

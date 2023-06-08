@@ -6,15 +6,21 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ipfs/go-cid"
+	"github.com/urfave/cli/v2"
+	cbg "github.com/whyrusleeping/cbor-gen"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	cborutil "github.com/filecoin-project/go-cbor-util"
@@ -26,18 +32,14 @@ import (
 	"github.com/filecoin-project/specs-actors/actors/builtin/miner"
 	"github.com/filecoin-project/specs-actors/actors/builtin/power"
 	"github.com/filecoin-project/specs-actors/actors/util/adt"
-	cid "github.com/ipfs/go-cid"
-	"github.com/urfave/cli/v2"
-	cbg "github.com/whyrusleeping/cbor-gen"
-	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/lotus/api"
 	lapi "github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/api/v0api"
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors"
-	"github.com/filecoin-project/lotus/chain/stmgr"
-	types "github.com/filecoin-project/lotus/chain/types"
+	"github.com/filecoin-project/lotus/chain/consensus"
+	"github.com/filecoin-project/lotus/chain/types"
 )
 
 var ChainCmd = &cli.Command{
@@ -55,12 +57,14 @@ var ChainCmd = &cli.Command{
 		ChainGetCmd,
 		ChainBisectCmd,
 		ChainExportCmd,
+		ChainExportRangeCmd,
 		SlashConsensusFault,
 		ChainGasPriceCmd,
 		ChainInspectUsage,
 		ChainDecodeCmd,
 		ChainEncodeCmd,
 		ChainDisputeSetCmd,
+		ChainPruneCmd,
 	},
 }
 
@@ -68,6 +72,8 @@ var ChainHeadCmd = &cli.Command{
 	Name:  "head",
 	Usage: "Print chain head",
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
+
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
@@ -81,14 +87,15 @@ var ChainHeadCmd = &cli.Command{
 		}
 
 		for _, c := range head.Cids() {
-			fmt.Println(c)
+			afmt.Println(c)
 		}
 		return nil
 	},
 }
 
 var ChainGetBlock = &cli.Command{
-	Name:      "getblock",
+	Name:      "get-block",
+	Aliases:   []string{"getblock"},
 	Usage:     "Get a block and print its details",
 	ArgsUsage: "[blockCid]",
 	Flags: []cli.Flag{
@@ -98,6 +105,8 @@ var ChainGetBlock = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
+
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
@@ -105,8 +114,8 @@ var ChainGetBlock = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass cid of block to print")
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		bcid, err := cid.Decode(cctx.Args().First())
@@ -125,7 +134,7 @@ var ChainGetBlock = &cli.Command{
 				return err
 			}
 
-			fmt.Println(string(out))
+			afmt.Println(string(out))
 			return nil
 		}
 
@@ -142,7 +151,7 @@ var ChainGetBlock = &cli.Command{
 		recpts, err := api.ChainGetParentReceipts(ctx, bcid)
 		if err != nil {
 			log.Warn(err)
-			//return xerrors.Errorf("failed to get receipts: %w", err)
+			// return xerrors.Errorf("failed to get receipts: %w", err)
 		}
 
 		cblock := struct {
@@ -164,9 +173,8 @@ var ChainGetBlock = &cli.Command{
 			return err
 		}
 
-		fmt.Println(string(out))
+		afmt.Println(string(out))
 		return nil
-
 	},
 }
 
@@ -183,12 +191,18 @@ var ChainReadObjCmd = &cli.Command{
 	Usage:     "Read the raw bytes of an object",
 	ArgsUsage: "[objectCid]",
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
+
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
 		}
 		defer closer()
 		ctx := ReqContext(cctx)
+
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
 
 		c, err := cid.Decode(cctx.Args().First())
 		if err != nil {
@@ -200,7 +214,7 @@ var ChainReadObjCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Printf("%x\n", obj)
+		afmt.Printf("%x\n", obj)
 		return nil
 	},
 }
@@ -216,12 +230,18 @@ var ChainDeleteObjCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
+
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
 		}
 		defer closer()
 		ctx := ReqContext(cctx)
+
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
 
 		c, err := cid.Decode(cctx.Args().First())
 		if err != nil {
@@ -237,7 +257,7 @@ var ChainDeleteObjCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Printf("Obj %s deleted\n", c.String())
+		afmt.Printf("Obj %s deleted\n", c.String())
 		return nil
 	},
 }
@@ -258,12 +278,17 @@ var ChainStatObjCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
 		}
 		defer closer()
 		ctx := ReqContext(cctx)
+
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
 
 		obj, err := cid.Decode(cctx.Args().First())
 		if err != nil {
@@ -283,19 +308,22 @@ var ChainStatObjCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Printf("Links: %d\n", stats.Links)
-		fmt.Printf("Size: %s (%d)\n", types.SizeStr(types.NewInt(stats.Size)), stats.Size)
+		afmt.Printf("Links: %d\n", stats.Links)
+		afmt.Printf("Size: %s (%d)\n", types.SizeStr(types.NewInt(stats.Size)), stats.Size)
 		return nil
 	},
 }
 
 var ChainGetMsgCmd = &cli.Command{
 	Name:      "getmessage",
+	Aliases:   []string{"get-message", "get-msg"},
 	Usage:     "Get and print a message by its cid",
 	ArgsUsage: "[messageCid]",
 	Action: func(cctx *cli.Context) error {
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass a cid of a message to get")
+		afmt := NewAppFmt(cctx.App)
+
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		api, closer, err := GetFullNodeAPI(cctx)
@@ -332,13 +360,14 @@ var ChainGetMsgCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Println(string(enc))
+		afmt.Println(string(enc))
 		return nil
 	},
 }
 
 var ChainSetHeadCmd = &cli.Command{
 	Name:      "sethead",
+	Aliases:   []string{"set-head"},
 	Usage:     "manually set the local nodes head tipset (Caution: normally only used for recovery)",
 	ArgsUsage: "[tipsetkey]",
 	Flags: []cli.Flag{
@@ -358,6 +387,10 @@ var ChainSetHeadCmd = &cli.Command{
 		}
 		defer closer()
 		ctx := ReqContext(cctx)
+
+		if !cctx.Bool("genesis") && !cctx.IsSet("epoch") && cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
 
 		var ts *types.TipSet
 
@@ -407,6 +440,7 @@ var ChainInspectUsage = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
@@ -477,7 +511,7 @@ var ChainInspectUsage = &cli.Command{
 				return err
 			}
 
-			mm := stmgr.MethodsMap[code][m.Message.Method]
+			mm := consensus.NewActorRegistry().Methods[code][m.Message.Method] // TODO: use remote map
 
 			byMethod[mm.Name] += m.Message.GasLimit
 			byMethodC[mm.Name]++
@@ -508,23 +542,23 @@ var ChainInspectUsage = &cli.Command{
 
 		numRes := cctx.Int("num-results")
 
-		fmt.Printf("Total Gas Limit: %d\n", sum)
-		fmt.Printf("By Sender:\n")
+		afmt.Printf("Total Gas Limit: %d\n", sum)
+		afmt.Printf("By Sender:\n")
 		for i := 0; i < numRes && i < len(senderVals); i++ {
 			sv := senderVals[i]
-			fmt.Printf("%s\t%0.2f%%\t(total: %d, count: %d)\n", sv.Key, (100*float64(sv.Gas))/float64(sum), sv.Gas, bySenderC[sv.Key])
+			afmt.Printf("%s\t%0.2f%%\t(total: %d, count: %d)\n", sv.Key, (100*float64(sv.Gas))/float64(sum), sv.Gas, bySenderC[sv.Key])
 		}
-		fmt.Println()
-		fmt.Printf("By Receiver:\n")
+		afmt.Println()
+		afmt.Printf("By Receiver:\n")
 		for i := 0; i < numRes && i < len(destVals); i++ {
 			sv := destVals[i]
-			fmt.Printf("%s\t%0.2f%%\t(total: %d, count: %d)\n", sv.Key, (100*float64(sv.Gas))/float64(sum), sv.Gas, byDestC[sv.Key])
+			afmt.Printf("%s\t%0.2f%%\t(total: %d, count: %d)\n", sv.Key, (100*float64(sv.Gas))/float64(sum), sv.Gas, byDestC[sv.Key])
 		}
-		fmt.Println()
-		fmt.Printf("By Method:\n")
+		afmt.Println()
+		afmt.Printf("By Method:\n")
 		for i := 0; i < numRes && i < len(methodVals); i++ {
 			sv := methodVals[i]
-			fmt.Printf("%s\t%0.2f%%\t(total: %d, count: %d)\n", sv.Key, (100*float64(sv.Gas))/float64(sum), sv.Gas, byMethodC[sv.Key])
+			afmt.Printf("%s\t%0.2f%%\t(total: %d, count: %d)\n", sv.Key, (100*float64(sv.Gas))/float64(sum), sv.Gas, byMethodC[sv.Key])
 		}
 
 		return nil
@@ -536,7 +570,7 @@ var ChainListCmd = &cli.Command{
 	Aliases: []string{"love"},
 	Usage:   "View a segment of the chain",
 	Flags: []cli.Flag{
-		&cli.Uint64Flag{Name: "height"},
+		&cli.Uint64Flag{Name: "height", DefaultText: "current head"},
 		&cli.IntFlag{Name: "count", Value: 30},
 		&cli.StringFlag{
 			Name:  "format",
@@ -549,6 +583,7 @@ var ChainListCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
@@ -596,7 +631,7 @@ var ChainListCmd = &cli.Command{
 			tss = otss
 			for i, ts := range tss {
 				pbf := ts.Blocks()[0].ParentBaseFee
-				fmt.Printf("%d: %d blocks (baseFee: %s -> maxFee: %s)\n", ts.Height(), len(ts.Blocks()), ts.Blocks()[0].ParentBaseFee, types.FIL(types.BigMul(pbf, types.NewInt(uint64(build.BlockGasLimit)))))
+				afmt.Printf("%d: %d blocks (baseFee: %s -> maxFee: %s)\n", ts.Height(), len(ts.Blocks()), ts.Blocks()[0].ParentBaseFee, types.FIL(types.BigMul(pbf, types.NewInt(uint64(build.BlockGasLimit)))))
 
 				for _, b := range ts.Blocks() {
 					msgs, err := api.ChainGetBlockMessages(ctx, b.Cid())
@@ -622,7 +657,7 @@ var ChainListCmd = &cli.Command{
 						avgpremium = big.Div(psum, big.NewInt(int64(lenmsgs)))
 					}
 
-					fmt.Printf("\t%s: \t%d msgs, gasLimit: %d / %d (%0.2f%%), avgPremium: %s\n", b.Miner, len(msgs.BlsMessages)+len(msgs.SecpkMessages), limitSum, build.BlockGasLimit, 100*float64(limitSum)/float64(build.BlockGasLimit), avgpremium)
+					afmt.Printf("\t%s: \t%d msgs, gasLimit: %d / %d (%0.2f%%), avgPremium: %s\n", b.Miner, len(msgs.BlsMessages)+len(msgs.SecpkMessages), limitSum, build.BlockGasLimit, 100*float64(limitSum)/float64(build.BlockGasLimit), avgpremium)
 				}
 				if i < len(tss)-1 {
 					msgs, err := api.ChainGetParentMessages(ctx, tss[i+1].Blocks()[0].Cid())
@@ -647,13 +682,13 @@ var ChainListCmd = &cli.Command{
 					gasEfficiency := 100 * float64(gasUsed) / float64(limitSum)
 					gasCapacity := 100 * float64(limitSum) / float64(build.BlockGasLimit)
 
-					fmt.Printf("\ttipset: \t%d msgs, %d (%0.2f%%) / %d (%0.2f%%)\n", len(msgs), gasUsed, gasEfficiency, limitSum, gasCapacity)
+					afmt.Printf("\ttipset: \t%d msgs, %d (%0.2f%%) / %d (%0.2f%%)\n", len(msgs), gasUsed, gasEfficiency, limitSum, gasCapacity)
 				}
-				fmt.Println()
+				afmt.Println()
 			}
 		} else {
 			for i := len(tss) - 1; i >= 0; i-- {
-				printTipSet(cctx.String("format"), tss[i])
+				printTipSet(cctx.String("format"), tss[i], afmt)
 			}
 		}
 		return nil
@@ -708,12 +743,18 @@ var ChainGetCmd = &cli.Command{
    - account-state
 `,
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
+
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
 		}
 		defer closer()
 		ctx := ReqContext(cctx)
+
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
+		}
 
 		p := path.Clean(cctx.Args().First())
 		if strings.HasPrefix(p, "/pstate") {
@@ -726,7 +767,7 @@ var ChainGetCmd = &cli.Command{
 
 			p = "/ipfs/" + ts.ParentState().String() + p
 			if cctx.Bool("verbose") {
-				fmt.Println(p)
+				afmt.Println(p)
 			}
 		}
 
@@ -741,7 +782,7 @@ var ChainGetCmd = &cli.Command{
 			if err != nil {
 				return err
 			}
-			fmt.Println(string(b))
+			afmt.Println(string(b))
 			return nil
 		}
 
@@ -783,7 +824,7 @@ var ChainGetCmd = &cli.Command{
 		}
 
 		if cbu == nil {
-			fmt.Printf("%x", raw)
+			afmt.Printf("%x", raw)
 			return nil
 		}
 
@@ -795,7 +836,7 @@ var ChainGetCmd = &cli.Command{
 		if err != nil {
 			return err
 		}
-		fmt.Println(string(b))
+		afmt.Println(string(b))
 		return nil
 	},
 }
@@ -879,7 +920,7 @@ func handleHamtAddress(ctx context.Context, api v0api.FullNode, r cid.Cid) error
 	})
 }
 
-func printTipSet(format string, ts *types.TipSet) {
+func printTipSet(format string, ts *types.TipSet, afmt *AppFmt) {
 	format = strings.ReplaceAll(format, "<height>", fmt.Sprint(ts.Height()))
 	format = strings.ReplaceAll(format, "<time>", time.Unix(int64(ts.MinTimestamp()), 0).Format(time.Stamp))
 	blks := "[ "
@@ -898,7 +939,7 @@ func printTipSet(format string, ts *types.TipSet) {
 	format = strings.ReplaceAll(format, "<blocks>", blks)
 	format = strings.ReplaceAll(format, "<weight>", fmt.Sprint(ts.Blocks()[0].ParentWeight))
 
-	fmt.Println(format)
+	afmt.Println(format)
 }
 
 var ChainBisectCmd = &cli.Command{
@@ -919,6 +960,8 @@ var ChainBisectCmd = &cli.Command{
    For special path elements see 'chain get' help
 `,
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
+
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
@@ -926,8 +969,8 @@ var ChainBisectCmd = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
-		if cctx.Args().Len() < 4 {
-			return xerrors.New("need at least 4 args")
+		if cctx.NArg() < 4 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		start, err := strconv.ParseUint(cctx.Args().Get(0), 10, 64)
@@ -962,7 +1005,7 @@ var ChainBisectCmd = &cli.Command{
 			}
 
 			path := "/ipld/" + midTs.ParentState().String() + "/" + subPath
-			fmt.Printf("* Testing %d (%d - %d) (%s): ", mid, start, end, path)
+			afmt.Printf("* Testing %d (%d - %d) (%s): ", mid, start, end, path)
 
 			nd, err := api.ChainGetNode(ctx, path)
 			if err != nil {
@@ -989,32 +1032,32 @@ var ChainBisectCmd = &cli.Command{
 				if strings.TrimSpace(out.String()) != "false" {
 					end = mid
 					highest = midTs
-					fmt.Println("true")
+					afmt.Println("true")
 				} else {
 					start = mid
-					fmt.Printf("false (cli)\n")
+					afmt.Printf("false (cli)\n")
 				}
 			case *exec.ExitError:
 				if len(serr.String()) > 0 {
-					fmt.Println("error")
+					afmt.Println("error")
 
-					fmt.Printf("> Command: %s\n---->\n", strings.Join(cctx.Args().Slice()[3:], " "))
-					fmt.Println(string(b))
-					fmt.Println("<----")
+					afmt.Printf("> Command: %s\n---->\n", strings.Join(cctx.Args().Slice()[3:], " "))
+					afmt.Println(string(b))
+					afmt.Println("<----")
 					return xerrors.Errorf("error running bisect check: %s", serr.String())
 				}
 
 				start = mid
-				fmt.Println("false")
+				afmt.Println("false")
 			default:
 				return err
 			}
 
 			if start == end {
 				if strings.TrimSpace(out.String()) == "true" {
-					fmt.Println(midTs.Height())
+					afmt.Println(midTs.Height())
 				} else {
-					fmt.Println(prev)
+					afmt.Println(prev)
 				}
 				return nil
 			}
@@ -1030,7 +1073,9 @@ var ChainExportCmd = &cli.Command{
 	ArgsUsage: "[outputPath]",
 	Flags: []cli.Flag{
 		&cli.StringFlag{
-			Name: "tipset",
+			Name:  "tipset",
+			Usage: "specify tipset to start the export from",
+			Value: "@head",
 		},
 		&cli.Int64Flag{
 			Name:  "recent-stateroots",
@@ -1048,8 +1093,8 @@ var ChainExportCmd = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must specify filename to export chain to")
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		rsrs := abi.ChainEpoch(cctx.Int64("recent-stateroots"))
@@ -1057,7 +1102,7 @@ var ChainExportCmd = &cli.Command{
 			return fmt.Errorf("\"recent-stateroots\" has to be greater than %d", build.Finality)
 		}
 
-		fi, err := os.Create(cctx.Args().First())
+		fi, err := createExportFile(cctx.App, cctx.Args().First())
 		if err != nil {
 			return err
 		}
@@ -1102,6 +1147,109 @@ var ChainExportCmd = &cli.Command{
 	},
 }
 
+var ChainExportRangeCmd = &cli.Command{
+	Name:      "export-range",
+	Usage:     "export chain to a car file",
+	ArgsUsage: "",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "head",
+			Usage: "specify tipset to start the export from (higher epoch)",
+			Value: "@head",
+		},
+		&cli.StringFlag{
+			Name:  "tail",
+			Usage: "specify tipset to end the export at (lower epoch)",
+			Value: "@tail",
+		},
+		&cli.BoolFlag{
+			Name:  "messages",
+			Usage: "specify if messages should be include",
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name:  "receipts",
+			Usage: "specify if receipts should be include",
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name:  "stateroots",
+			Usage: "specify if stateroots should be include",
+			Value: false,
+		},
+		&cli.IntFlag{
+			Name:  "workers",
+			Usage: "specify the number of workers",
+			Value: 1,
+		},
+		&cli.IntFlag{
+			Name:  "write-buffer",
+			Usage: "specify write buffer size",
+			Value: 1 << 20,
+		},
+		&cli.BoolFlag{
+			Name:   "internal",
+			Usage:  "write the file locally to disk",
+			Value:  true,
+			Hidden: true, // currently, non-internal export is not implemented.
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPIV1(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		ctx := ReqContext(cctx)
+
+		var head, tail *types.TipSet
+		headstr := cctx.String("head")
+		if headstr == "@head" {
+			head, err = api.ChainHead(ctx)
+			if err != nil {
+				return err
+			}
+		} else {
+			head, err = ParseTipSetRef(ctx, api, headstr)
+			if err != nil {
+				return fmt.Errorf("parsing head: %w", err)
+			}
+		}
+		tailstr := cctx.String("tail")
+		if tailstr == "@tail" {
+			tail, err = api.ChainGetGenesis(ctx)
+			if err != nil {
+				return err
+			}
+		} else {
+			tail, err = ParseTipSetRef(ctx, api, tailstr)
+			if err != nil {
+				return fmt.Errorf("parsing tail: %w", err)
+			}
+		}
+
+		if head.Height() < tail.Height() {
+			return errors.New("Height of --head tipset must be greater or equal to the height of the --tail tipset")
+		}
+
+		if !cctx.Bool("internal") {
+			return errors.New("Non-internal exports are not implemented")
+		}
+
+		err = api.ChainExportRangeInternal(ctx, head.Key(), tail.Key(), lapi.ChainExportConfig{
+			WriteBufferSize:   cctx.Int("write-buffer"),
+			NumWorkers:        cctx.Int("workers"),
+			IncludeMessages:   cctx.Bool("messages"),
+			IncludeReceipts:   cctx.Bool("receipts"),
+			IncludeStateRoots: cctx.Bool("stateroots"),
+		})
+		if err != nil {
+			return err
+		}
+		return nil
+	},
+}
+
 var SlashConsensusFault = &cli.Command{
 	Name:      "slash-consensus",
 	Usage:     "Report consensus fault",
@@ -1117,6 +1265,8 @@ var SlashConsensusFault = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
+
 		srv, err := GetFullNodeServices(cctx)
 		if err != nil {
 			return err
@@ -1221,7 +1371,7 @@ var SlashConsensusFault = &cli.Command{
 			return err
 		}
 
-		fmt.Println(smsg.Cid())
+		afmt.Println(smsg.Cid())
 
 		return nil
 	},
@@ -1231,6 +1381,8 @@ var ChainGasPriceCmd = &cli.Command{
 	Name:  "gas-price",
 	Usage: "Estimate gas prices",
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
+
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
@@ -1247,7 +1399,7 @@ var ChainGasPriceCmd = &cli.Command{
 				return err
 			}
 
-			fmt.Printf("%d blocks: %s (%s)\n", nblocks, est, types.FIL(est))
+			afmt.Printf("%d blocks: %s (%s)\n", nblocks, est, types.FIL(est))
 		}
 
 		return nil
@@ -1277,6 +1429,8 @@ var chainDecodeParamsCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
+		afmt := NewAppFmt(cctx.App)
+
 		api, closer, err := GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
@@ -1284,8 +1438,8 @@ var chainDecodeParamsCmd = &cli.Command{
 		defer closer()
 		ctx := ReqContext(cctx)
 
-		if cctx.Args().Len() != 3 {
-			return ShowHelp(cctx, fmt.Errorf("incorrect number of arguments"))
+		if cctx.NArg() != 3 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		to, err := address.NewFromString(cctx.Args().First())
@@ -1328,7 +1482,7 @@ var chainDecodeParamsCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Println(pstr)
+		afmt.Println(pstr)
 
 		return nil
 	},
@@ -1345,7 +1499,7 @@ var ChainEncodeCmd = &cli.Command{
 var chainEncodeParamsCmd = &cli.Command{
 	Name:      "params",
 	Usage:     "Encodes the given JSON params",
-	ArgsUsage: "[toAddr method params]",
+	ArgsUsage: "[dest method params]",
 	Flags: []cli.Flag{
 		&cli.StringFlag{
 			Name: "tipset",
@@ -1355,22 +1509,16 @@ var chainEncodeParamsCmd = &cli.Command{
 			Value: "base64",
 			Usage: "specify input encoding to parse",
 		},
+		&cli.BoolFlag{
+			Name:  "to-code",
+			Usage: "interpret dest as code CID instead of as address",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
-		api, closer, err := GetFullNodeAPI(cctx)
-		if err != nil {
-			return err
-		}
-		defer closer()
-		ctx := ReqContext(cctx)
+		afmt := NewAppFmt(cctx.App)
 
-		if cctx.Args().Len() != 3 {
-			return ShowHelp(cctx, fmt.Errorf("incorrect number of arguments"))
-		}
-
-		to, err := address.NewFromString(cctx.Args().First())
-		if err != nil {
-			return xerrors.Errorf("parsing toAddr: %w", err)
+		if cctx.NArg() != 3 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		method, err := strconv.ParseInt(cctx.Args().Get(1), 10, 64)
@@ -1378,41 +1526,163 @@ var chainEncodeParamsCmd = &cli.Command{
 			return xerrors.Errorf("parsing method id: %w", err)
 		}
 
-		ts, err := LoadTipSet(ctx, cctx, api)
-		if err != nil {
-			return err
-		}
+		ctx := ReqContext(cctx)
 
-		act, err := api.StateGetActor(ctx, to, ts.Key())
-		if err != nil {
-			return xerrors.Errorf("getting actor: %w", err)
-		}
+		var p []byte
+		if !cctx.Bool("to-code") {
+			svc, err := GetFullNodeServices(cctx)
+			if err != nil {
+				return err
+			}
+			defer svc.Close() // nolint
 
-		methodMeta, found := stmgr.MethodsMap[act.Code][abi.MethodNum(method)]
-		if !found {
-			return fmt.Errorf("method %d not found on actor %s", method, act.Code)
-		}
+			to, err := address.NewFromString(cctx.Args().First())
+			if err != nil {
+				return xerrors.Errorf("parsing to addr: %w", err)
+			}
 
-		p := reflect.New(methodMeta.Params.Elem()).Interface().(cbg.CBORMarshaler)
+			p, err = svc.DecodeTypedParamsFromJSON(ctx, to, abi.MethodNum(method), cctx.Args().Get(2))
+			if err != nil {
+				return xerrors.Errorf("decoding json params: %w", err)
+			}
+		} else {
+			api, done, err := GetFullNodeAPIV1(cctx)
+			if err != nil {
+				return err
+			}
+			defer done()
 
-		if err := json.Unmarshal([]byte(cctx.Args().Get(2)), p); err != nil {
-			return fmt.Errorf("unmarshaling input into params type: %w", err)
-		}
+			to, err := cid.Parse(cctx.Args().First())
+			if err != nil {
+				return xerrors.Errorf("parsing to addr: %w", err)
+			}
 
-		buf := new(bytes.Buffer)
-		if err := p.MarshalCBOR(buf); err != nil {
-			return err
+			p, err = api.StateEncodeParams(ctx, to, abi.MethodNum(method), json.RawMessage(cctx.Args().Get(2)))
+			if err != nil {
+				return xerrors.Errorf("decoding json params: %w", err)
+			}
 		}
 
 		switch cctx.String("encoding") {
-		case "base64":
-			fmt.Println(base64.StdEncoding.EncodeToString(buf.Bytes()))
+		case "base64", "b64":
+			afmt.Println(base64.StdEncoding.EncodeToString(p))
 		case "hex":
-			fmt.Println(hex.EncodeToString(buf.Bytes()))
+			afmt.Println(hex.EncodeToString(p))
 		default:
-			return xerrors.Errorf("unrecognized encoding: %s", cctx.String("encoding"))
+			return xerrors.Errorf("unknown encoding")
 		}
 
 		return nil
+	},
+}
+
+// createExportFile returns the export file handle from the app metadata, or creates a new file if it doesn't exist
+func createExportFile(app *cli.App, path string) (io.WriteCloser, error) {
+	if wc, ok := app.Metadata["export-file"]; ok {
+		return wc.(io.WriteCloser), nil
+	}
+
+	fi, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return fi, nil
+}
+
+var ChainPruneCmd = &cli.Command{
+	Name:  "prune",
+	Usage: "splitstore gc",
+	Subcommands: []*cli.Command{
+		chainPruneColdCmd,
+		chainPruneHotGCCmd,
+		chainPruneHotMovingGCCmd,
+	},
+}
+
+var chainPruneHotGCCmd = &cli.Command{
+	Name:  "hot",
+	Usage: "run online (badger vlog) garbage collection on hotstore",
+	Flags: []cli.Flag{
+		&cli.Float64Flag{Name: "threshold", Value: 0.01, Usage: "Threshold of vlog garbage for gc"},
+		&cli.BoolFlag{Name: "periodic", Value: false, Usage: "Run periodic gc over multiple vlogs. Otherwise run gc once"},
+	},
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPIV1(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		ctx := ReqContext(cctx)
+		opts := lapi.HotGCOpts{}
+		opts.Periodic = cctx.Bool("periodic")
+		opts.Threshold = cctx.Float64("threshold")
+
+		gcStart := time.Now()
+		err = api.ChainHotGC(ctx, opts)
+		gcTime := time.Since(gcStart)
+		fmt.Printf("Online GC took %v (periodic <%t> threshold <%f>)", gcTime, opts.Periodic, opts.Threshold)
+		return err
+	},
+}
+
+var chainPruneHotMovingGCCmd = &cli.Command{
+	Name:  "hot-moving",
+	Usage: "run moving gc on hotstore",
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPIV1(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		ctx := ReqContext(cctx)
+		opts := lapi.HotGCOpts{}
+		opts.Moving = true
+
+		gcStart := time.Now()
+		err = api.ChainHotGC(ctx, opts)
+		gcTime := time.Since(gcStart)
+		fmt.Printf("Moving GC took %v", gcTime)
+		return err
+	},
+}
+
+var chainPruneColdCmd = &cli.Command{
+	Name:  "compact-cold",
+	Usage: "force splitstore compaction on cold store state and run gc",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "online-gc",
+			Value: false,
+			Usage: "use online gc for garbage collecting the coldstore",
+		},
+		&cli.BoolFlag{
+			Name:  "moving-gc",
+			Value: false,
+			Usage: "use moving gc for garbage collecting the coldstore",
+		},
+		&cli.IntFlag{
+			Name:  "retention",
+			Value: -1,
+			Usage: "specify state retention policy",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPIV1(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+		ctx := ReqContext(cctx)
+
+		opts := lapi.PruneOpts{}
+		if cctx.Bool("online-gc") {
+			opts.MovingGC = false
+		}
+		if cctx.Bool("moving-gc") {
+			opts.MovingGC = true
+		}
+		opts.RetainState = int64(cctx.Int("retention"))
+
+		return api.ChainPrune(ctx, opts)
 	},
 }

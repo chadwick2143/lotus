@@ -3,22 +3,24 @@ package miner
 import (
 	"bytes"
 	"errors"
+	"fmt"
 
-	"github.com/filecoin-project/go-state-types/big"
-
-	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/go-bitfield"
-	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/go-state-types/dline"
 	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p-core/peer"
 	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/lotus/chain/actors/adt"
-
+	"github.com/filecoin-project/go-bitfield"
+	rle "github.com/filecoin-project/go-bitfield/rle"
+	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/dline"
+	"github.com/filecoin-project/go-state-types/manifest"
 	miner0 "github.com/filecoin-project/specs-actors/actors/builtin/miner"
 	adt0 "github.com/filecoin-project/specs-actors/actors/util/adt"
+
+	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
 )
 
 var _ State = (*state0)(nil)
@@ -29,6 +31,12 @@ func load0(store adt.Store, root cid.Cid) (State, error) {
 	if err != nil {
 		return nil, err
 	}
+	return &out, nil
+}
+
+func make0(store adt.Store) (State, error) {
+	out := state0{store: store}
+	out.State = miner0.State{}
 	return &out, nil
 }
 
@@ -83,6 +91,7 @@ func (s *state0) PreCommitDeposits() (abi.TokenAmount, error) {
 	return s.State.PreCommitDeposits, nil
 }
 
+// Returns nil, nil if sector is not found
 func (s *state0) GetSector(num abi.SectorNumber) (*SectorOnChainInfo, error) {
 	info, ok, err := s.State.GetSector(s.store, num)
 	if !ok || err != nil {
@@ -133,6 +142,7 @@ func (s *state0) GetSectorExpiration(num abi.SectorNumber) (*SectorExpiration, e
 	// epoch (i.e., the first element in the partition's expiration queue.
 	// 2. If it's faulty, it will expire early within the first 14 entries
 	// of the expiration queue.
+
 	stopErr := errors.New("stop")
 	out := SectorExpiration{}
 	err = dls.ForEach(s.store, func(dlIdx uint64, dl *miner0.Deadline) error {
@@ -200,6 +210,22 @@ func (s *state0) GetPrecommittedSector(num abi.SectorNumber) (*SectorPreCommitOn
 	return &ret, nil
 }
 
+func (s *state0) ForEachPrecommittedSector(cb func(SectorPreCommitOnChainInfo) error) error {
+	precommitted, err := adt0.AsMap(s.store, s.State.PreCommittedSectors)
+	if err != nil {
+		return err
+	}
+
+	var info miner0.SectorPreCommitOnChainInfo
+	if err := precommitted.ForEach(&info, func(_ string) error {
+		return cb(fromV0SectorPreCommitOnChainInfo(info))
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (s *state0) LoadSectors(snos *bitfield.BitField) ([]*SectorOnChainInfo, error) {
 	sectors, err := miner0.LoadSectors(s.store, s.State.Sectors)
 	if err != nil {
@@ -233,13 +259,68 @@ func (s *state0) LoadSectors(snos *bitfield.BitField) ([]*SectorOnChainInfo, err
 	return infos, nil
 }
 
-func (s *state0) IsAllocated(num abi.SectorNumber) (bool, error) {
+func (s *state0) loadAllocatedSectorNumbers() (bitfield.BitField, error) {
 	var allocatedSectors bitfield.BitField
-	if err := s.store.Get(s.store.Context(), s.State.AllocatedSectors, &allocatedSectors); err != nil {
+	err := s.store.Get(s.store.Context(), s.State.AllocatedSectors, &allocatedSectors)
+	return allocatedSectors, err
+}
+
+func (s *state0) IsAllocated(num abi.SectorNumber) (bool, error) {
+	allocatedSectors, err := s.loadAllocatedSectorNumbers()
+	if err != nil {
 		return false, err
 	}
 
 	return allocatedSectors.IsSet(uint64(num))
+}
+
+func (s *state0) GetProvingPeriodStart() (abi.ChainEpoch, error) {
+	return s.State.ProvingPeriodStart, nil
+}
+
+func (s *state0) UnallocatedSectorNumbers(count int) ([]abi.SectorNumber, error) {
+	allocatedSectors, err := s.loadAllocatedSectorNumbers()
+	if err != nil {
+		return nil, err
+	}
+
+	allocatedRuns, err := allocatedSectors.RunIterator()
+	if err != nil {
+		return nil, err
+	}
+
+	unallocatedRuns, err := rle.Subtract(
+		&rle.RunSliceIterator{Runs: []rle.Run{{Val: true, Len: abi.MaxSectorNumber}}},
+		allocatedRuns,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	iter, err := rle.BitsFromRuns(unallocatedRuns)
+	if err != nil {
+		return nil, err
+	}
+
+	sectors := make([]abi.SectorNumber, 0, count)
+	for iter.HasNext() && len(sectors) < count {
+		nextNo, err := iter.Next()
+		if err != nil {
+			return nil, err
+		}
+		sectors = append(sectors, abi.SectorNumber(nextNo))
+	}
+
+	return sectors, nil
+}
+
+func (s *state0) GetAllocatedSectors() (*bitfield.BitField, error) {
+	var allocatedSectors bitfield.BitField
+	if err := s.store.Get(s.store.Context(), s.State.AllocatedSectors, &allocatedSectors); err != nil {
+		return nil, err
+	}
+
+	return &allocatedSectors, nil
 }
 
 func (s *state0) LoadDeadline(idx uint64) (Deadline, error) {
@@ -293,11 +374,6 @@ func (s *state0) Info() (MinerInfo, error) {
 		return MinerInfo{}, err
 	}
 
-	var pid *peer.ID
-	if peerID, err := peer.IDFromBytes(info.PeerId); err == nil {
-		pid = &peerID
-	}
-
 	wpp, err := info.SealProofType.RegisteredWindowPoStProof()
 	if err != nil {
 		return MinerInfo{}, err
@@ -308,20 +384,14 @@ func (s *state0) Info() (MinerInfo, error) {
 		Worker:           info.Worker,
 		ControlAddresses: info.ControlAddresses,
 
-		NewWorker:         address.Undef,
-		WorkerChangeEpoch: -1,
+		PendingWorkerKey: (*WorkerKeyChange)(info.PendingWorkerKey),
 
-		PeerId:                     pid,
+		PeerId:                     info.PeerId,
 		Multiaddrs:                 info.Multiaddrs,
 		WindowPoStProofType:        wpp,
 		SectorSize:                 info.SectorSize,
 		WindowPoStPartitionSectors: info.WindowPoStPartitionSectors,
 		ConsensusFaultElapsed:      -1,
-	}
-
-	if info.PendingWorkerKey != nil {
-		mi.NewWorker = info.PendingWorkerKey.NewWorker
-		mi.WorkerChangeEpoch = info.PendingWorkerKey.EffectiveAt
 	}
 
 	return mi, nil
@@ -361,6 +431,13 @@ func (s *state0) decodeSectorPreCommitOnChainInfo(val *cbg.Deferred) (SectorPreC
 	}
 
 	return fromV0SectorPreCommitOnChainInfo(sp), nil
+}
+
+func (s *state0) EraseAllUnproven() error {
+
+	// field doesn't exist until v2
+	return nil
+
 }
 
 func (d *deadline0) LoadPartition(idx uint64) (Partition, error) {
@@ -415,14 +492,62 @@ func (p *partition0) RecoveringSectors() (bitfield.BitField, error) {
 	return p.Partition.Recoveries, nil
 }
 
+func (p *partition0) UnprovenSectors() (bitfield.BitField, error) {
+	return bitfield.New(), nil
+}
+
 func fromV0SectorOnChainInfo(v0 miner0.SectorOnChainInfo) SectorOnChainInfo {
-
-	return (SectorOnChainInfo)(v0)
-
+	info := SectorOnChainInfo{
+		SectorNumber:          v0.SectorNumber,
+		SealProof:             v0.SealProof,
+		SealedCID:             v0.SealedCID,
+		DealIDs:               v0.DealIDs,
+		Activation:            v0.Activation,
+		Expiration:            v0.Expiration,
+		DealWeight:            v0.DealWeight,
+		VerifiedDealWeight:    v0.VerifiedDealWeight,
+		InitialPledge:         v0.InitialPledge,
+		ExpectedDayReward:     v0.ExpectedDayReward,
+		ExpectedStoragePledge: v0.ExpectedStoragePledge,
+	}
+	return info
 }
 
 func fromV0SectorPreCommitOnChainInfo(v0 miner0.SectorPreCommitOnChainInfo) SectorPreCommitOnChainInfo {
+	ret := SectorPreCommitOnChainInfo{
+		Info: SectorPreCommitInfo{
+			SealProof:     v0.Info.SealProof,
+			SectorNumber:  v0.Info.SectorNumber,
+			SealedCID:     v0.Info.SealedCID,
+			SealRandEpoch: v0.Info.SealRandEpoch,
+			DealIDs:       v0.Info.DealIDs,
+			Expiration:    v0.Info.Expiration,
+			UnsealedCid:   nil,
+		},
+		PreCommitDeposit: v0.PreCommitDeposit,
+		PreCommitEpoch:   v0.PreCommitEpoch,
+	}
 
-	return (SectorPreCommitOnChainInfo)(v0)
+	return ret
+}
 
+func (s *state0) GetState() interface{} {
+	return &s.State
+}
+
+func (s *state0) ActorKey() string {
+	return manifest.MinerKey
+}
+
+func (s *state0) ActorVersion() actorstypes.Version {
+	return actorstypes.Version0
+}
+
+func (s *state0) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

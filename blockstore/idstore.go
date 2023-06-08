@@ -4,11 +4,10 @@ import (
 	"context"
 	"io"
 
-	"golang.org/x/xerrors"
-
 	blocks "github.com/ipfs/go-block-format"
-	cid "github.com/ipfs/go-cid"
+	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+	"golang.org/x/xerrors"
 )
 
 var _ Blockstore = (*idstore)(nil)
@@ -38,7 +37,7 @@ func decodeCid(cid cid.Cid) (inline bool, data []byte, err error) {
 	return false, nil, err
 }
 
-func (b *idstore) Has(cid cid.Cid) (bool, error) {
+func (b *idstore) Has(ctx context.Context, cid cid.Cid) (bool, error) {
 	inline, _, err := decodeCid(cid)
 	if err != nil {
 		return false, xerrors.Errorf("error decoding Cid: %w", err)
@@ -48,10 +47,10 @@ func (b *idstore) Has(cid cid.Cid) (bool, error) {
 		return true, nil
 	}
 
-	return b.bs.Has(cid)
+	return b.bs.Has(ctx, cid)
 }
 
-func (b *idstore) Get(cid cid.Cid) (blocks.Block, error) {
+func (b *idstore) Get(ctx context.Context, cid cid.Cid) (blocks.Block, error) {
 	inline, data, err := decodeCid(cid)
 	if err != nil {
 		return nil, xerrors.Errorf("error decoding Cid: %w", err)
@@ -61,10 +60,10 @@ func (b *idstore) Get(cid cid.Cid) (blocks.Block, error) {
 		return blocks.NewBlockWithCid(data, cid)
 	}
 
-	return b.bs.Get(cid)
+	return b.bs.Get(ctx, cid)
 }
 
-func (b *idstore) GetSize(cid cid.Cid) (int, error) {
+func (b *idstore) GetSize(ctx context.Context, cid cid.Cid) (int, error) {
 	inline, data, err := decodeCid(cid)
 	if err != nil {
 		return 0, xerrors.Errorf("error decoding Cid: %w", err)
@@ -74,10 +73,10 @@ func (b *idstore) GetSize(cid cid.Cid) (int, error) {
 		return len(data), err
 	}
 
-	return b.bs.GetSize(cid)
+	return b.bs.GetSize(ctx, cid)
 }
 
-func (b *idstore) View(cid cid.Cid, cb func([]byte) error) error {
+func (b *idstore) View(ctx context.Context, cid cid.Cid, cb func([]byte) error) error {
 	inline, data, err := decodeCid(cid)
 	if err != nil {
 		return xerrors.Errorf("error decoding Cid: %w", err)
@@ -87,10 +86,10 @@ func (b *idstore) View(cid cid.Cid, cb func([]byte) error) error {
 		return cb(data)
 	}
 
-	return b.bs.View(cid, cb)
+	return b.bs.View(ctx, cid, cb)
 }
 
-func (b *idstore) Put(blk blocks.Block) error {
+func (b *idstore) Put(ctx context.Context, blk blocks.Block) error {
 	inline, _, err := decodeCid(blk.Cid())
 	if err != nil {
 		return xerrors.Errorf("error decoding Cid: %w", err)
@@ -100,10 +99,18 @@ func (b *idstore) Put(blk blocks.Block) error {
 		return nil
 	}
 
-	return b.bs.Put(blk)
+	return b.bs.Put(ctx, blk)
 }
 
-func (b *idstore) PutMany(blks []blocks.Block) error {
+func (b *idstore) ForEachKey(f func(cid.Cid) error) error {
+	iterBstore, ok := b.bs.(BlockstoreIterator)
+	if !ok {
+		return xerrors.Errorf("underlying blockstore (type %T) doesn't support fast iteration", b.bs)
+	}
+	return iterBstore.ForEachKey(f)
+}
+
+func (b *idstore) PutMany(ctx context.Context, blks []blocks.Block) error {
 	toPut := make([]blocks.Block, 0, len(blks))
 	for _, blk := range blks {
 		inline, _, err := decodeCid(blk.Cid())
@@ -118,13 +125,13 @@ func (b *idstore) PutMany(blks []blocks.Block) error {
 	}
 
 	if len(toPut) > 0 {
-		return b.bs.PutMany(toPut)
+		return b.bs.PutMany(ctx, toPut)
 	}
 
 	return nil
 }
 
-func (b *idstore) DeleteBlock(cid cid.Cid) error {
+func (b *idstore) DeleteBlock(ctx context.Context, cid cid.Cid) error {
 	inline, _, err := decodeCid(cid)
 	if err != nil {
 		return xerrors.Errorf("error decoding Cid: %w", err)
@@ -134,10 +141,10 @@ func (b *idstore) DeleteBlock(cid cid.Cid) error {
 		return nil
 	}
 
-	return b.bs.DeleteBlock(cid)
+	return b.bs.DeleteBlock(ctx, cid)
 }
 
-func (b *idstore) DeleteMany(cids []cid.Cid) error {
+func (b *idstore) DeleteMany(ctx context.Context, cids []cid.Cid) error {
 	toDelete := make([]cid.Cid, 0, len(cids))
 	for _, cid := range cids {
 		inline, _, err := decodeCid(cid)
@@ -152,7 +159,7 @@ func (b *idstore) DeleteMany(cids []cid.Cid) error {
 	}
 
 	if len(toDelete) > 0 {
-		return b.bs.DeleteMany(toDelete)
+		return b.bs.DeleteMany(ctx, toDelete)
 	}
 
 	return nil
@@ -171,4 +178,8 @@ func (b *idstore) Close() error {
 		return c.Close()
 	}
 	return nil
+}
+
+func (b *idstore) Flush(ctx context.Context) error {
+	return b.bs.Flush(ctx)
 }

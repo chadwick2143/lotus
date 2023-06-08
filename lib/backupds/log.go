@@ -1,9 +1,9 @@
 package backupds
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,9 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/xerrors"
-
 	"github.com/ipfs/go-datastore"
+	"golang.org/x/xerrors"
 )
 
 var loghead = datastore.NewKey("/backupds/log/head") // string([logfile base name];[uuid];[unix ts])
@@ -23,7 +22,7 @@ func (d *Datastore) startLog(logdir string) error {
 		return xerrors.Errorf("mkdir logdir ('%s'): %w", logdir, err)
 	}
 
-	files, err := ioutil.ReadDir(logdir)
+	files, err := os.ReadDir(logdir)
 	if err != nil {
 		return xerrors.Errorf("read logdir ('%s'): %w", logdir, err)
 	}
@@ -100,6 +99,7 @@ type logfile struct {
 var compactThresh = 2
 
 func (d *Datastore) createLog(logdir string) (*logfile, string, error) {
+	ctx := context.TODO()
 	p := filepath.Join(logdir, strconv.FormatInt(time.Now().Unix(), 10)+".log.cbor")
 	log.Infow("creating log", "file", p)
 
@@ -108,7 +108,7 @@ func (d *Datastore) createLog(logdir string) (*logfile, string, error) {
 		return nil, "", err
 	}
 
-	if err := d.Backup(f); err != nil {
+	if err := d.Backup(ctx, f); err != nil {
 		return nil, "", xerrors.Errorf("writing log base: %w", err)
 	}
 	if err := f.Sync(); err != nil {
@@ -122,8 +122,9 @@ func (d *Datastore) createLog(logdir string) (*logfile, string, error) {
 }
 
 func (d *Datastore) openLog(p string) (*logfile, string, error) {
+	ctx := context.TODO()
 	log.Infow("opening log", "file", p)
-	lh, err := d.child.Get(loghead)
+	lh, err := d.child.Get(ctx, loghead)
 	if err != nil {
 		return nil, "", xerrors.Errorf("checking log head (logfile '%s'): %w", p, err)
 	}
@@ -212,6 +213,7 @@ func (d *Datastore) openLog(p string) (*logfile, string, error) {
 }
 
 func (l *logfile) writeLogHead(logname string, ds datastore.Batching) error {
+	ctx := context.TODO()
 	lval := []byte(fmt.Sprintf("%s;%s;%d", logname, uuid.New(), time.Now().Unix()))
 
 	err := l.writeEntry(&Entry{
@@ -223,7 +225,7 @@ func (l *logfile) writeLogHead(logname string, ds datastore.Batching) error {
 		return xerrors.Errorf("writing loghead to the log: %w", err)
 	}
 
-	if err := ds.Put(loghead, lval); err != nil {
+	if err := ds.Put(ctx, loghead, lval); err != nil {
 		return xerrors.Errorf("writing loghead to the datastore: %w", err)
 	}
 

@@ -11,9 +11,10 @@ import (
 	"os/exec"
 
 	"github.com/fatih/color"
+	"github.com/urfave/cli/v2"
+
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/test-vectors/schema"
-	"github.com/urfave/cli/v2"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/types"
@@ -129,6 +130,7 @@ func runSimulateCmd(_ *cli.Context) error {
 		CircSupply: circSupply.FilCirculating,
 		BaseFee:    baseFee,
 		Rand:       rand,
+		// TODO NetworkVersion
 	})
 	if err != nil {
 		return fmt.Errorf("failed to apply message: %w", err)

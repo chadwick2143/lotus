@@ -1,3 +1,5 @@
+// stm: ignore
+// Ignored because implementation relies on external (ffi) lib
 package bls_test
 
 import (
@@ -9,7 +11,7 @@ import (
 	"github.com/filecoin-project/go-state-types/crypto"
 
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/lotus/chain/wallet"
+	"github.com/filecoin-project/lotus/chain/wallet/key"
 	"github.com/filecoin-project/lotus/lib/sigs"
 	_ "github.com/filecoin-project/lotus/lib/sigs/bls"
 )
@@ -22,7 +24,7 @@ func TestRoundtrip(t *testing.T) {
 		Type:       types.KTBLS,
 		PrivateKey: pk,
 	}
-	k, err := wallet.NewKey(ki)
+	k, err := key.NewKey(ki)
 	require.NoError(t, err)
 
 	p := []byte("potato")

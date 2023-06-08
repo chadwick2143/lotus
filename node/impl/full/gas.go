@@ -4,22 +4,22 @@ import (
 	"context"
 	"math"
 	"math/rand"
+	"os"
 	"sort"
 
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
-	"github.com/filecoin-project/lotus/chain/actors/builtin/paych"
-	lru "github.com/hashicorp/golang-lru"
-
+	lru "github.com/hashicorp/golang-lru/v2"
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/builtin"
 	"github.com/filecoin-project/go-state-types/exitcode"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
+	lbuiltin "github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/messagepool"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/store"
@@ -62,7 +62,7 @@ type GasAPI struct {
 
 func NewGasPriceCache() *GasPriceCache {
 	// 50 because we usually won't access more than 40
-	c, err := lru.New2Q(50)
+	c, err := lru.New2Q[types.TipSetKey, []GasMeta](50)
 	if err != nil {
 		// err only if parameter is bad
 		panic(err)
@@ -74,7 +74,7 @@ func NewGasPriceCache() *GasPriceCache {
 }
 
 type GasPriceCache struct {
-	c *lru.TwoQueueCache
+	c *lru.TwoQueueCache[types.TipSetKey, []GasMeta]
 }
 
 type GasMeta struct {
@@ -82,14 +82,14 @@ type GasMeta struct {
 	Limit int64
 }
 
-func (g *GasPriceCache) GetTSGasStats(cstore *store.ChainStore, ts *types.TipSet) ([]GasMeta, error) {
+func (g *GasPriceCache) GetTSGasStats(ctx context.Context, cstore *store.ChainStore, ts *types.TipSet) ([]GasMeta, error) {
 	i, has := g.c.Get(ts.Key())
 	if has {
-		return i.([]GasMeta), nil
+		return i, nil
 	}
 
 	var prices []GasMeta
-	msgs, err := cstore.MessagesForTipset(ts)
+	msgs, err := cstore.MessagesForTipset(ctx, ts)
 	if err != nil {
 		return nil, xerrors.Errorf("loading messages: %w", err)
 	}
@@ -173,7 +173,7 @@ func (a *GasAPI) GasEstimateGasPremium(
 	gaslimit int64,
 	_ types.TipSetKey,
 ) (types.BigInt, error) {
-	return gasEstimateGasPremium(a.Chain, a.PriceCache, nblocksincl)
+	return gasEstimateGasPremium(ctx, a.Chain, a.PriceCache, nblocksincl)
 }
 func (m *GasModule) GasEstimateGasPremium(
 	ctx context.Context,
@@ -182,9 +182,9 @@ func (m *GasModule) GasEstimateGasPremium(
 	gaslimit int64,
 	_ types.TipSetKey,
 ) (types.BigInt, error) {
-	return gasEstimateGasPremium(m.Chain, m.PriceCache, nblocksincl)
+	return gasEstimateGasPremium(ctx, m.Chain, m.PriceCache, nblocksincl)
 }
-func gasEstimateGasPremium(cstore *store.ChainStore, cache *GasPriceCache, nblocksincl uint64) (types.BigInt, error) {
+func gasEstimateGasPremium(ctx context.Context, cstore *store.ChainStore, cache *GasPriceCache, nblocksincl uint64) (types.BigInt, error) {
 	if nblocksincl == 0 {
 		nblocksincl = 1
 	}
@@ -198,13 +198,13 @@ func gasEstimateGasPremium(cstore *store.ChainStore, cache *GasPriceCache, nbloc
 			break // genesis
 		}
 
-		pts, err := cstore.LoadTipSet(ts.Parents())
+		pts, err := cstore.LoadTipSet(ctx, ts.Parents())
 		if err != nil {
 			return types.BigInt{}, err
 		}
 
 		blocks += len(pts.Blocks())
-		meta, err := cache.GetTSGasStats(cstore, pts)
+		meta, err := cache.GetTSGasStats(ctx, cstore, pts)
 		if err != nil {
 			return types.BigInt{}, err
 		}
@@ -236,19 +236,71 @@ func gasEstimateGasPremium(cstore *store.ChainStore, cache *GasPriceCache, nbloc
 }
 
 func (a *GasAPI) GasEstimateGasLimit(ctx context.Context, msgIn *types.Message, tsk types.TipSetKey) (int64, error) {
-	ts, err := a.Chain.GetTipSetFromKey(tsk)
+	ts, err := a.Chain.GetTipSetFromKey(ctx, tsk)
 	if err != nil {
 		return -1, xerrors.Errorf("getting tipset: %w", err)
 	}
 	return gasEstimateGasLimit(ctx, a.Chain, a.Stmgr, a.Mpool, msgIn, ts)
 }
 func (m *GasModule) GasEstimateGasLimit(ctx context.Context, msgIn *types.Message, tsk types.TipSetKey) (int64, error) {
-	ts, err := m.Chain.GetTipSetFromKey(tsk)
+	ts, err := m.Chain.GetTipSetFromKey(ctx, tsk)
 	if err != nil {
 		return -1, xerrors.Errorf("getting tipset: %w", err)
 	}
 	return gasEstimateGasLimit(ctx, m.Chain, m.Stmgr, m.Mpool, msgIn, ts)
 }
+
+// gasEstimateCallWithGas invokes a message "msgIn" on the earliest available tipset with pending
+// messages in the message pool. The function returns the result of the message invocation, the
+// pending messages, the tipset used for the invocation, and an error if occurred.
+// The returned information can be used to make subsequent calls to CallWithGas with the same parameters.
+func gasEstimateCallWithGas(
+	ctx context.Context,
+	cstore *store.ChainStore,
+	smgr *stmgr.StateManager,
+	mpool *messagepool.MessagePool,
+	msgIn *types.Message,
+	currTs *types.TipSet,
+) (*api.InvocResult, []types.ChainMsg, *types.TipSet, error) {
+	msg := *msgIn
+	fromA, err := smgr.ResolveToDeterministicAddress(ctx, msgIn.From, currTs)
+	if err != nil {
+		return nil, []types.ChainMsg{}, nil, xerrors.Errorf("getting key address: %w", err)
+	}
+
+	pending, ts := mpool.PendingFor(ctx, fromA)
+	priorMsgs := make([]types.ChainMsg, 0, len(pending))
+	for _, m := range pending {
+		if m.Message.Nonce == msg.Nonce {
+			break
+		}
+		priorMsgs = append(priorMsgs, m)
+	}
+
+	applyTsMessages := true
+	if os.Getenv("LOTUS_SKIP_APPLY_TS_MESSAGE_CALL_WITH_GAS") == "1" {
+		applyTsMessages = false
+	}
+
+	// Try calling until we find a height with no migration.
+	var res *api.InvocResult
+	for {
+		res, err = smgr.CallWithGas(ctx, &msg, priorMsgs, ts, applyTsMessages)
+		if err != stmgr.ErrExpensiveFork {
+			break
+		}
+		ts, err = cstore.GetTipSetFromKey(ctx, ts.Parents())
+		if err != nil {
+			return nil, []types.ChainMsg{}, nil, xerrors.Errorf("getting parent tipset: %w", err)
+		}
+	}
+	if err != nil {
+		return nil, []types.ChainMsg{}, nil, xerrors.Errorf("CallWithGas failed: %w", err)
+	}
+
+	return res, priorMsgs, ts, nil
+}
+
 func gasEstimateGasLimit(
 	ctx context.Context,
 	cstore *store.ChainStore,
@@ -259,76 +311,88 @@ func gasEstimateGasLimit(
 ) (int64, error) {
 	msg := *msgIn
 	msg.GasLimit = build.BlockGasLimit
-	msg.GasFeeCap = types.NewInt(uint64(build.MinimumBaseFee) + 1)
-	msg.GasPremium = types.NewInt(1)
+	msg.GasFeeCap = big.Zero()
+	msg.GasPremium = big.Zero()
 
-	fromA, err := smgr.ResolveToKeyAddress(ctx, msgIn.From, currTs)
+	res, _, ts, err := gasEstimateCallWithGas(ctx, cstore, smgr, mpool, &msg, currTs)
 	if err != nil {
-		return -1, xerrors.Errorf("getting key address: %w", err)
+		return -1, xerrors.Errorf("gas estimation failed: %w", err)
 	}
 
-	pending, ts := mpool.PendingFor(fromA)
-	priorMsgs := make([]types.ChainMsg, 0, len(pending))
-	for _, m := range pending {
-		if m.Message.Nonce == msg.Nonce {
-			break
-		}
-		priorMsgs = append(priorMsgs, m)
+	if res.MsgRct.ExitCode == exitcode.SysErrOutOfGas {
+		return -1, &api.ErrOutOfGas{}
 	}
 
-	// Try calling until we find a height with no migration.
-	var res *api.InvocResult
-	for {
-		res, err = smgr.CallWithGas(ctx, &msg, priorMsgs, ts)
-		if err != stmgr.ErrExpensiveFork {
-			break
-		}
-		ts, err = cstore.GetTipSetFromKey(ts.Parents())
-		if err != nil {
-			return -1, xerrors.Errorf("getting parent tipset: %w", err)
-		}
-	}
-	if err != nil {
-		return -1, xerrors.Errorf("CallWithGas failed: %w", err)
-	}
 	if res.MsgRct.ExitCode != exitcode.Ok {
 		return -1, xerrors.Errorf("message execution failed: exit %s, reason: %s", res.MsgRct.ExitCode, res.Error)
 	}
 
-	// Special case for PaymentChannel collect, which is deleting actor
-	st, err := smgr.ParentState(ts)
-	if err != nil {
-		_ = err
-		// somewhat ignore it as it can happen and we just want to detect
-		// an existing PaymentChannel actor
-		return res.MsgRct.GasUsed, nil
-	}
-	act, err := st.GetActor(msg.To)
-	if err != nil {
-		_ = err
-		// somewhat ignore it as it can happen and we just want to detect
-		// an existing PaymentChannel actor
-		return res.MsgRct.GasUsed, nil
-	}
+	ret := res.MsgRct.GasUsed
 
-	if !builtin.IsPaymentChannelActor(act.Code) {
-		return res.MsgRct.GasUsed, nil
-	}
-	if msgIn.Method != paych.Methods.Collect {
-		return res.MsgRct.GasUsed, nil
-	}
+	log.Infow("GasEstimateMessageGas CallWithGas Result", "GasUsed", ret, "ExitCode", res.MsgRct.ExitCode)
 
-	// return GasUsed without the refund for DestoryActor
-	return res.MsgRct.GasUsed + 76e3, nil
+	transitionalMulti := 1.0
+	// Overestimate gas around the upgrade
+	if ts.Height() <= build.UpgradeHyggeHeight && (build.UpgradeHyggeHeight-ts.Height() <= 20) {
+		func() {
+
+			// Bare transfers get about 3x more expensive: https://github.com/filecoin-project/FIPs/blob/master/FIPS/fip-0057.md#product-considerations
+			if msgIn.Method == builtin.MethodSend {
+				transitionalMulti = 3.0
+				return
+			}
+
+			st, err := smgr.ParentState(ts)
+			if err != nil {
+				return
+			}
+			act, err := st.GetActor(msg.To)
+			if err != nil {
+				return
+			}
+
+			if lbuiltin.IsStorageMinerActor(act.Code) {
+				switch msgIn.Method {
+				case 3:
+					transitionalMulti = 1.92
+				case 4:
+					transitionalMulti = 1.72
+				case 6:
+					transitionalMulti = 1.06
+				case 7:
+					transitionalMulti = 1.2
+				case 16:
+					transitionalMulti = 1.19
+				case 18:
+					transitionalMulti = 1.73
+				case 23:
+					transitionalMulti = 1.73
+				case 26:
+					transitionalMulti = 1.15
+				case 27:
+					transitionalMulti = 1.18
+				default:
+				}
+			}
+		}()
+	}
+	ret = (ret * int64(transitionalMulti*1024)) >> 10
+
+	return ret, nil
 }
 
 func (m *GasModule) GasEstimateMessageGas(ctx context.Context, msg *types.Message, spec *api.MessageSendSpec, _ types.TipSetKey) (*types.Message, error) {
 	if msg.GasLimit == 0 {
 		gasLimit, err := m.GasEstimateGasLimit(ctx, msg, types.EmptyTSK)
 		if err != nil {
-			return nil, xerrors.Errorf("estimating gas used: %w", err)
+			return nil, err
 		}
 		msg.GasLimit = int64(float64(gasLimit) * m.Mpool.GetConfig().GasLimitOverestimation)
+
+		// Gas overestimation can cause us to exceed the block gas limit, cap it.
+		if msg.GasLimit > build.BlockGasLimit {
+			msg.GasLimit = build.BlockGasLimit
+		}
 	}
 
 	if msg.GasPremium == types.EmptyInt || types.BigCmp(msg.GasPremium, types.NewInt(0)) == 0 {

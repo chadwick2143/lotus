@@ -8,6 +8,9 @@ import (
 	"strings"
 
 	"github.com/urfave/cli/v2"
+	"golang.org/x/xerrors"
+
+	miner6 "github.com/filecoin-project/specs-actors/v6/actors/builtin/miner"
 
 	"github.com/filecoin-project/lotus/chain/types"
 )
@@ -17,6 +20,8 @@ var mathCmd = &cli.Command{
 	Usage: "utility commands around doing math on a list of numbers",
 	Subcommands: []*cli.Command{
 		mathSumCmd,
+		mathPreCommitAggFeesCmd,
+		mathProveCommitAggFeesCmd,
 	},
 }
 
@@ -97,6 +102,70 @@ var mathSumCmd = &cli.Command{
 		default:
 			return fmt.Errorf("Unknown format")
 		}
+
+		return nil
+	},
+}
+
+var mathProveCommitAggFeesCmd = &cli.Command{
+	Name: "agg-fees-commit",
+	Flags: []cli.Flag{
+		&cli.IntFlag{
+			Name:     "size",
+			Required: true,
+		},
+		&cli.StringFlag{
+			Name:     "base-fee",
+			Usage:    "baseFee aFIL",
+			Required: true,
+		},
+		&cli.StringFlag{
+			Name:     "base-fee",
+			Usage:    "baseFee aFIL",
+			Required: true,
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		as := cctx.Int("size")
+
+		bf, err := types.BigFromString(cctx.String("base-fee"))
+		if err != nil {
+			return xerrors.Errorf("parsing basefee: %w", err)
+		}
+
+		fmt.Println(types.FIL(miner6.AggregateProveCommitNetworkFee(as, bf)))
+
+		return nil
+	},
+}
+
+var mathPreCommitAggFeesCmd = &cli.Command{
+	Name: "agg-fees-precommit",
+	Flags: []cli.Flag{
+		&cli.IntFlag{
+			Name:     "size",
+			Required: true,
+		},
+		&cli.StringFlag{
+			Name:     "base-fee",
+			Usage:    "baseFee aFIL",
+			Required: true,
+		},
+		&cli.StringFlag{
+			Name:     "base-fee",
+			Usage:    "baseFee aFIL",
+			Required: true,
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		as := cctx.Int("size")
+
+		bf, err := types.BigFromString(cctx.String("base-fee"))
+		if err != nil {
+			return xerrors.Errorf("parsing basefee: %w", err)
+		}
+
+		fmt.Println(types.FIL(miner6.AggregatePreCommitNetworkFee(as, bf)))
 
 		return nil
 	},

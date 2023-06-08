@@ -1,32 +1,30 @@
+// stm: #unit
 package storageadapter
 
 import (
 	"context"
 	"testing"
 
-	"github.com/filecoin-project/lotus/chain/events"
-	"golang.org/x/sync/errgroup"
-
-	cbornode "github.com/ipfs/go-ipld-cbor"
-
-	adt2 "github.com/filecoin-project/specs-actors/v2/actors/util/adt"
 	"github.com/ipfs/go-cid"
+	cbornode "github.com/ipfs/go-ipld-cbor"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
-	bstore "github.com/filecoin-project/lotus/blockstore"
-	test "github.com/filecoin-project/lotus/chain/events/state/mock"
 	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
-
 	market2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/market"
+	adt2 "github.com/filecoin-project/specs-actors/v2/actors/util/adt"
 
-	"github.com/stretchr/testify/require"
-
+	bstore "github.com/filecoin-project/lotus/blockstore"
+	"github.com/filecoin-project/lotus/chain/events"
 	"github.com/filecoin-project/lotus/chain/events/state"
+	test "github.com/filecoin-project/lotus/chain/events/state/mock"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
 func TestDealStateMatcher(t *testing.T) {
+	//stm: @CHAIN_STATE_GET_ACTOR_001
 	ctx := context.Background()
 	bs := bstore.NewMemorySync()
 	store := adt2.WrapStore(ctx, cbornode.NewCborStore(bs))

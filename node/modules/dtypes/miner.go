@@ -11,7 +11,7 @@ import (
 	"github.com/filecoin-project/go-fil-markets/storagemarket"
 	"github.com/filecoin-project/go-state-types/abi"
 
-	"github.com/filecoin-project/lotus/extern/storage-sealing/sealiface"
+	"github.com/filecoin-project/lotus/storage/pipeline/sealiface"
 )
 
 type MinerAddress address.Address
@@ -74,10 +74,12 @@ type ConsiderUnverifiedStorageDealsConfigFunc func() (bool, error)
 // disable or enable unverified storage deal acceptance.
 type SetConsiderUnverifiedStorageDealsConfigFunc func(bool) error
 
-// SetSealingDelay sets how long a sector waits for more deals before sealing begins.
+// SetSealingConfigFunc is a function which is used to
+// sets the sealing config.
 type SetSealingConfigFunc func(sealiface.Config) error
 
-// GetSealingDelay returns how long a sector waits for more deals before sealing begins.
+// GetSealingConfigFunc is a function which is used to
+// get the sealing config.
 type GetSealingConfigFunc func() (sealiface.Config, error)
 
 // SetExpectedSealDurationFunc is a function which is used to set how long sealing is expected to take.
@@ -88,5 +90,10 @@ type SetExpectedSealDurationFunc func(time.Duration) error
 // too determine how long sealing is expected to take
 type GetExpectedSealDurationFunc func() (time.Duration, error)
 
+type SetMaxDealStartDelayFunc func(time.Duration) error
+type GetMaxDealStartDelayFunc func() (time.Duration, error)
+
 type StorageDealFilter func(ctx context.Context, deal storagemarket.MinerDeal) (bool, string, error)
 type RetrievalDealFilter func(ctx context.Context, deal retrievalmarket.ProviderDealState) (bool, string, error)
+
+type RetrievalPricingFunc func(ctx context.Context, dealPricingParams retrievalmarket.PricingInput) (retrievalmarket.Ask, error)

@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/fatih/color"
 	"github.com/urfave/cli/v2"
@@ -11,13 +14,14 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
-	"github.com/filecoin-project/lotus/api"
-
+	"github.com/filecoin-project/go-state-types/builtin"
+	"github.com/filecoin-project/go-state-types/builtin/v9/miner"
+	"github.com/filecoin-project/go-state-types/network"
 	miner2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/miner"
 
+	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors"
-	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
 	"github.com/filecoin-project/lotus/lib/tablewriter"
@@ -32,17 +36,29 @@ var actorCmd = &cli.Command{
 		actorControl,
 		actorProposeChangeWorker,
 		actorConfirmChangeWorker,
+		actorGetMethodNum,
+		actorProposeChangeBeneficiary,
+		actorConfirmChangeBeneficiary,
 	},
 }
 
 var actorWithdrawCmd = &cli.Command{
 	Name:      "withdraw",
-	Usage:     "withdraw available balance",
+	Usage:     "withdraw available balance to beneficiary",
 	ArgsUsage: "[amount (FIL)]",
 	Flags: []cli.Flag{
 		&cli.StringFlag{
 			Name:  "actor",
 			Usage: "specify the address of miner actor",
+		},
+		&cli.IntFlag{
+			Name:  "confidence",
+			Usage: "number of block confirmations to wait for",
+			Value: int(build.MessageConfidence),
+		},
+		&cli.BoolFlag{
+			Name:  "beneficiary",
+			Usage: "send withdraw message from the beneficiary address",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -64,13 +80,13 @@ var actorWithdrawCmd = &cli.Command{
 		ctx := lcli.ReqContext(cctx)
 
 		if maddr.Empty() {
-			minerAPI, closer, err := lcli.GetStorageMinerAPI(cctx)
+			minerApi, closer, err := lcli.GetStorageMinerAPI(cctx)
 			if err != nil {
 				return err
 			}
 			defer closer()
 
-			maddr, err = minerAPI.ActorAddress(ctx)
+			maddr, err = minerApi.ActorAddress(ctx)
 			if err != nil {
 				return err
 			}
@@ -96,7 +112,7 @@ var actorWithdrawCmd = &cli.Command{
 			amount = abi.TokenAmount(f)
 
 			if amount.GreaterThan(available) {
-				return xerrors.Errorf("can't withdraw more funds than available; requested: %s; available: %s", amount, available)
+				return xerrors.Errorf("can't withdraw more funds than available; requested: %s; available: %s", types.FIL(amount), types.FIL(available))
 			}
 		}
 
@@ -107,11 +123,18 @@ var actorWithdrawCmd = &cli.Command{
 			return err
 		}
 
+		var sender address.Address
+		if cctx.IsSet("beneficiary") {
+			sender = mi.Beneficiary
+		} else {
+			sender = mi.Owner
+		}
+
 		smsg, err := nodeAPI.MpoolPushMessage(ctx, &types.Message{
 			To:     maddr,
-			From:   mi.Owner,
+			From:   sender,
 			Value:  types.NewInt(0),
-			Method: miner.Methods.WithdrawBalance,
+			Method: builtin.MethodsMiner.WithdrawBalance,
 			Params: params,
 		}, &api.MessageSendSpec{MaxFee: abi.TokenAmount(types.MustParseFIL("0.1"))})
 		if err != nil {
@@ -119,6 +142,35 @@ var actorWithdrawCmd = &cli.Command{
 		}
 
 		fmt.Printf("Requested rewards withdrawal in message %s\n", smsg.Cid())
+
+		// wait for it to get mined into a block
+		wait, err := nodeAPI.StateWaitMsg(ctx, smsg.Cid(), uint64(cctx.Int("confidence")))
+		if err != nil {
+			return err
+		}
+
+		// check it executed successfully
+		if wait.Receipt.ExitCode.IsError() {
+			fmt.Println(cctx.App.Writer, "withdrawal failed!")
+			return err
+		}
+
+		nv, err := nodeAPI.StateNetworkVersion(ctx, wait.TipSet)
+		if err != nil {
+			return err
+		}
+
+		if nv >= network.Version14 {
+			var withdrawn abi.TokenAmount
+			if err := withdrawn.UnmarshalCBOR(bytes.NewReader(wait.Receipt.Return)); err != nil {
+				return err
+			}
+
+			fmt.Printf("Successfully withdrew %s \n", types.FIL(withdrawn))
+			if withdrawn.LessThan(amount) {
+				fmt.Printf("Note that this is less than the requested amount of %s \n", types.FIL(amount))
+			}
+		}
 
 		return nil
 	},
@@ -146,7 +198,7 @@ var actorSetOwnerCmd = &cli.Command{
 		}
 
 		if cctx.NArg() != 2 {
-			return fmt.Errorf("must pass new owner address and sender address")
+			return lcli.IncorrectNumArgs(cctx)
 		}
 
 		var maddr address.Address
@@ -187,13 +239,13 @@ var actorSetOwnerCmd = &cli.Command{
 		}
 
 		if maddr.Empty() {
-			minerAPI, closer, err := lcli.GetStorageMinerAPI(cctx)
+			minerApi, closer, err := lcli.GetStorageMinerAPI(cctx)
 			if err != nil {
 				return err
 			}
 			defer closer()
 
-			maddr, err = minerAPI.ActorAddress(ctx)
+			maddr, err = minerApi.ActorAddress(ctx)
 			if err != nil {
 				return err
 			}
@@ -216,7 +268,7 @@ var actorSetOwnerCmd = &cli.Command{
 		smsg, err := nodeAPI.MpoolPushMessage(ctx, &types.Message{
 			From:   fromAddrId,
 			To:     maddr,
-			Method: miner.Methods.ChangeOwnerAddress,
+			Method: builtin.MethodsMiner.ChangeOwnerAddress,
 			Value:  big.Zero(),
 			Params: sp,
 		}, nil)
@@ -233,7 +285,7 @@ var actorSetOwnerCmd = &cli.Command{
 		}
 
 		// check it executed successfully
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			fmt.Println("owner change failed!")
 			return err
 		}
@@ -265,12 +317,15 @@ var actorControlList = &cli.Command{
 			Name: "verbose",
 		},
 		&cli.BoolFlag{
-			Name:  "color",
-			Value: true,
+			Name:        "color",
+			Usage:       "use color in display output",
+			DefaultText: "depends on output being a TTY",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		color.NoColor = !cctx.Bool("color")
+		if cctx.IsSet("color") {
+			color.NoColor = !cctx.Bool("color")
+		}
 
 		var maddr address.Address
 		if act := cctx.String("actor"); act != "" {
@@ -290,13 +345,13 @@ var actorControlList = &cli.Command{
 		ctx := lcli.ReqContext(cctx)
 
 		if maddr.Empty() {
-			minerAPI, closer, err := lcli.GetStorageMinerAPI(cctx)
+			minerApi, closer, err := lcli.GetStorageMinerAPI(cctx)
 			if err != nil {
 				return err
 			}
 			defer closer()
 
-			maddr, err = minerAPI.ActorAddress(ctx)
+			maddr, err = minerApi.ActorAddress(ctx)
 			if err != nil {
 				return err
 			}
@@ -329,7 +384,9 @@ var actorControlList = &cli.Command{
 
 			kstr := k.String()
 			if !cctx.Bool("verbose") {
-				kstr = kstr[:9] + "..."
+				if len(kstr) > 9 {
+					kstr = kstr[:6] + "..."
+				}
 			}
 
 			bstr := types.FIL(b).String()
@@ -370,17 +427,17 @@ var actorControlSet = &cli.Command{
 			Usage: "specify the address of miner actor",
 		},
 		&cli.BoolFlag{
+			Name:  "dump-bytes",
+			Usage: "Dumps the bytes of the message that would propose this change",
+			Value: false,
+		},
+		&cli.BoolFlag{
 			Name:  "really-do-it",
 			Usage: "Actually send transaction performing the action",
 			Value: false,
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if !cctx.Bool("really-do-it") {
-			fmt.Println("Pass --really-do-it to actually execute this action")
-			return nil
-		}
-
 		var maddr address.Address
 		if act := cctx.String("actor"); act != "" {
 			var err error
@@ -399,13 +456,13 @@ var actorControlSet = &cli.Command{
 		ctx := lcli.ReqContext(cctx)
 
 		if maddr.Empty() {
-			minerAPI, closer, err := lcli.GetStorageMinerAPI(cctx)
+			minerApi, closer, err := lcli.GetStorageMinerAPI(cctx)
 			if err != nil {
 				return err
 			}
 			defer closer()
 
-			maddr, err = minerAPI.ActorAddress(ctx)
+			maddr, err = minerApi.ActorAddress(ctx)
 			if err != nil {
 				return err
 			}
@@ -470,14 +527,36 @@ var actorControlSet = &cli.Command{
 			return xerrors.Errorf("serializing params: %w", err)
 		}
 
-		smsg, err := nodeAPI.MpoolPushMessage(ctx, &types.Message{
+		msg := &types.Message{
 			From:   mi.Owner,
 			To:     maddr,
-			Method: miner.Methods.ChangeWorkerAddress,
-
+			Method: builtin.MethodsMiner.ChangeWorkerAddress,
 			Value:  big.Zero(),
 			Params: sp,
-		}, nil)
+		}
+
+		if cctx.Bool("dump-bytes") {
+
+			msg, err = nodeAPI.GasEstimateMessageGas(ctx, msg, nil, types.EmptyTSK)
+			if err != nil {
+				return err
+			}
+
+			msgBytes, err := msg.Serialize()
+			if err != nil {
+				return err
+			}
+
+			fmt.Fprintln(cctx.App.Writer, hex.EncodeToString(msgBytes))
+			return nil
+		}
+
+		if !cctx.Bool("really-do-it") {
+			fmt.Fprintln(cctx.App.Writer, "Pass --really-do-it to actually execute this action")
+			return nil
+		}
+
+		smsg, err := nodeAPI.MpoolPushMessage(ctx, msg, nil)
 		if err != nil {
 			return xerrors.Errorf("mpool push: %w", err)
 		}
@@ -541,13 +620,13 @@ var actorProposeChangeWorker = &cli.Command{
 		}
 
 		if maddr.Empty() {
-			minerAPI, closer, err := lcli.GetStorageMinerAPI(cctx)
+			minerApi, closer, err := lcli.GetStorageMinerAPI(cctx)
 			if err != nil {
 				return err
 			}
 			defer closer()
 
-			maddr, err = minerAPI.ActorAddress(ctx)
+			maddr, err = minerApi.ActorAddress(ctx)
 			if err != nil {
 				return err
 			}
@@ -581,7 +660,7 @@ var actorProposeChangeWorker = &cli.Command{
 		smsg, err := nodeAPI.MpoolPushMessage(ctx, &types.Message{
 			From:   mi.Owner,
 			To:     maddr,
-			Method: miner.Methods.ChangeWorkerAddress,
+			Method: builtin.MethodsMiner.ChangeWorkerAddress,
 			Value:  big.Zero(),
 			Params: sp,
 		}, nil)
@@ -598,7 +677,7 @@ var actorProposeChangeWorker = &cli.Command{
 		}
 
 		// check it executed successfully
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			fmt.Fprintln(cctx.App.Writer, "Propose worker change failed!")
 			return err
 		}
@@ -671,13 +750,13 @@ var actorConfirmChangeWorker = &cli.Command{
 		}
 
 		if maddr.Empty() {
-			minerAPI, closer, err := lcli.GetStorageMinerAPI(cctx)
+			minerApi, closer, err := lcli.GetStorageMinerAPI(cctx)
 			if err != nil {
 				return err
 			}
 			defer closer()
 
-			maddr, err = minerAPI.ActorAddress(ctx)
+			maddr, err = minerApi.ActorAddress(ctx)
 			if err != nil {
 				return err
 			}
@@ -703,7 +782,7 @@ var actorConfirmChangeWorker = &cli.Command{
 		smsg, err := nodeAPI.MpoolPushMessage(ctx, &types.Message{
 			From:   mi.Owner,
 			To:     maddr,
-			Method: miner.Methods.ConfirmUpdateWorkerKey,
+			Method: builtin.MethodsMiner.ConfirmChangeWorkerAddress,
 			Value:  big.Zero(),
 		}, nil)
 		if err != nil {
@@ -719,7 +798,7 @@ var actorConfirmChangeWorker = &cli.Command{
 		}
 
 		// check it executed successfully
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			fmt.Fprintln(cctx.App.Writer, "Worker change failed!")
 			return err
 		}
@@ -730,6 +809,279 @@ var actorConfirmChangeWorker = &cli.Command{
 		}
 		if mi.Worker != newAddr {
 			return fmt.Errorf("Confirmed worker address change not reflected on chain: expected '%s', found '%s'", newAddr, mi.Worker)
+		}
+
+		return nil
+	},
+}
+
+var actorGetMethodNum = &cli.Command{
+	Name:      "generate-method-num",
+	Usage:     "Generate method number from method name",
+	ArgsUsage: "[methodName]",
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass methodNum")
+		}
+
+		methodName := cctx.Args().First()
+		methodNum, err := builtin.GenerateFRCMethodNum(methodName)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("Method Num: ", methodNum)
+
+		return nil
+	},
+}
+
+var actorProposeChangeBeneficiary = &cli.Command{
+	Name:      "propose-change-beneficiary",
+	Usage:     "Propose a beneficiary address change",
+	ArgsUsage: "[beneficiaryAddress quota expiration minerID]",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "really-do-it",
+			Usage: "Actually send transaction performing the action",
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name:  "overwrite-pending-change",
+			Usage: "Overwrite the current beneficiary change proposal",
+			Value: false,
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() != 4 {
+			return lcli.IncorrectNumArgs(cctx)
+		}
+
+		api, acloser, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return xerrors.Errorf("getting fullnode api: %w", err)
+		}
+		defer acloser()
+
+		ctx := lcli.ReqContext(cctx)
+
+		na, err := address.NewFromString(cctx.Args().Get(0))
+		if err != nil {
+			return xerrors.Errorf("parsing beneficiary address: %w", err)
+		}
+
+		newAddr, err := api.StateLookupID(ctx, na, types.EmptyTSK)
+		if err != nil {
+			return xerrors.Errorf("looking up new beneficiary address: %w", err)
+		}
+
+		quota, err := types.ParseFIL(cctx.Args().Get(1))
+		if err != nil {
+			return xerrors.Errorf("parsing quota: %w", err)
+		}
+
+		expiration, err := strconv.ParseInt(cctx.Args().Get(2), 10, 64)
+		if err != nil {
+			return xerrors.Errorf("parsing expiration: %w", err)
+		}
+
+		maddr, err := address.NewFromString(cctx.Args().Get(3))
+		if err != nil {
+			return xerrors.Errorf("getting miner address: %w", err)
+		}
+
+		mi, err := api.StateMinerInfo(ctx, maddr, types.EmptyTSK)
+		if err != nil {
+			return xerrors.Errorf("getting miner info: %w", err)
+		}
+
+		if mi.Beneficiary == mi.Owner && newAddr == mi.Owner {
+			return fmt.Errorf("beneficiary %s already set to owner address", mi.Beneficiary)
+		}
+
+		if mi.PendingBeneficiaryTerm != nil {
+			fmt.Println("WARNING: replacing Pending Beneficiary Term of:")
+			fmt.Println("Beneficiary: ", mi.PendingBeneficiaryTerm.NewBeneficiary)
+			fmt.Println("Quota:", mi.PendingBeneficiaryTerm.NewQuota)
+			fmt.Println("Expiration Epoch:", mi.PendingBeneficiaryTerm.NewExpiration)
+
+			if !cctx.Bool("overwrite-pending-change") {
+				return fmt.Errorf("must pass --overwrite-pending-change to replace current pending beneficiary change. Please review CAREFULLY")
+			}
+		}
+
+		if !cctx.Bool("really-do-it") {
+			fmt.Println("Pass --really-do-it to actually execute this action. Review what you're about to approve CAREFULLY please")
+			return nil
+		}
+
+		params := &miner.ChangeBeneficiaryParams{
+			NewBeneficiary: newAddr,
+			NewQuota:       abi.TokenAmount(quota),
+			NewExpiration:  abi.ChainEpoch(expiration),
+		}
+
+		sp, err := actors.SerializeParams(params)
+		if err != nil {
+			return xerrors.Errorf("serializing params: %w", err)
+		}
+
+		smsg, err := api.MpoolPushMessage(ctx, &types.Message{
+			From:   mi.Owner,
+			To:     maddr,
+			Method: builtin.MethodsMiner.ChangeBeneficiary,
+			Value:  big.Zero(),
+			Params: sp,
+		}, nil)
+		if err != nil {
+			return xerrors.Errorf("mpool push: %w", err)
+		}
+
+		fmt.Println("Propose Message CID:", smsg.Cid())
+
+		// wait for it to get mined into a block
+		wait, err := api.StateWaitMsg(ctx, smsg.Cid(), build.MessageConfidence)
+		if err != nil {
+			return xerrors.Errorf("waiting for message to be included in block: %w", err)
+		}
+
+		// check it executed successfully
+		if wait.Receipt.ExitCode.IsError() {
+			return fmt.Errorf("propose beneficiary change failed")
+		}
+
+		updatedMinerInfo, err := api.StateMinerInfo(ctx, maddr, wait.TipSet)
+		if err != nil {
+			return xerrors.Errorf("getting miner info: %w", err)
+		}
+
+		if updatedMinerInfo.PendingBeneficiaryTerm == nil && updatedMinerInfo.Beneficiary == newAddr {
+			fmt.Println("Beneficiary address successfully changed")
+		} else {
+			fmt.Println("Beneficiary address change awaiting additional confirmations")
+		}
+
+		return nil
+	},
+}
+
+var actorConfirmChangeBeneficiary = &cli.Command{
+	Name:      "confirm-change-beneficiary",
+	Usage:     "Confirm a beneficiary address change",
+	ArgsUsage: "[minerID]",
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "really-do-it",
+			Usage: "Actually send transaction performing the action",
+			Value: false,
+		},
+		&cli.BoolFlag{
+			Name:  "existing-beneficiary",
+			Usage: "send confirmation from the existing beneficiary address",
+		},
+		&cli.BoolFlag{
+			Name:  "new-beneficiary",
+			Usage: "send confirmation from the new beneficiary address",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() != 1 {
+			return lcli.IncorrectNumArgs(cctx)
+		}
+
+		api, acloser, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return xerrors.Errorf("getting fullnode api: %w", err)
+		}
+		defer acloser()
+
+		ctx := lcli.ReqContext(cctx)
+
+		maddr, err := address.NewFromString(cctx.Args().First())
+		if err != nil {
+			return xerrors.Errorf("parsing beneficiary address: %w", err)
+		}
+
+		mi, err := api.StateMinerInfo(ctx, maddr, types.EmptyTSK)
+		if err != nil {
+			return xerrors.Errorf("getting miner info: %w", err)
+		}
+
+		if mi.PendingBeneficiaryTerm == nil {
+			return fmt.Errorf("no pending beneficiary term found for miner %s", maddr)
+		}
+
+		if (cctx.IsSet("existing-beneficiary") && cctx.IsSet("new-beneficiary")) || (!cctx.IsSet("existing-beneficiary") && !cctx.IsSet("new-beneficiary")) {
+			return lcli.ShowHelp(cctx, fmt.Errorf("must pass exactly one of --existing-beneficiary or --new-beneficiary"))
+		}
+
+		var fromAddr address.Address
+		if cctx.IsSet("existing-beneficiary") {
+			if mi.PendingBeneficiaryTerm.ApprovedByBeneficiary {
+				return fmt.Errorf("beneficiary change already approved by current beneficiary")
+			}
+			fromAddr = mi.Beneficiary
+		} else {
+			if mi.PendingBeneficiaryTerm.ApprovedByNominee {
+				return fmt.Errorf("beneficiary change already approved by new beneficiary")
+			}
+			fromAddr = mi.PendingBeneficiaryTerm.NewBeneficiary
+		}
+
+		fmt.Println("Confirming Pending Beneficiary Term of:")
+		fmt.Println("Beneficiary: ", mi.PendingBeneficiaryTerm.NewBeneficiary)
+		fmt.Println("Quota:", mi.PendingBeneficiaryTerm.NewQuota)
+		fmt.Println("Expiration Epoch:", mi.PendingBeneficiaryTerm.NewExpiration)
+
+		if !cctx.Bool("really-do-it") {
+			fmt.Println("Pass --really-do-it to actually execute this action. Review what you're about to approve CAREFULLY please")
+			return nil
+		}
+
+		params := &miner.ChangeBeneficiaryParams{
+			NewBeneficiary: mi.PendingBeneficiaryTerm.NewBeneficiary,
+			NewQuota:       mi.PendingBeneficiaryTerm.NewQuota,
+			NewExpiration:  mi.PendingBeneficiaryTerm.NewExpiration,
+		}
+
+		sp, err := actors.SerializeParams(params)
+		if err != nil {
+			return xerrors.Errorf("serializing params: %w", err)
+		}
+
+		smsg, err := api.MpoolPushMessage(ctx, &types.Message{
+			From:   fromAddr,
+			To:     maddr,
+			Method: builtin.MethodsMiner.ChangeBeneficiary,
+			Value:  big.Zero(),
+			Params: sp,
+		}, nil)
+		if err != nil {
+			return xerrors.Errorf("mpool push: %w", err)
+		}
+
+		fmt.Println("Confirm Message CID:", smsg.Cid())
+
+		// wait for it to get mined into a block
+		wait, err := api.StateWaitMsg(ctx, smsg.Cid(), build.MessageConfidence)
+		if err != nil {
+			return xerrors.Errorf("waiting for message to be included in block: %w", err)
+		}
+
+		// check it executed successfully
+		if wait.Receipt.ExitCode.IsError() {
+			return fmt.Errorf("confirm beneficiary change failed with code %d", wait.Receipt.ExitCode)
+		}
+
+		updatedMinerInfo, err := api.StateMinerInfo(ctx, maddr, types.EmptyTSK)
+		if err != nil {
+			return err
+		}
+
+		if updatedMinerInfo.PendingBeneficiaryTerm == nil && updatedMinerInfo.Beneficiary == mi.PendingBeneficiaryTerm.NewBeneficiary {
+			fmt.Println("Beneficiary address successfully changed")
+		} else {
+			fmt.Println("Beneficiary address change awaiting additional confirmations")
 		}
 
 		return nil

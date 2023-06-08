@@ -1,42 +1,40 @@
 package sub
 
 import (
+	"bytes"
 	"context"
-	"errors"
-	"fmt"
+	"encoding/binary"
+	"sync"
 	"time"
 
-	address "github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/lotus/blockstore"
-	"github.com/filecoin-project/lotus/build"
-	"github.com/filecoin-project/lotus/chain"
-	"github.com/filecoin-project/lotus/chain/messagepool"
-	"github.com/filecoin-project/lotus/chain/stmgr"
-	"github.com/filecoin-project/lotus/chain/store"
-	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/lotus/lib/sigs"
-	"github.com/filecoin-project/lotus/metrics"
-	"github.com/filecoin-project/lotus/node/impl/client"
-	blockadt "github.com/filecoin-project/specs-actors/actors/util/adt"
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 	blocks "github.com/ipfs/go-block-format"
 	bserv "github.com/ipfs/go-blockservice"
 	"github.com/ipfs/go-cid"
-	cbor "github.com/ipfs/go-ipld-cbor"
 	logging "github.com/ipfs/go-log/v2"
-	connmgr "github.com/libp2p/go-libp2p-core/connmgr"
-	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/ipni/go-libipni/announce/message"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	cbg "github.com/whyrusleeping/cbor-gen"
+	"github.com/libp2p/go-libp2p/core/connmgr"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 	"golang.org/x/xerrors"
+
+	"github.com/filecoin-project/go-address"
+
+	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain"
+	"github.com/filecoin-project/lotus/chain/consensus"
+	"github.com/filecoin-project/lotus/chain/messagepool"
+	"github.com/filecoin-project/lotus/chain/store"
+	"github.com/filecoin-project/lotus/chain/sub/ratelimit"
+	"github.com/filecoin-project/lotus/chain/types"
+	"github.com/filecoin-project/lotus/metrics"
+	"github.com/filecoin-project/lotus/node/impl/client"
+	"github.com/filecoin-project/lotus/node/impl/full"
 )
 
 var log = logging.Logger("sub")
-
-var ErrSoftFailure = errors.New("soft validation failure")
-var ErrInsufficientPower = errors.New("incoming block's miner does not have minimum power")
 
 var msgCidPrefix = cid.Prefix{
 	Version:  1,
@@ -81,13 +79,13 @@ func HandleIncomingBlocks(ctx context.Context, bsub *pubsub.Subscription, s *cha
 			log.Debug("about to fetch messages for block from pubsub")
 			bmsgs, err := FetchMessagesByCids(ctx, ses, blk.BlsMessages)
 			if err != nil {
-				log.Errorf("failed to fetch all bls messages for block received over pubusb: %s; source: %s", err, src)
+				log.Errorf("failed to fetch all bls messages for block received over pubsub: %s; source: %s", err, src)
 				return
 			}
 
 			smsgs, err := FetchSignedMessagesByCids(ctx, ses, blk.SecpkMessages)
 			if err != nil {
-				log.Errorf("failed to fetch all secpk messages for block received over pubusb: %s; source: %s", err, src)
+				log.Errorf("failed to fetch all secpk messages for block received over pubsub: %s; source: %s", err, src)
 				return
 			}
 
@@ -161,9 +159,12 @@ func FetchSignedMessagesByCids(
 }
 
 // Fetch `cids` from the block service, apply `cb` on each of them. Used
-//  by the fetch message functions above.
+//
+//	by the fetch message functions above.
+//
 // We check that each block is received only once and we do not received
-//  blocks we did not request.
+//
+//	blocks we did not request.
 func fetchCids(
 	ctx context.Context,
 	bserv bserv.BlockGetter,
@@ -177,12 +178,12 @@ func fetchCids(
 	cidIndex := make(map[cid.Cid]int)
 	for i, c := range cids {
 		if c.Prefix() != msgCidPrefix {
-			return fmt.Errorf("invalid msg CID: %s", c)
+			return xerrors.Errorf("invalid msg CID: %s", c)
 		}
 		cidIndex[c] = i
 	}
 	if len(cids) != len(cidIndex) {
-		return fmt.Errorf("duplicate CIDs in fetchCids input")
+		return xerrors.Errorf("duplicate CIDs in fetchCids input")
 	}
 
 	for block := range bserv.GetBlocks(ctx, cids) {
@@ -205,7 +206,7 @@ func fetchCids(
 	if len(cidIndex) > 0 {
 		err := ctx.Err()
 		if err == nil {
-			err = fmt.Errorf("failed to fetch %d messages for unknown reasons", len(cidIndex))
+			err = xerrors.Errorf("failed to fetch %d messages for unknown reasons", len(cidIndex))
 		}
 		return err
 	}
@@ -216,7 +217,7 @@ func fetchCids(
 type BlockValidator struct {
 	self peer.ID
 
-	peers *lru.TwoQueueCache
+	peers *lru.TwoQueueCache[peer.ID, int]
 
 	killThresh int
 
@@ -225,12 +226,12 @@ type BlockValidator struct {
 	blacklist func(peer.ID)
 
 	// necessary for block validation
-	chain *store.ChainStore
-	stmgr *stmgr.StateManager
+	chain     *store.ChainStore
+	consensus consensus.Consensus
 }
 
-func NewBlockValidator(self peer.ID, chain *store.ChainStore, stmgr *stmgr.StateManager, blacklist func(peer.ID)) *BlockValidator {
-	p, _ := lru.New2Q(4096)
+func NewBlockValidator(self peer.ID, chain *store.ChainStore, cns consensus.Consensus, blacklist func(peer.ID)) *BlockValidator {
+	p, _ := lru.New2Q[peer.ID, int](4096)
 	return &BlockValidator{
 		self:       self,
 		peers:      p,
@@ -238,18 +239,16 @@ func NewBlockValidator(self peer.ID, chain *store.ChainStore, stmgr *stmgr.State
 		blacklist:  blacklist,
 		recvBlocks: newBlockReceiptCache(),
 		chain:      chain,
-		stmgr:      stmgr,
+		consensus:  cns,
 	}
 }
 
 func (bv *BlockValidator) flagPeer(p peer.ID) {
-	v, ok := bv.peers.Get(p)
+	val, ok := bv.peers.Get(p)
 	if !ok {
-		bv.peers.Add(p, int(1))
+		bv.peers.Add(p, 1)
 		return
 	}
-
-	val := v.(int)
 
 	if val >= bv.killThresh {
 		log.Warnf("blacklisting peer %s", p)
@@ -257,225 +256,46 @@ func (bv *BlockValidator) flagPeer(p peer.ID) {
 		return
 	}
 
-	bv.peers.Add(p, v.(int)+1)
+	bv.peers.Add(p, val+1)
 }
 
-func (bv *BlockValidator) Validate(ctx context.Context, pid peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
-	if pid == bv.self {
-		return bv.validateLocalBlock(ctx, msg)
-	}
-
-	// track validation time
-	begin := build.Clock.Now()
+func (bv *BlockValidator) Validate(ctx context.Context, pid peer.ID, msg *pubsub.Message) (res pubsub.ValidationResult) {
 	defer func() {
-		log.Debugf("block validation time: %s", build.Clock.Since(begin))
+		if rerr := recover(); rerr != nil {
+			err := xerrors.Errorf("validate block: %s", rerr)
+			recordFailure(ctx, metrics.BlockValidationFailure, err.Error())
+			bv.flagPeer(pid)
+			res = pubsub.ValidationReject
+			return
+		}
 	}()
 
-	stats.Record(ctx, metrics.BlockReceived.M(1))
+	var what string
+	res, what = consensus.ValidateBlockPubsub(ctx, bv.consensus, pid == bv.self, msg)
+	if res == pubsub.ValidationAccept {
+		// it's a good block! make sure we've only seen it once
+		if count := bv.recvBlocks.add(msg.ValidatorData.(*types.BlockMsg).Cid()); count > 0 {
+			if pid == bv.self {
+				log.Warnf("local block has been seen %d times; ignoring", count)
+			}
 
-	recordFailureFlagPeer := func(what string) {
+			// TODO: once these changes propagate to the network, we can consider
+			// dropping peers who send us the same block multiple times
+			return pubsub.ValidationIgnore
+		}
+	} else {
 		recordFailure(ctx, metrics.BlockValidationFailure, what)
-		bv.flagPeer(pid)
 	}
 
-	blk, what, err := bv.decodeAndCheckBlock(msg)
-	if err != nil {
-		log.Error("got invalid block over pubsub: ", err)
-		recordFailureFlagPeer(what)
-		return pubsub.ValidationReject
-	}
-
-	// validate the block meta: the Message CID in the header must match the included messages
-	err = bv.validateMsgMeta(ctx, blk)
-	if err != nil {
-		log.Warnf("error validating message metadata: %s", err)
-		recordFailureFlagPeer("invalid_block_meta")
-		return pubsub.ValidationReject
-	}
-
-	// we want to ensure that it is a block from a known miner; we reject blocks from unknown miners
-	// to prevent spam attacks.
-	// the logic works as follows: we lookup the miner in the chain for its key.
-	// if we can find it then it's a known miner and we can validate the signature.
-	// if we can't find it, we check whether we are (near) synced in the chain.
-	// if we are not synced we cannot validate the block and we must ignore it.
-	// if we are synced and the miner is unknown, then the block is rejcected.
-	key, err := bv.checkPowerAndGetWorkerKey(ctx, blk.Header)
-	if err != nil {
-		if err != ErrSoftFailure && bv.isChainNearSynced() {
-			log.Warnf("received block from unknown miner or miner that doesn't meet min power over pubsub; rejecting message")
-			recordFailureFlagPeer("unknown_miner")
-			return pubsub.ValidationReject
-		}
-
-		log.Warnf("cannot validate block message; unknown miner or miner that doesn't meet min power in unsynced chain")
-		return pubsub.ValidationIgnore
-	}
-
-	err = sigs.CheckBlockSignature(ctx, blk.Header, key)
-	if err != nil {
-		log.Errorf("block signature verification failed: %s", err)
-		recordFailureFlagPeer("signature_verification_failed")
-		return pubsub.ValidationReject
-	}
-
-	if blk.Header.ElectionProof.WinCount < 1 {
-		log.Errorf("block is not claiming to be winning")
-		recordFailureFlagPeer("not_winning")
-		return pubsub.ValidationReject
-	}
-
-	// it's a good block! make sure we've only seen it once
-	if bv.recvBlocks.add(blk.Header.Cid()) > 0 {
-		// TODO: once these changes propagate to the network, we can consider
-		// dropping peers who send us the same block multiple times
-		return pubsub.ValidationIgnore
-	}
-
-	// all good, accept the block
-	msg.ValidatorData = blk
-	stats.Record(ctx, metrics.BlockValidationSuccess.M(1))
-	return pubsub.ValidationAccept
-}
-
-func (bv *BlockValidator) validateLocalBlock(ctx context.Context, msg *pubsub.Message) pubsub.ValidationResult {
-	stats.Record(ctx, metrics.BlockPublished.M(1))
-
-	if size := msg.Size(); size > 1<<20-1<<15 {
-		log.Errorf("ignoring oversize block (%dB)", size)
-		recordFailure(ctx, metrics.BlockValidationFailure, "oversize_block")
-		return pubsub.ValidationIgnore
-	}
-
-	blk, what, err := bv.decodeAndCheckBlock(msg)
-	if err != nil {
-		log.Errorf("got invalid local block: %s", err)
-		recordFailure(ctx, metrics.BlockValidationFailure, what)
-		return pubsub.ValidationIgnore
-	}
-
-	if count := bv.recvBlocks.add(blk.Header.Cid()); count > 0 {
-		log.Warnf("local block has been seen %d times; ignoring", count)
-		return pubsub.ValidationIgnore
-	}
-
-	msg.ValidatorData = blk
-	stats.Record(ctx, metrics.BlockValidationSuccess.M(1))
-	return pubsub.ValidationAccept
-}
-
-func (bv *BlockValidator) decodeAndCheckBlock(msg *pubsub.Message) (*types.BlockMsg, string, error) {
-	blk, err := types.DecodeBlockMsg(msg.GetData())
-	if err != nil {
-		return nil, "invalid", xerrors.Errorf("error decoding block: %w", err)
-	}
-
-	if count := len(blk.BlsMessages) + len(blk.SecpkMessages); count > build.BlockMessageLimit {
-		return nil, "too_many_messages", fmt.Errorf("block contains too many messages (%d)", count)
-	}
-
-	// make sure we have a signature
-	if blk.Header.BlockSig == nil {
-		return nil, "missing_signature", fmt.Errorf("block without a signature")
-	}
-
-	return blk, "", nil
-}
-
-func (bv *BlockValidator) isChainNearSynced() bool {
-	ts := bv.chain.GetHeaviestTipSet()
-	timestamp := ts.MinTimestamp()
-	timestampTime := time.Unix(int64(timestamp), 0)
-	return build.Clock.Since(timestampTime) < 6*time.Hour
-}
-
-func (bv *BlockValidator) validateMsgMeta(ctx context.Context, msg *types.BlockMsg) error {
-	// TODO there has to be a simpler way to do this without the blockstore dance
-	// block headers use adt0
-	store := blockadt.WrapStore(ctx, cbor.NewCborStore(blockstore.NewMemory()))
-	bmArr := blockadt.MakeEmptyArray(store)
-	smArr := blockadt.MakeEmptyArray(store)
-
-	for i, m := range msg.BlsMessages {
-		c := cbg.CborCid(m)
-		if err := bmArr.Set(uint64(i), &c); err != nil {
-			return err
-		}
-	}
-
-	for i, m := range msg.SecpkMessages {
-		c := cbg.CborCid(m)
-		if err := smArr.Set(uint64(i), &c); err != nil {
-			return err
-		}
-	}
-
-	bmroot, err := bmArr.Root()
-	if err != nil {
-		return err
-	}
-
-	smroot, err := smArr.Root()
-	if err != nil {
-		return err
-	}
-
-	mrcid, err := store.Put(store.Context(), &types.MsgMeta{
-		BlsMessages:   bmroot,
-		SecpkMessages: smroot,
-	})
-
-	if err != nil {
-		return err
-	}
-
-	if msg.Header.Messages != mrcid {
-		return fmt.Errorf("messages didn't match root cid in header")
-	}
-
-	return nil
-}
-
-func (bv *BlockValidator) checkPowerAndGetWorkerKey(ctx context.Context, bh *types.BlockHeader) (address.Address, error) {
-	// we check that the miner met the minimum power at the lookback tipset
-
-	baseTs := bv.chain.GetHeaviestTipSet()
-	lbts, lbst, err := stmgr.GetLookbackTipSetForRound(ctx, bv.stmgr, baseTs, bh.Height)
-	if err != nil {
-		log.Warnf("failed to load lookback tipset for incoming block: %s", err)
-		return address.Undef, ErrSoftFailure
-	}
-
-	key, err := stmgr.GetMinerWorkerRaw(ctx, bv.stmgr, lbst, bh.Miner)
-	if err != nil {
-		log.Warnf("failed to resolve worker key for miner %s: %s", bh.Miner, err)
-		return address.Undef, ErrSoftFailure
-	}
-
-	// NOTE: we check to see if the miner was eligible in the lookback
-	// tipset - 1 for historical reasons. DO NOT use the lookback state
-	// returned by GetLookbackTipSetForRound.
-
-	eligible, err := stmgr.MinerEligibleToMine(ctx, bv.stmgr, bh.Miner, baseTs, lbts)
-	if err != nil {
-		log.Warnf("failed to determine if incoming block's miner has minimum power: %s", err)
-		return address.Undef, ErrSoftFailure
-	}
-
-	if !eligible {
-		log.Warnf("incoming block's miner is ineligible")
-		return address.Undef, ErrInsufficientPower
-	}
-
-	return key, nil
+	return res
 }
 
 type blockReceiptCache struct {
-	blocks *lru.TwoQueueCache
+	blocks *lru.TwoQueueCache[cid.Cid, int]
 }
 
 func newBlockReceiptCache() *blockReceiptCache {
-	c, _ := lru.New2Q(8192)
+	c, _ := lru.New2Q[cid.Cid, int](8192)
 
 	return &blockReceiptCache{
 		blocks: c,
@@ -485,12 +305,12 @@ func newBlockReceiptCache() *blockReceiptCache {
 func (brc *blockReceiptCache) add(bcid cid.Cid) int {
 	val, ok := brc.blocks.Get(bcid)
 	if !ok {
-		brc.blocks.Add(bcid, int(1))
+		brc.blocks.Add(bcid, 1)
 		return 0
 	}
 
-	brc.blocks.Add(bcid, val.(int)+1)
-	return val.(int)
+	brc.blocks.Add(bcid, val+1)
+	return val
 }
 
 type MessageValidator struct {
@@ -507,6 +327,12 @@ func (mv *MessageValidator) Validate(ctx context.Context, pid peer.ID, msg *pubs
 		return mv.validateLocalMessage(ctx, msg)
 	}
 
+	start := time.Now()
+	defer func() {
+		ms := time.Now().Sub(start).Microseconds()
+		stats.Record(ctx, metrics.MessageValidationDuration.M(float64(ms)/1000))
+	}()
+
 	stats.Record(ctx, metrics.MessageReceived.M(1))
 	m, err := types.DecodeSignedMessage(msg.Message.GetData())
 	if err != nil {
@@ -516,7 +342,7 @@ func (mv *MessageValidator) Validate(ctx context.Context, pid peer.ID, msg *pubs
 		return pubsub.ValidationReject
 	}
 
-	if err := mv.mpool.Add(m); err != nil {
+	if err := mv.mpool.Add(ctx, m); err != nil {
 		log.Debugf("failed to add message from network to message pool (From: %s, To: %s, Nonce: %d, Value: %s): %s", m.Message.From, m.Message.To, m.Message.Nonce, types.FIL(m.Message.Value), err)
 		ctx, _ = tag.New(
 			ctx,
@@ -532,12 +358,20 @@ func (mv *MessageValidator) Validate(ctx context.Context, pid peer.ID, msg *pubs
 			fallthrough
 		case xerrors.Is(err, messagepool.ErrNonceGap):
 			fallthrough
+		case xerrors.Is(err, messagepool.ErrGasFeeCapTooLow):
+			fallthrough
 		case xerrors.Is(err, messagepool.ErrNonceTooLow):
 			return pubsub.ValidationIgnore
 		default:
 			return pubsub.ValidationReject
 		}
 	}
+
+	ctx, _ = tag.New(
+		ctx,
+		tag.Upsert(metrics.MsgValid, "true"),
+	)
+
 	stats.Record(ctx, metrics.MessageValidationSuccess.M(1))
 	return pubsub.ValidationAccept
 }
@@ -547,6 +381,13 @@ func (mv *MessageValidator) validateLocalMessage(ctx context.Context, msg *pubsu
 		ctx,
 		tag.Upsert(metrics.Local, "true"),
 	)
+
+	start := time.Now()
+	defer func() {
+		ms := time.Now().Sub(start).Microseconds()
+		stats.Record(ctx, metrics.MessageValidationDuration.M(float64(ms)/1000))
+	}()
+
 	// do some lightweight validation
 	stats.Record(ctx, metrics.MessagePublished.M(1))
 
@@ -557,7 +398,7 @@ func (mv *MessageValidator) validateLocalMessage(ctx context.Context, msg *pubsu
 		return pubsub.ValidationIgnore
 	}
 
-	if m.Size() > 32*1024 {
+	if m.Size() > messagepool.MaxMessageSize {
 		log.Warnf("local message is too large! (%dB)", m.Size())
 		recordFailure(ctx, metrics.MessageValidationFailure, "oversize")
 		return pubsub.ValidationIgnore
@@ -580,6 +421,11 @@ func (mv *MessageValidator) validateLocalMessage(ctx context.Context, msg *pubsu
 		recordFailure(ctx, metrics.MessageValidationFailure, "verify-sig")
 		return pubsub.ValidationIgnore
 	}
+
+	ctx, _ = tag.New(
+		ctx,
+		tag.Upsert(metrics.MsgValid, "true"),
+	)
 
 	stats.Record(ctx, metrics.MessageValidationSuccess.M(1))
 	return pubsub.ValidationAccept
@@ -607,4 +453,166 @@ func recordFailure(ctx context.Context, metric *stats.Int64Measure, failureType 
 		tag.Upsert(metrics.FailureType, failureType),
 	)
 	stats.Record(ctx, metric.M(1))
+}
+
+type peerMsgInfo struct {
+	peerID    peer.ID
+	lastCid   cid.Cid
+	lastSeqno uint64
+	rateLimit *ratelimit.Window
+	mutex     sync.Mutex
+}
+
+type IndexerMessageValidator struct {
+	self peer.ID
+
+	peerCache *lru.TwoQueueCache[address.Address, *peerMsgInfo]
+	chainApi  full.ChainModuleAPI
+	stateApi  full.StateModuleAPI
+}
+
+func NewIndexerMessageValidator(self peer.ID, chainApi full.ChainModuleAPI, stateApi full.StateModuleAPI) *IndexerMessageValidator {
+	peerCache, _ := lru.New2Q[address.Address, *peerMsgInfo](8192)
+
+	return &IndexerMessageValidator{
+		self:      self,
+		peerCache: peerCache,
+		chainApi:  chainApi,
+		stateApi:  stateApi,
+	}
+}
+
+func (v *IndexerMessageValidator) Validate(ctx context.Context, pid peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
+	// This chain-node should not be publishing its own messages.  These are
+	// relayed from market-nodes.  If a node appears to be local, reject it.
+	if pid == v.self {
+		log.Debug("ignoring indexer message from self")
+		stats.Record(ctx, metrics.IndexerMessageValidationFailure.M(1))
+		return pubsub.ValidationIgnore
+	}
+	originPeer := msg.GetFrom()
+	if originPeer == v.self {
+		log.Debug("ignoring indexer message originating from self")
+		stats.Record(ctx, metrics.IndexerMessageValidationFailure.M(1))
+		return pubsub.ValidationIgnore
+	}
+
+	idxrMsg := message.Message{}
+	err := idxrMsg.UnmarshalCBOR(bytes.NewBuffer(msg.Data))
+	if err != nil {
+		log.Errorw("Could not decode indexer pubsub message", "err", err)
+		return pubsub.ValidationReject
+	}
+	if len(idxrMsg.ExtraData) == 0 {
+		log.Debugw("ignoring messsage missing miner id", "peer", originPeer)
+		return pubsub.ValidationIgnore
+	}
+
+	// Get miner info from lotus
+	minerAddr, err := address.NewFromBytes(idxrMsg.ExtraData)
+	if err != nil {
+		log.Warnw("cannot parse extra data as miner address", "err", err, "extraData", idxrMsg.ExtraData)
+		return pubsub.ValidationReject
+	}
+
+	msgCid := idxrMsg.Cid
+
+	var msgInfo *peerMsgInfo
+	msgInfo, ok := v.peerCache.Get(minerAddr)
+	if !ok {
+		msgInfo = &peerMsgInfo{}
+	}
+
+	// Lock this peer's message info.
+	msgInfo.mutex.Lock()
+	defer msgInfo.mutex.Unlock()
+
+	if ok {
+		// Reject replayed messages.
+		seqno := binary.BigEndian.Uint64(msg.Message.GetSeqno())
+		if seqno <= msgInfo.lastSeqno {
+			log.Debugf("ignoring replayed indexer message")
+			return pubsub.ValidationIgnore
+		}
+		msgInfo.lastSeqno = seqno
+	}
+
+	if !ok || originPeer != msgInfo.peerID {
+		// Check that the miner ID maps to the peer that sent the message.
+		err = v.authenticateMessage(ctx, minerAddr, originPeer)
+		if err != nil {
+			log.Warnw("cannot authenticate messsage", "err", err, "peer", originPeer, "minerID", minerAddr)
+			stats.Record(ctx, metrics.IndexerMessageValidationFailure.M(1))
+			return pubsub.ValidationReject
+		}
+		msgInfo.peerID = originPeer
+		if !ok {
+			// Add msgInfo to cache only after being authenticated.  If two
+			// messages from the same peer are handled concurrently, there is a
+			// small chance that one msgInfo could replace the other here when
+			// the info is first cached.  This is OK, so no need to prevent it.
+			v.peerCache.Add(minerAddr, msgInfo)
+		}
+	}
+
+	// See if message needs to be ignored due to rate limiting.
+	if v.rateLimitPeer(msgInfo, msgCid) {
+		return pubsub.ValidationIgnore
+	}
+
+	stats.Record(ctx, metrics.IndexerMessageValidationSuccess.M(1))
+	return pubsub.ValidationAccept
+}
+
+func (v *IndexerMessageValidator) rateLimitPeer(msgInfo *peerMsgInfo, msgCid cid.Cid) bool {
+	const (
+		msgLimit        = 5
+		msgTimeLimit    = 10 * time.Second
+		repeatTimeLimit = 2 * time.Hour
+	)
+
+	timeWindow := msgInfo.rateLimit
+
+	// Check overall message rate.
+	if timeWindow == nil {
+		timeWindow = ratelimit.NewWindow(msgLimit, msgTimeLimit)
+		msgInfo.rateLimit = timeWindow
+	} else if msgInfo.lastCid == msgCid {
+		// Check if this is a repeat of the previous message data.
+		if time.Since(timeWindow.Newest()) < repeatTimeLimit {
+			log.Warnw("ignoring repeated indexer message", "sender", msgInfo.peerID)
+			return true
+		}
+	}
+
+	err := timeWindow.Add()
+	if err != nil {
+		log.Warnw("ignoring indexer message", "sender", msgInfo.peerID, "err", err)
+		return true
+	}
+
+	msgInfo.lastCid = msgCid
+
+	return false
+}
+
+func (v *IndexerMessageValidator) authenticateMessage(ctx context.Context, minerAddress address.Address, peerID peer.ID) error {
+	ts, err := v.chainApi.ChainHead(ctx)
+	if err != nil {
+		return err
+	}
+
+	minerInfo, err := v.stateApi.StateMinerInfo(ctx, minerAddress, ts.Key())
+	if err != nil {
+		return err
+	}
+
+	if minerInfo.PeerId == nil {
+		return xerrors.New("no peer id for miner")
+	}
+	if *minerInfo.PeerId != peerID {
+		return xerrors.New("miner id does not map to peer that sent message")
+	}
+
+	return nil
 }

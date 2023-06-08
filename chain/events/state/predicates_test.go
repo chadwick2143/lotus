@@ -1,30 +1,28 @@
+// stm: #unit
 package state
 
 import (
 	"context"
 	"testing"
 
-	test "github.com/filecoin-project/lotus/chain/events/state/mock"
-
-	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
-
-	"github.com/filecoin-project/go-bitfield"
-
 	"github.com/ipfs/go-cid"
 	cbornode "github.com/ipfs/go-ipld-cbor"
 	"github.com/stretchr/testify/require"
 
 	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-bitfield"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
 	market2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/market"
 	miner2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/miner"
 	adt2 "github.com/filecoin-project/specs-actors/v2/actors/util/adt"
-	tutils "github.com/filecoin-project/specs-actors/v2/support/testing"
+	tutils "github.com/filecoin-project/specs-actors/v5/support/testing"
 
 	bstore "github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/market"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
+	test "github.com/filecoin-project/lotus/chain/events/state/mock"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
@@ -35,6 +33,12 @@ func init() {
 }
 
 func TestMarketPredicates(t *testing.T) {
+	//stm: @EVENTS_PREDICATES_ON_ACTOR_STATE_CHANGED_001, @EVENTS_PREDICATES_DEAL_STATE_CHANGED_001
+	//stm: @EVENTS_PREDICATES_DEAL_CHANGED_FOR_IDS
+
+	//stm: @EVENTS_PREDICATES_ON_BALANCE_CHANGED_001, @EVENTS_PREDICATES_BALANCE_CHANGED_FOR_ADDRESS_001
+	//stm: @EVENTS_PREDICATES_ON_DEAL_PROPOSAL_CHANGED_001, @EVENTS_PREDICATES_PROPOSAL_AMT_CHANGED_001
+	//stm: @EVENTS_PREDICATES_DEAL_STATE_CHANGED_001, @EVENTS_PREDICATES_DEAL_AMT_CHANGED_001
 	ctx := context.Background()
 	bs := bstore.NewMemorySync()
 	store := adt2.WrapStore(ctx, cbornode.NewCborStore(bs))
@@ -333,6 +337,8 @@ func TestMarketPredicates(t *testing.T) {
 }
 
 func TestMinerSectorChange(t *testing.T) {
+	//stm: @EVENTS_PREDICATES_ON_ACTOR_STATE_CHANGED_001, @EVENTS_PREDICATES_MINER_ACTOR_CHANGE_001
+	//stm: @EVENTS_PREDICATES_MINER_SECTOR_CHANGE_001
 	ctx := context.Background()
 	bs := bstore.NewMemorySync()
 	store := adt2.WrapStore(ctx, cbornode.NewCborStore(bs))

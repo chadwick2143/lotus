@@ -3,18 +3,18 @@ package stmgr
 import (
 	"context"
 
-	"golang.org/x/xerrors"
-
 	"github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
+
 	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
-func (sm *StateManager) ParentStateTsk(tsk types.TipSetKey) (*state.StateTree, error) {
-	ts, err := sm.cs.GetTipSetFromKey(tsk)
+func (sm *StateManager) ParentStateTsk(ctx context.Context, tsk types.TipSetKey) (*state.StateTree, error) {
+	ts, err := sm.cs.GetTipSetFromKey(ctx, tsk)
 	if err != nil {
 		return nil, xerrors.Errorf("loading tipset %s: %w", tsk, err)
 	}
@@ -29,6 +29,14 @@ func (sm *StateManager) ParentState(ts *types.TipSet) (*state.StateTree, error) 
 	}
 
 	return state, nil
+}
+
+func (sm *StateManager) parentState(ts *types.TipSet) cid.Cid {
+	if ts == nil {
+		ts = sm.cs.GetHeaviestTipSet()
+	}
+
+	return ts.ParentState()
 }
 
 func (sm *StateManager) StateTree(st cid.Cid) (*state.StateTree, error) {
@@ -49,8 +57,8 @@ func (sm *StateManager) LoadActor(_ context.Context, addr address.Address, ts *t
 	return state.GetActor(addr)
 }
 
-func (sm *StateManager) LoadActorTsk(_ context.Context, addr address.Address, tsk types.TipSetKey) (*types.Actor, error) {
-	state, err := sm.ParentStateTsk(tsk)
+func (sm *StateManager) LoadActorTsk(ctx context.Context, addr address.Address, tsk types.TipSetKey) (*types.Actor, error) {
+	state, err := sm.ParentStateTsk(ctx, tsk)
 	if err != nil {
 		return nil, err
 	}

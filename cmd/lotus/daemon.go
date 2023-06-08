@@ -1,3 +1,4 @@
+//go:build !nodaemon
 // +build !nodaemon
 
 package main
@@ -9,13 +10,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"net/http"
 	"os"
+	"path"
 	"runtime/pprof"
 	"strings"
 
-	paramfetch "github.com/filecoin-project/go-paramfetch"
+	"github.com/DataDog/zstd"
 	metricsprom "github.com/ipfs/go-metrics-prometheus"
 	"github.com/mitchellh/go-homedir"
 	"github.com/multiformats/go-multiaddr"
@@ -27,23 +27,32 @@ import (
 	"golang.org/x/xerrors"
 	"gopkg.in/cheggaaa/pb.v1"
 
-	"github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/go-jsonrpc"
+	"github.com/filecoin-project/go-paramfetch"
+
+	lapi "github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/consensus"
+	"github.com/filecoin-project/lotus/chain/consensus/filcns"
+	"github.com/filecoin-project/lotus/chain/index"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
 	lcli "github.com/filecoin-project/lotus/cli"
-	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
 	"github.com/filecoin-project/lotus/journal"
+	"github.com/filecoin-project/lotus/journal/fsjournal"
+	"github.com/filecoin-project/lotus/lib/httpreader"
 	"github.com/filecoin-project/lotus/lib/peermgr"
 	"github.com/filecoin-project/lotus/lib/ulimit"
 	"github.com/filecoin-project/lotus/metrics"
 	"github.com/filecoin-project/lotus/node"
+	"github.com/filecoin-project/lotus/node/config"
 	"github.com/filecoin-project/lotus/node/modules"
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
 	"github.com/filecoin-project/lotus/node/modules/testing"
 	"github.com/filecoin-project/lotus/node/repo"
+	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper"
 )
 
 const (
@@ -115,9 +124,8 @@ var DaemonCmd = &cli.Command{
 			Usage: "halt the process after importing chain from file",
 		},
 		&cli.BoolFlag{
-			Name:   "lite",
-			Usage:  "start lotus in lite mode",
-			Hidden: true,
+			Name:  "lite",
+			Usage: "start lotus in lite mode",
 		},
 		&cli.StringFlag{
 			Name:  "pprof",
@@ -231,14 +239,14 @@ var DaemonCmd = &cli.Command{
 		freshRepo := err != repo.ErrRepoExists
 
 		if !isLite {
-			if err := paramfetch.GetParams(lcli.ReqContext(cctx), build.ParametersJSON(), 0); err != nil {
+			if err := paramfetch.GetParams(lcli.ReqContext(cctx), build.ParametersJSON(), build.SrsJSON(), 0); err != nil {
 				return xerrors.Errorf("fetching proof parameters: %w", err)
 			}
 		}
 
 		var genBytes []byte
 		if cctx.String("genesis") != "" {
-			genBytes, err = ioutil.ReadFile(cctx.String("genesis"))
+			genBytes, err = os.ReadFile(cctx.String("genesis"))
 			if err != nil {
 				return xerrors.Errorf("reading genesis: %w", err)
 			}
@@ -299,7 +307,7 @@ var DaemonCmd = &cli.Command{
 			}
 
 			defer closer()
-			liteModeDeps = node.Override(new(api.Gateway), gapi)
+			liteModeDeps = node.Override(new(lapi.Gateway), gapi)
 		}
 
 		// some libraries like ipfs/go-ds-measure and ipfs/go-ipfs-blockstore
@@ -309,11 +317,11 @@ var DaemonCmd = &cli.Command{
 			log.Warnf("unable to inject prometheus ipfs/go-metrics exporter; some metrics will be unavailable; err: %s", err)
 		}
 
-		var api api.FullNode
+		var api lapi.FullNode
 		stop, err := node.New(ctx,
 			node.FullAPI(&api, node.Lite(isLite)),
 
-			node.Online(),
+			node.Base(),
 			node.Repo(r),
 
 			node.Override(new(dtypes.Bootstrapper), isBootstrapper),
@@ -351,21 +359,50 @@ var DaemonCmd = &cli.Command{
 			return xerrors.Errorf("getting api endpoint: %w", err)
 		}
 
+		//
+		// Instantiate JSON-RPC endpoint.
+		// ----
+
+		// Populate JSON-RPC options.
+		serverOptions := []jsonrpc.ServerOption{jsonrpc.WithServerErrors(lapi.RPCErrors)}
+		if maxRequestSize := cctx.Int("api-max-req-size"); maxRequestSize != 0 {
+			serverOptions = append(serverOptions, jsonrpc.WithMaxRequestSize(int64(maxRequestSize)))
+		}
+
+		// Instantiate the full node handler.
+		h, err := node.FullNodeHandler(api, true, serverOptions...)
+		if err != nil {
+			return fmt.Errorf("failed to instantiate rpc handler: %s", err)
+		}
+
+		// Serve the RPC.
+		rpcStopper, err := node.ServeRPC(h, "lotus-daemon", endpoint)
+		if err != nil {
+			return fmt.Errorf("failed to start json-rpc endpoint: %s", err)
+		}
+
+		// Monitor for shutdown.
+		finishCh := node.MonitorShutdown(shutdownChan,
+			node.ShutdownHandler{Component: "rpc server", StopFunc: rpcStopper},
+			node.ShutdownHandler{Component: "node", StopFunc: stop},
+		)
+		<-finishCh // fires when shutdown is complete.
+
 		// TODO: properly parse api endpoint (or make it a URL)
-		return serveRPC(api, stop, endpoint, shutdownChan, int64(cctx.Int("api-max-req-size")))
+		return nil
 	},
 	Subcommands: []*cli.Command{
 		daemonStopCmd,
 	},
 }
 
-func importKey(ctx context.Context, api api.FullNode, f string) error {
+func importKey(ctx context.Context, api lapi.FullNode, f string) error {
 	f, err := homedir.Expand(f)
 	if err != nil {
 		return err
 	}
 
-	hexdata, err := ioutil.ReadFile(f)
+	hexdata, err := os.ReadFile(f)
 	if err != nil {
 		return err
 	}
@@ -397,18 +434,13 @@ func ImportChain(ctx context.Context, r repo.Repo, fname string, snapshot bool) 
 	var rd io.Reader
 	var l int64
 	if strings.HasPrefix(fname, "http://") || strings.HasPrefix(fname, "https://") {
-		resp, err := http.Get(fname) //nolint:gosec
+		rrd, err := httpreader.NewResumableReader(ctx, fname)
 		if err != nil {
-			return err
-		}
-		defer resp.Body.Close() //nolint:errcheck
-
-		if resp.StatusCode != http.StatusOK {
-			return xerrors.Errorf("fetching chain CAR failed with non-200 response: %d", resp.StatusCode)
+			return xerrors.Errorf("fetching chain CAR failed: setting up resumable reader: %w", err)
 		}
 
-		rd = resp.Body
-		l = resp.ContentLength
+		rd = rrd
+		l = rrd.ContentLength()
 	} else {
 		fname, err = homedir.Expand(fname)
 		if err != nil {
@@ -441,22 +473,27 @@ func ImportChain(ctx context.Context, r repo.Repo, fname string, snapshot bool) 
 		return xerrors.Errorf("failed to open blockstore: %w", err)
 	}
 
-	mds, err := lr.Datastore(context.TODO(), "/metadata")
+	mds, err := lr.Datastore(ctx, "/metadata")
 	if err != nil {
 		return err
 	}
 
-	j, err := journal.OpenFSJournal(lr, journal.EnvDisabledEvents())
+	j, err := fsjournal.OpenFSJournal(lr, journal.EnvDisabledEvents())
 	if err != nil {
 		return xerrors.Errorf("failed to open journal: %w", err)
 	}
 
-	cst := store.NewChainStore(bs, bs, mds, vm.Syscalls(ffiwrapper.ProofVerifier), j)
+	cst := store.NewChainStore(bs, bs, mds, filcns.Weight, j)
 	defer cst.Close() //nolint:errcheck
 
 	log.Infof("importing chain from %s...", fname)
 
 	bufr := bufio.NewReaderSize(rd, 1<<20)
+
+	header, err := bufr.Peek(4)
+	if err != nil {
+		return xerrors.Errorf("peek header: %w", err)
+	}
 
 	bar := pb.New64(l)
 	br := bar.NewProxyReader(bufr)
@@ -465,15 +502,27 @@ func ImportChain(ctx context.Context, r repo.Repo, fname string, snapshot bool) 
 	bar.ShowSpeed = true
 	bar.Units = pb.U_BYTES
 
+	var ir io.Reader = br
+
+	if string(header[1:]) == "\xB5\x2F\xFD" { // zstd
+		zr := zstd.NewReader(br)
+		defer func() {
+			if err := zr.Close(); err != nil {
+				log.Errorw("closing zstd reader", "error", err)
+			}
+		}()
+		ir = zr
+	}
+
 	bar.Start()
-	ts, err := cst.Import(br)
+	ts, err := cst.Import(ctx, ir)
 	bar.Finish()
 
 	if err != nil {
 		return xerrors.Errorf("importing chain failed: %w", err)
 	}
 
-	if err := cst.FlushValidationCache(); err != nil {
+	if err := cst.FlushValidationCache(ctx); err != nil {
 		return xerrors.Errorf("flushing validation cache failed: %w", err)
 	}
 
@@ -482,12 +531,16 @@ func ImportChain(ctx context.Context, r repo.Repo, fname string, snapshot bool) 
 		return err
 	}
 
-	err = cst.SetGenesis(gb.Blocks()[0])
+	err = cst.SetGenesis(ctx, gb.Blocks()[0])
 	if err != nil {
 		return err
 	}
 
-	stm := stmgr.NewStateManager(cst)
+	// TODO: We need to supply the actual beacon after v14
+	stm, err := stmgr.NewStateManager(cst, consensus.NewTipSetExecutor(filcns.RewardFunc), vm.Syscalls(ffiwrapper.ProofVerifier), filcns.DefaultUpgradeSchedule(), nil, mds, index.DummyMsgIndex)
+	if err != nil {
+		return err
+	}
 
 	if !snapshot {
 		log.Infof("validating imported chain...")
@@ -499,6 +552,24 @@ func ImportChain(ctx context.Context, r repo.Repo, fname string, snapshot bool) 
 	log.Infof("accepting %s as new head", ts.Cids())
 	if err := cst.ForceHeadSilent(ctx, ts); err != nil {
 		return err
+	}
+
+	// populate the message index if user has EnableMsgIndex enabled
+	//
+	c, err := lr.Config()
+	if err != nil {
+		return err
+	}
+	cfg, ok := c.(*config.FullNode)
+	if !ok {
+		return xerrors.Errorf("invalid config for repo, got: %T", c)
+	}
+	if cfg.Index.EnableMsgIndex {
+		log.Info("populating message index...")
+		if err := index.PopulateAfterSnapshot(ctx, path.Join(lr.Path(), "sqlite"), cst); err != nil {
+			return err
+		}
+		log.Info("populating message index done")
 	}
 
 	return nil

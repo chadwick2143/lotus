@@ -8,18 +8,18 @@ import (
 	dchain "github.com/drand/drand/chain"
 	dclient "github.com/drand/drand/client"
 	hclient "github.com/drand/drand/client/http"
+	"github.com/drand/drand/common/scheme"
 	dlog "github.com/drand/drand/log"
 	gclient "github.com/drand/drand/lp2p/client"
 	"github.com/drand/kyber"
-	kzap "github.com/go-kit/kit/log/zap"
-	lru "github.com/hashicorp/golang-lru"
-	"go.uber.org/zap/zapcore"
-	"golang.org/x/xerrors"
-
+	lru "github.com/hashicorp/golang-lru/v2"
 	logging "github.com/ipfs/go-log/v2"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"go.uber.org/zap"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/network"
 
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/beacon"
@@ -61,12 +61,24 @@ type DrandBeacon struct {
 	filGenTime   uint64
 	filRoundTime uint64
 
-	localCache *lru.Cache
+	localCache *lru.Cache[uint64, *types.BeaconEntry]
 }
 
 // DrandHTTPClient interface overrides the user agent used by drand
 type DrandHTTPClient interface {
 	SetUserAgent(string)
+}
+
+type logger struct {
+	*zap.SugaredLogger
+}
+
+func (l *logger) With(args ...interface{}) dlog.Logger {
+	return &logger{l.SugaredLogger.With(args...)}
+}
+
+func (l *logger) Named(s string) dlog.Logger {
+	return &logger{l.SugaredLogger.Named(s)}
 }
 
 func NewDrandBeacon(genesisTs, interval uint64, ps *pubsub.PubSub, config dtypes.DrandConfig) (*DrandBeacon, error) {
@@ -78,9 +90,6 @@ func NewDrandBeacon(genesisTs, interval uint64, ps *pubsub.PubSub, config dtypes
 	if err != nil {
 		return nil, xerrors.Errorf("unable to unmarshal drand chain info: %w", err)
 	}
-
-	dlogger := dlog.NewKitLoggerFrom(kzap.NewZapSugarLogger(
-		log.SugaredLogger.Desugar(), zapcore.InfoLevel))
 
 	var clients []dclient.Client
 	for _, url := range config.Servers {
@@ -96,7 +105,7 @@ func NewDrandBeacon(genesisTs, interval uint64, ps *pubsub.PubSub, config dtypes
 	opts := []dclient.Option{
 		dclient.WithChainInfo(drandChain),
 		dclient.WithCacheSize(1024),
-		dclient.WithLogger(dlogger),
+		dclient.WithLogger(&logger{&log.SugaredLogger}),
 	}
 
 	if ps != nil {
@@ -107,10 +116,10 @@ func NewDrandBeacon(genesisTs, interval uint64, ps *pubsub.PubSub, config dtypes
 
 	client, err := dclient.Wrap(clients, opts...)
 	if err != nil {
-		return nil, xerrors.Errorf("creating drand client")
+		return nil, xerrors.Errorf("creating drand client: %w", err)
 	}
 
-	lc, err := lru.New(1024)
+	lc, err := lru.New[uint64, *types.BeaconEntry](1024)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +151,7 @@ func (db *DrandBeacon) Entry(ctx context.Context, round uint64) <-chan beacon.Re
 
 	go func() {
 		start := build.Clock.Now()
-		log.Infow("start fetching randomness", "round", round)
+		log.Debugw("start fetching randomness", "round", round)
 		resp, err := db.client.Get(ctx, round)
 
 		var br beacon.Response
@@ -152,7 +161,7 @@ func (db *DrandBeacon) Entry(ctx context.Context, round uint64) <-chan beacon.Re
 			br.Entry.Round = resp.Round()
 			br.Entry.Data = resp.Signature()
 		}
-		log.Infow("done fetching randomness", "round", round, "took", build.Clock.Since(start))
+		log.Debugw("done fetching randomness", "round", round, "took", build.Clock.Since(start))
 		out <- br
 		close(out)
 	}()
@@ -160,16 +169,12 @@ func (db *DrandBeacon) Entry(ctx context.Context, round uint64) <-chan beacon.Re
 	return out
 }
 func (db *DrandBeacon) cacheValue(e types.BeaconEntry) {
-	db.localCache.Add(e.Round, e)
+	db.localCache.Add(e.Round, &e)
 }
 
 func (db *DrandBeacon) getCachedValue(round uint64) *types.BeaconEntry {
-	v, ok := db.localCache.Get(round)
-	if !ok {
-		return nil
-	}
-	e, _ := v.(types.BeaconEntry)
-	return &e
+	v, _ := db.localCache.Get(round)
+	return v
 }
 
 func (db *DrandBeacon) VerifyEntry(curr types.BeaconEntry, prev types.BeaconEntry) error {
@@ -177,6 +182,11 @@ func (db *DrandBeacon) VerifyEntry(curr types.BeaconEntry, prev types.BeaconEntr
 		// TODO handle genesis better
 		return nil
 	}
+
+	if curr.Round != prev.Round+1 {
+		return xerrors.Errorf("invalid beacon entry: cur (%d) != prev (%d) + 1", curr.Round, prev.Round)
+	}
+
 	if be := db.getCachedValue(curr.Round); be != nil {
 		if !bytes.Equal(curr.Data, be.Data) {
 			return xerrors.New("invalid beacon value, does not match cached good value")
@@ -189,18 +199,39 @@ func (db *DrandBeacon) VerifyEntry(curr types.BeaconEntry, prev types.BeaconEntr
 		Round:       curr.Round,
 		Signature:   curr.Data,
 	}
-	err := dchain.VerifyBeacon(db.pubkey, b)
+	err := dchain.NewVerifier(scheme.GetSchemeFromEnv()).VerifyBeacon(*b, db.pubkey)
 	if err == nil {
 		db.cacheValue(curr)
 	}
 	return err
 }
 
-func (db *DrandBeacon) MaxBeaconRoundForEpoch(filEpoch abi.ChainEpoch) uint64 {
+func (db *DrandBeacon) MaxBeaconRoundForEpoch(nv network.Version, filEpoch abi.ChainEpoch) uint64 {
 	// TODO: sometimes the genesis time for filecoin is zero and this goes negative
 	latestTs := ((uint64(filEpoch) * db.filRoundTime) + db.filGenTime) - db.filRoundTime
+
+	if nv <= network.Version15 {
+		return db.maxBeaconRoundV1(latestTs)
+	}
+
+	return db.maxBeaconRoundV2(latestTs)
+}
+
+func (db *DrandBeacon) maxBeaconRoundV1(latestTs uint64) uint64 {
 	dround := (latestTs - db.drandGenTime) / uint64(db.interval.Seconds())
 	return dround
+}
+
+func (db *DrandBeacon) maxBeaconRoundV2(latestTs uint64) uint64 {
+	if latestTs < db.drandGenTime {
+		return 1
+	}
+
+	fromGenesis := latestTs - db.drandGenTime
+	// we take the time from genesis divided by the periods in seconds, that
+	// gives us the number of periods since genesis.  We also add +1 because
+	// round 1 starts at genesis time.
+	return fromGenesis/uint64(db.interval.Seconds()) + 1
 }
 
 var _ beacon.RandomBeacon = (*DrandBeacon)(nil)

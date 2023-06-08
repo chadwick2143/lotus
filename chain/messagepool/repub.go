@@ -5,40 +5,50 @@ import (
 	"sort"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
+
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/messagepool/gasguess"
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/ipfs/go-cid"
 )
 
 const repubMsgLimit = 30
 
 var RepublishBatchDelay = 100 * time.Millisecond
 
-func (mp *MessagePool) republishPendingMessages() error {
-	mp.curTsLk.Lock()
+func (mp *MessagePool) republishPendingMessages(ctx context.Context) error {
+	mp.curTsLk.RLock()
 	ts := mp.curTs
+	mp.curTsLk.RUnlock()
 
 	baseFee, err := mp.api.ChainComputeBaseFee(context.TODO(), ts)
 	if err != nil {
-		mp.curTsLk.Unlock()
 		return xerrors.Errorf("computing basefee: %w", err)
 	}
 	baseFeeLowerBound := getBaseFeeLowerBound(baseFee, baseFeeLowerBoundFactor)
 
 	pending := make(map[address.Address]map[uint64]*types.SignedMessage)
+
 	mp.lk.Lock()
 	mp.republished = nil // clear this to avoid races triggering an early republish
-	for actor := range mp.localAddrs {
-		mset, ok := mp.pending[actor]
+	mp.lk.Unlock()
+
+	mp.lk.RLock()
+	mp.forEachLocal(ctx, func(ctx context.Context, actor address.Address) {
+		mset, ok, err := mp.getPendingMset(ctx, actor)
+		if err != nil {
+			log.Debugf("failed to get mset: %w", err)
+			return
+		}
+
 		if !ok {
-			continue
+			return
 		}
 		if len(mset.msgs) == 0 {
-			continue
+			return
 		}
 		// we need to copy this while holding the lock to avoid races with concurrent modification
 		pend := make(map[uint64]*types.SignedMessage, len(mset.msgs))
@@ -46,9 +56,8 @@ func (mp *MessagePool) republishPendingMessages() error {
 			pend[nonce] = m
 		}
 		pending[actor] = pend
-	}
-	mp.lk.Unlock()
-	mp.curTsLk.Unlock()
+	})
+	mp.lk.RUnlock()
 
 	if len(pending) == 0 {
 		return nil
@@ -72,7 +81,7 @@ func (mp *MessagePool) republishPendingMessages() error {
 		return chains[i].Before(chains[j])
 	})
 
-	gasLimit := int64(build.BlockGasLimit)
+	gasLimit := build.BlockGasLimit
 	minGas := int64(gasguess.MinGas)
 	var msgs []*types.SignedMessage
 loop:
@@ -115,7 +124,7 @@ loop:
 
 		// we can't fit the current chain but there is gas to spare
 		// trim it and push it down
-		chain.Trim(gasLimit, mp, baseFee)
+		chain.Trim(gasLimit, repubMsgLimit, mp, baseFee)
 		for j := i; j < len(chains)-1; j++ {
 			if chains[j].Before(chains[j+1]) {
 				break
@@ -125,6 +134,10 @@ loop:
 	}
 
 	count := 0
+	if len(msgs) > repubMsgLimit {
+		msgs = msgs[:repubMsgLimit]
+	}
+
 	log.Infof("republishing %d messages", len(msgs))
 	for _, m := range msgs {
 		mb, err := m.Serialize()
@@ -165,8 +178,8 @@ loop:
 		republished[m.Cid()] = struct{}{}
 	}
 
-	mp.lk.Lock()
 	// update the republished set so that we can trigger early republish from head changes
+	mp.lk.Lock()
 	mp.republished = republished
 	mp.lk.Unlock()
 

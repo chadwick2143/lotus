@@ -61,12 +61,16 @@ func BackupCmd(repoFlag string, rt repo.RepoType, getApi BackupApiFn) *cli.Comma
 			return xerrors.Errorf("expanding file path: %w", err)
 		}
 
+		if _, err := os.Stat(fpath); !os.IsNotExist(err) {
+			return xerrors.Errorf("backup file %s already exists. Overwriting it will corrupt the file, please specify another file name", fpath)
+		}
+
 		out, err := os.OpenFile(fpath, os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			return xerrors.Errorf("opening backup file %s: %w", fpath, err)
 		}
 
-		if err := bds.Backup(out); err != nil {
+		if err := bds.Backup(cctx.Context, out); err != nil {
 			if cerr := out.Close(); cerr != nil {
 				log.Errorw("error closing backup file while handling backup error", "closeErr", cerr, "backupErr", err)
 			}
@@ -87,7 +91,12 @@ func BackupCmd(repoFlag string, rt repo.RepoType, getApi BackupApiFn) *cli.Comma
 		}
 		defer closer()
 
-		err = api.CreateBackup(ReqContext(cctx), cctx.Args().First())
+		backupPath := cctx.Args().First()
+		if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+			return xerrors.Errorf("backup file %s already exists. Overwriting it will corrupt the file, please specify another file name", backupPath)
+		}
+
+		err = api.CreateBackup(ReqContext(cctx), backupPath)
 		if err != nil {
 			return err
 		}
@@ -114,8 +123,8 @@ this command must be within this base path`,
 		},
 		ArgsUsage: "[backup file path]",
 		Action: func(cctx *cli.Context) error {
-			if cctx.Args().Len() != 1 {
-				return xerrors.Errorf("expected 1 argument")
+			if cctx.NArg() != 1 {
+				return IncorrectNumArgs(cctx)
 			}
 
 			if cctx.Bool("offline") {

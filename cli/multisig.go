@@ -10,29 +10,25 @@ import (
 	"strconv"
 	"text/tabwriter"
 
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
-
-	"github.com/filecoin-project/lotus/chain/actors"
-	"github.com/filecoin-project/lotus/chain/stmgr"
-	cbg "github.com/whyrusleeping/cbor-gen"
-
-	"github.com/filecoin-project/go-state-types/big"
-
-	"github.com/filecoin-project/go-state-types/abi"
-
-	"github.com/filecoin-project/go-address"
-	cid "github.com/ipfs/go-cid"
+	"github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	"github.com/urfave/cli/v2"
+	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 
+	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
 	init2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/init"
 	msig2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/multisig"
 
 	"github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/multisig"
+	"github.com/filecoin-project/lotus/chain/consensus"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
@@ -52,6 +48,7 @@ var multisigCmd = &cli.Command{
 		msigProposeCmd,
 		msigRemoveProposeCmd,
 		msigApproveCmd,
+		msigCancelCmd,
 		msigAddProposeCmd,
 		msigAddApproveCmd,
 		msigAddCancelCmd,
@@ -91,8 +88,8 @@ var msigCreateCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() < 1 {
-			return ShowHelp(cctx, fmt.Errorf("multisigs must have at least one signer"))
+		if cctx.NArg() < 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -160,6 +157,9 @@ var msigCreateCmd = &cli.Command{
 
 		msgCid := sm.Cid()
 
+		fmt.Println("sent create in message: ", msgCid)
+		fmt.Println("waiting for confirmation..")
+
 		// wait for it to get mined into a block
 		wait, err := api.StateWaitMsg(ctx, msgCid, uint64(cctx.Int("confidence")), build.Finality, true)
 		if err != nil {
@@ -167,7 +167,7 @@ var msigCreateCmd = &cli.Command{
 		}
 
 		// check it executed successfully
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			fmt.Fprintln(cctx.App.Writer, "actor creation failed!")
 			return err
 		}
@@ -325,7 +325,7 @@ var msigInspectCmd = &cli.Command{
 						fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%s\t%s(%d)\t%s\n", txid, "pending", len(tx.Approved), target, types.FIL(tx.Value), "new account, unknown method", tx.Method, paramStr)
 					}
 				} else {
-					method := stmgr.MethodsMap[targAct.Code][tx.Method]
+					method := consensus.NewActorRegistry().Methods[targAct.Code][tx.Method] // TODO: use remote map
 
 					if decParams && tx.Method != 0 {
 						ptyp := reflect.New(method.Params.Elem()).Interface().(cbg.CBORUnmarshaler)
@@ -365,11 +365,11 @@ var msigProposeCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() < 3 {
+		if cctx.NArg() < 3 {
 			return ShowHelp(cctx, fmt.Errorf("must pass at least multisig address, destination, and value"))
 		}
 
-		if cctx.Args().Len() > 3 && cctx.Args().Len() != 5 {
+		if cctx.NArg() > 3 && cctx.NArg() != 5 {
 			return ShowHelp(cctx, fmt.Errorf("must either pass three or five arguments"))
 		}
 
@@ -399,7 +399,7 @@ var msigProposeCmd = &cli.Command{
 
 		var method uint64
 		var params []byte
-		if cctx.Args().Len() == 5 {
+		if cctx.NArg() == 5 {
 			m, err := strconv.ParseUint(cctx.Args().Get(3), 10, 64)
 			if err != nil {
 				return err
@@ -449,14 +449,14 @@ var msigProposeCmd = &cli.Command{
 
 		msgCid := sm.Cid()
 
-		fmt.Println("send proposal in message: ", msgCid)
+		fmt.Println("sent proposal in message: ", msgCid)
 
 		wait, err := api.StateWaitMsg(ctx, msgCid, uint64(cctx.Int("confidence")), build.Finality, true)
 		if err != nil {
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("proposal returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -487,15 +487,15 @@ var msigApproveCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() < 2 {
+		if cctx.NArg() < 2 {
 			return ShowHelp(cctx, fmt.Errorf("must pass at least multisig address and message ID"))
 		}
 
-		if cctx.Args().Len() > 2 && cctx.Args().Len() < 5 {
+		if cctx.NArg() > 2 && cctx.NArg() < 5 {
 			return ShowHelp(cctx, fmt.Errorf("usage: msig approve <msig addr> <message ID> <proposer address> <desination> <value>"))
 		}
 
-		if cctx.Args().Len() > 5 && cctx.Args().Len() != 7 {
+		if cctx.NArg() > 5 && cctx.NArg() != 7 {
 			return ShowHelp(cctx, fmt.Errorf("usage: msig approve <msig addr> <message ID> <proposer address> <desination> <value> [ <method> <params> ]"))
 		}
 
@@ -534,7 +534,7 @@ var msigApproveCmd = &cli.Command{
 		}
 
 		var msgCid cid.Cid
-		if cctx.Args().Len() == 2 {
+		if cctx.NArg() == 2 {
 			proto, err := api.MsigApprove(ctx, msig, txid, from)
 			if err != nil {
 				return err
@@ -571,7 +571,7 @@ var msigApproveCmd = &cli.Command{
 
 			var method uint64
 			var params []byte
-			if cctx.Args().Len() == 7 {
+			if cctx.NArg() == 7 {
 				m, err := strconv.ParseUint(cctx.Args().Get(5), 10, 64)
 				if err != nil {
 					return err
@@ -605,8 +605,133 @@ var msigApproveCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("approve returned exit %d", wait.Receipt.ExitCode)
+		}
+
+		return nil
+	},
+}
+
+var msigCancelCmd = &cli.Command{
+	Name:      "cancel",
+	Usage:     "Cancel a multisig message",
+	ArgsUsage: "<multisigAddress messageId> [destination value [methodId methodParams]]",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "from",
+			Usage: "account to send the cancel message from",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() < 2 {
+			return ShowHelp(cctx, fmt.Errorf("must pass at least multisig address and message ID"))
+		}
+
+		if cctx.NArg() > 2 && cctx.NArg() < 4 {
+			return ShowHelp(cctx, fmt.Errorf("usage: msig cancel <msig addr> <message ID> <desination> <value>"))
+		}
+
+		if cctx.NArg() > 4 && cctx.NArg() != 6 {
+			return ShowHelp(cctx, fmt.Errorf("usage: msig cancel <msig addr> <message ID> <desination> <value> [ <method> <params> ]"))
+		}
+
+		srv, err := GetFullNodeServices(cctx)
+		if err != nil {
+			return err
+		}
+		defer srv.Close() //nolint:errcheck
+
+		api := srv.FullNodeAPI()
+		ctx := ReqContext(cctx)
+
+		msig, err := address.NewFromString(cctx.Args().Get(0))
+		if err != nil {
+			return err
+		}
+
+		txid, err := strconv.ParseUint(cctx.Args().Get(1), 10, 64)
+		if err != nil {
+			return err
+		}
+
+		var from address.Address
+		if cctx.IsSet("from") {
+			f, err := address.NewFromString(cctx.String("from"))
+			if err != nil {
+				return err
+			}
+			from = f
+		} else {
+			defaddr, err := api.WalletDefaultAddress(ctx)
+			if err != nil {
+				return err
+			}
+			from = defaddr
+		}
+
+		var msgCid cid.Cid
+		if cctx.NArg() == 2 {
+			proto, err := api.MsigCancel(ctx, msig, txid, from)
+			if err != nil {
+				return err
+			}
+
+			sm, err := InteractiveSend(ctx, cctx, srv, proto)
+			if err != nil {
+				return err
+			}
+
+			msgCid = sm.Cid()
+		} else {
+			dest, err := address.NewFromString(cctx.Args().Get(2))
+			if err != nil {
+				return err
+			}
+
+			value, err := types.ParseFIL(cctx.Args().Get(3))
+			if err != nil {
+				return err
+			}
+
+			var method uint64
+			var params []byte
+			if cctx.NArg() == 6 {
+				m, err := strconv.ParseUint(cctx.Args().Get(4), 10, 64)
+				if err != nil {
+					return err
+				}
+				method = m
+
+				p, err := hex.DecodeString(cctx.Args().Get(5))
+				if err != nil {
+					return err
+				}
+				params = p
+			}
+
+			proto, err := api.MsigCancelTxnHash(ctx, msig, txid, dest, types.BigInt(value), from, method, params)
+			if err != nil {
+				return err
+			}
+
+			sm, err := InteractiveSend(ctx, cctx, srv, proto)
+			if err != nil {
+				return err
+			}
+
+			msgCid = sm.Cid()
+		}
+
+		fmt.Println("sent cancel in message: ", msgCid)
+
+		wait, err := api.StateWaitMsg(ctx, msgCid, uint64(cctx.Int("confidence")), build.Finality, true)
+		if err != nil {
+			return err
+		}
+
+		if wait.Receipt.ExitCode.IsError() {
+			return fmt.Errorf("cancel returned exit %d", wait.Receipt.ExitCode)
 		}
 
 		return nil
@@ -628,8 +753,8 @@ var msigRemoveProposeCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 2 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address and signer address"))
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -685,7 +810,7 @@ var msigRemoveProposeCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("add proposal returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -715,8 +840,8 @@ var msigAddProposeCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 2 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address and signer address"))
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -753,6 +878,39 @@ var msigAddProposeCmd = &cli.Command{
 			from = defaddr
 		}
 
+		store := adt.WrapStore(ctx, cbor.NewCborStore(blockstore.NewAPIBlockstore(api)))
+
+		head, err := api.ChainHead(ctx)
+		if err != nil {
+			return err
+		}
+
+		act, err := api.StateGetActor(ctx, msig, head.Key())
+		if err != nil {
+			return err
+		}
+
+		mstate, err := multisig.Load(store, act)
+		if err != nil {
+			return err
+		}
+
+		signers, err := mstate.Signers()
+		if err != nil {
+			return err
+		}
+
+		addrId, err := api.StateLookupID(ctx, addr, types.EmptyTSK)
+		if err != nil {
+			return err
+		}
+
+		for _, s := range signers {
+			if s == addrId {
+				return fmt.Errorf("%s is already a signer", addr.String())
+			}
+		}
+
 		proto, err := api.MsigAddPropose(ctx, msig, from, addr, cctx.Bool("increase-threshold"))
 		if err != nil {
 			return err
@@ -772,7 +930,7 @@ var msigAddProposeCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("add proposal returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -791,8 +949,8 @@ var msigAddApproveCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 5 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address, proposer address, transaction id, new signer address, whether to increase threshold"))
+		if cctx.NArg() != 5 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -863,7 +1021,7 @@ var msigAddApproveCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("add approval returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -882,8 +1040,8 @@ var msigAddCancelCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 4 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address, transaction id, new signer address, whether to increase threshold"))
+		if cctx.NArg() != 4 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -949,7 +1107,7 @@ var msigAddCancelCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("add cancellation returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -968,8 +1126,8 @@ var msigSwapProposeCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 3 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address, old signer address, new signer address"))
+		if cctx.NArg() != 3 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -1030,7 +1188,7 @@ var msigSwapProposeCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("swap proposal returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -1049,8 +1207,8 @@ var msigSwapApproveCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 5 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address, proposer address, transaction id, old signer address, new signer address"))
+		if cctx.NArg() != 5 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -1121,7 +1279,7 @@ var msigSwapApproveCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("swap approval returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -1140,8 +1298,8 @@ var msigSwapCancelCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 4 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address, transaction id, old signer address, new signer address"))
+		if cctx.NArg() != 4 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -1207,7 +1365,7 @@ var msigSwapCancelCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("swap cancellation returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -1226,8 +1384,8 @@ var msigLockProposeCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 4 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address, start epoch, unlock duration, and amount"))
+		if cctx.NArg() != 4 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -1303,7 +1461,7 @@ var msigLockProposeCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("lock proposal returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -1322,8 +1480,8 @@ var msigLockApproveCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 6 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address, proposer address, tx id, start epoch, unlock duration, and amount"))
+		if cctx.NArg() != 6 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -1409,7 +1567,7 @@ var msigLockApproveCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("lock approval returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -1428,8 +1586,8 @@ var msigLockCancelCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 6 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address, tx id, start epoch, unlock duration, and amount"))
+		if cctx.NArg() != 5 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -1491,7 +1649,7 @@ var msigLockCancelCmd = &cli.Command{
 			return actErr
 		}
 
-		proto, err := api.MsigCancel(ctx, msig, txid, msig, big.Zero(), from, uint64(multisig.Methods.LockBalance), params)
+		proto, err := api.MsigCancelTxnHash(ctx, msig, txid, msig, big.Zero(), from, uint64(multisig.Methods.LockBalance), params)
 		if err != nil {
 			return err
 		}
@@ -1510,7 +1668,7 @@ var msigLockCancelCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("lock cancellation returned exit %d", wait.Receipt.ExitCode)
 		}
 
@@ -1535,8 +1693,8 @@ var msigVestedCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 1 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address"))
+		if cctx.NArg() != 1 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		api, closer, err := GetFullNodeAPI(cctx)
@@ -1591,8 +1749,8 @@ var msigProposeThresholdCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 2 {
-			return ShowHelp(cctx, fmt.Errorf("must pass multisig address and new threshold value"))
+		if cctx.NArg() != 2 {
+			return IncorrectNumArgs(cctx)
 		}
 
 		srv, err := GetFullNodeServices(cctx)
@@ -1656,7 +1814,7 @@ var msigProposeThresholdCmd = &cli.Command{
 			return err
 		}
 
-		if wait.Receipt.ExitCode != 0 {
+		if wait.Receipt.ExitCode.IsError() {
 			return fmt.Errorf("change threshold proposal returned exit %d", wait.Receipt.ExitCode)
 		}
 

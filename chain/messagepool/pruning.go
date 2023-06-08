@@ -5,10 +5,12 @@ import (
 	"sort"
 	"time"
 
-	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
+
+	"github.com/filecoin-project/go-address"
+
+	"github.com/filecoin-project/lotus/chain/types"
 )
 
 func (mp *MessagePool) pruneExcessMessages() error {
@@ -49,7 +51,7 @@ func (mp *MessagePool) pruneMessages(ctx context.Context, ts *types.TipSet) erro
 	}
 	baseFeeLowerBound := getBaseFeeLowerBound(baseFee, baseFeeLowerBoundFactor)
 
-	pending, _ := mp.getPendingMessages(ts, ts)
+	pending, _ := mp.getPendingMessages(ctx, ts, ts)
 
 	// protected actors -- not pruned
 	protected := make(map[address.Address]struct{})
@@ -57,13 +59,18 @@ func (mp *MessagePool) pruneMessages(ctx context.Context, ts *types.TipSet) erro
 	mpCfg := mp.getConfig()
 	// we never prune priority addresses
 	for _, actor := range mpCfg.PriorityAddrs {
-		protected[actor] = struct{}{}
+		pk, err := mp.resolveToKey(ctx, actor)
+		if err != nil {
+			log.Debugf("pruneMessages failed to resolve priority address: %s", err)
+		}
+
+		protected[pk] = struct{}{}
 	}
 
 	// we also never prune locally published messages
-	for actor := range mp.localAddrs {
+	mp.forEachLocal(ctx, func(ctx context.Context, actor address.Address) {
 		protected[actor] = struct{}{}
-	}
+	})
 
 	// Collect all messages to track which ones to remove and create chains for block inclusion
 	pruneMsgs := make(map[cid.Cid]*types.SignedMessage, mp.currentSize)
@@ -108,7 +115,7 @@ keepLoop:
 	// and remove all messages that are still in pruneMsgs after processing the chains
 	log.Infof("Pruning %d messages", len(pruneMsgs))
 	for _, m := range pruneMsgs {
-		mp.remove(m.Message.From, m.Message.Nonce, false)
+		mp.remove(ctx, m.Message.From, m.Message.Nonce, false)
 	}
 
 	return nil

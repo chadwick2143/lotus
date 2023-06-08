@@ -6,29 +6,35 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-bitfield"
-	datatransfer "github.com/filecoin-project/go-data-transfer"
+	datatransfer "github.com/filecoin-project/go-data-transfer/v2"
 	"github.com/filecoin-project/go-fil-markets/retrievalmarket"
 	"github.com/filecoin-project/go-fil-markets/storagemarket"
-	"github.com/filecoin-project/go-multistore"
+	"github.com/filecoin-project/go-jsonrpc"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/builtin/v8/paych"
+	"github.com/filecoin-project/go-state-types/builtin/v9/market"
+	"github.com/filecoin-project/go-state-types/builtin/v9/miner"
+	verifregtypes "github.com/filecoin-project/go-state-types/builtin/v9/verifreg"
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/dline"
+	abinetwork "github.com/filecoin-project/go-state-types/network"
 
 	apitypes "github.com/filecoin-project/lotus/api/types"
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
-	"github.com/filecoin-project/lotus/chain/actors/builtin/market"
-	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
-	"github.com/filecoin-project/lotus/chain/actors/builtin/paych"
+	lminer "github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/power"
 	"github.com/filecoin-project/lotus/chain/types"
-	marketevents "github.com/filecoin-project/lotus/markets/loggers"
+	"github.com/filecoin-project/lotus/chain/types/ethtypes"
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
+	"github.com/filecoin-project/lotus/node/repo/imports"
 )
 
 //go:generate go run github.com/golang/mock/mockgen -destination=mocks/mock_full.go -package=mocks . FullNode
@@ -37,6 +43,7 @@ import (
 type ChainIO interface {
 	ChainReadObj(context.Context, cid.Cid) ([]byte, error)
 	ChainHasObj(context.Context, cid.Cid) (bool, error)
+	ChainPutObj(context.Context, blocks.Block) error
 }
 
 const LookbackNoLimit = abi.ChainEpoch(-1)
@@ -58,6 +65,7 @@ const LookbackNoLimit = abi.ChainEpoch(-1)
 // FullNode API is a low-level interface to the Filecoin network full node
 type FullNode interface {
 	Common
+	Net
 
 	// MethodGroup: Chain
 	// The Chain method group contains methods for interacting with the
@@ -69,12 +77,6 @@ type FullNode interface {
 
 	// ChainHead returns the current head of the chain.
 	ChainHead(context.Context) (*types.TipSet, error) //perm:read
-
-	// ChainGetRandomnessFromTickets is used to sample the chain for randomness.
-	ChainGetRandomnessFromTickets(ctx context.Context, tsk types.TipSetKey, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte) (abi.Randomness, error) //perm:read
-
-	// ChainGetRandomnessFromBeacon is used to sample the beacon for randomness.
-	ChainGetRandomnessFromBeacon(ctx context.Context, tsk types.TipSetKey, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte) (abi.Randomness, error) //perm:read
 
 	// ChainGetBlock returns the block specified by the given CID.
 	ChainGetBlock(context.Context, cid.Cid) (*types.BlockHeader, error) //perm:read
@@ -104,10 +106,18 @@ type FullNode interface {
 	// specified block.
 	ChainGetParentMessages(ctx context.Context, blockCid cid.Cid) ([]Message, error) //perm:read
 
+	// ChainGetMessagesInTipset returns message stores in current tipset
+	ChainGetMessagesInTipset(ctx context.Context, tsk types.TipSetKey) ([]Message, error) //perm:read
+
 	// ChainGetTipSetByHeight looks back for a tipset at the specified epoch.
 	// If there are no blocks at the specified epoch, a tipset at an earlier epoch
 	// will be returned.
 	ChainGetTipSetByHeight(context.Context, abi.ChainEpoch, types.TipSetKey) (*types.TipSet, error) //perm:read
+
+	// ChainGetTipSetAfterHeight looks back for a tipset at the specified epoch.
+	// If there are no blocks at the specified epoch, the first non-nil tipset at a later epoch
+	// will be returned.
+	ChainGetTipSetAfterHeight(context.Context, abi.ChainEpoch, types.TipSetKey) (*types.TipSet, error) //perm:read
 
 	// ChainReadObj reads ipld nodes referenced by the specified CID from chain
 	// blockstore and returns raw bytes.
@@ -118,6 +128,9 @@ type FullNode interface {
 
 	// ChainHasObj checks if a given CID exists in the chain blockstore.
 	ChainHasObj(context.Context, cid.Cid) (bool, error) //perm:read
+
+	// ChainPutObj puts a given object into the block store
+	ChainPutObj(context.Context, blocks.Block) error //perm:admin
 
 	// ChainStatObj returns statistics about the graph referenced by 'obj'.
 	// If 'base' is also specified, then the returned stat will be a diff
@@ -140,7 +153,7 @@ type FullNode interface {
 
 	// ChainGetPath returns a set of revert/apply operations needed to get from
 	// one tipset to another, for example:
-	//```
+	// ```
 	//        to
 	//         ^
 	// from   tAA
@@ -149,7 +162,7 @@ type FullNode interface {
 	//  ^---*--^
 	//      ^
 	//     tRR
-	//```
+	// ```
 	// Would return `[revert(tBA), apply(tAB), apply(tAA)]`
 	ChainGetPath(ctx context.Context, from types.TipSetKey, to types.TipSetKey) ([]*HeadChange, error) //perm:read
 
@@ -160,13 +173,33 @@ type FullNode interface {
 	// If oldmsgskip is set, messages from before the requested roots are also not included.
 	ChainExport(ctx context.Context, nroots abi.ChainEpoch, oldmsgskip bool, tsk types.TipSetKey) (<-chan []byte, error) //perm:read
 
-	// MethodGroup: Beacon
-	// The Beacon method group contains methods for interacting with the random beacon (DRAND)
+	// ChainExportRangeInternal triggers the export of a chain
+	// CAR-snapshot directly to disk. It is similar to ChainExport,
+	// except, depending on options, the snapshot can include receipts,
+	// messages and stateroots for the length between the specified head
+	// and tail, thus producing "archival-grade" snapshots that include
+	// all the on-chain data.  The header chain is included back to
+	// genesis and these snapshots can be used to initialize Filecoin
+	// nodes.
+	ChainExportRangeInternal(ctx context.Context, head, tail types.TipSetKey, cfg ChainExportConfig) error //perm:admin
 
-	// BeaconGetEntry returns the beacon entry for the given filecoin epoch. If
-	// the entry has not yet been produced, the call will block until the entry
-	// becomes available
-	BeaconGetEntry(ctx context.Context, epoch abi.ChainEpoch) (*types.BeaconEntry, error) //perm:read
+	// ChainPrune forces compaction on cold store and garbage collects; only supported if you
+	// are using the splitstore
+	ChainPrune(ctx context.Context, opts PruneOpts) error //perm:admin
+
+	// ChainHotGC does online (badger) GC on the hot store; only supported if you are using
+	// the splitstore
+	ChainHotGC(ctx context.Context, opts HotGCOpts) error //perm:admin
+
+	// ChainCheckBlockstore performs an (asynchronous) health check on the chain/state blockstore
+	// if supported by the underlying implementation.
+	ChainCheckBlockstore(context.Context) error //perm:admin
+
+	// ChainBlockstoreInfo returns some basic information about the blockstore
+	ChainBlockstoreInfo(context.Context) (map[string]interface{}, error) //perm:read
+
+	// ChainGetEvents returns the events under an event AMT root CID.
+	ChainGetEvents(context.Context, cid.Cid) ([]types.Event, error) //perm:read
 
 	// GasEstimateFeeCap estimates gas fee cap
 	GasEstimateFeeCap(context.Context, *types.Message, int64, types.TipSetKey) (types.BigInt, error) //perm:read
@@ -264,8 +297,10 @@ type FullNode interface {
 	MpoolGetNonce(context.Context, address.Address) (uint64, error) //perm:read
 	MpoolSub(context.Context) (<-chan MpoolUpdate, error)           //perm:read
 
-	// MpoolClear clears pending messages from the mpool
-	MpoolClear(context.Context, bool) error //perm:write
+	// MpoolClear clears pending messages from the mpool.
+	// If clearLocal is true, ALL messages will be cleared.
+	// If clearLocal is false, local messages will be protected, all others will be cleared.
+	MpoolClear(ctx context.Context, clearLocal bool) error //perm:write
 
 	// MpoolGetConfig returns (a copy of) the current mpool config
 	MpoolGetConfig(context.Context) (*types.MpoolConfig, error) //perm:read
@@ -279,7 +314,7 @@ type FullNode interface {
 
 	// // UX ?
 
-	// MethodGroup: Wallet
+	// MethodGroup: WalletF
 
 	// WalletNew creates a new address in the wallet with the given sigType.
 	// Available key types: bls, secp256k1, secp256k1-ledger
@@ -320,9 +355,11 @@ type FullNode interface {
 	// ClientImport imports file under the specified path into filestore.
 	ClientImport(ctx context.Context, ref FileRef) (*ImportRes, error) //perm:admin
 	// ClientRemoveImport removes file import
-	ClientRemoveImport(ctx context.Context, importID multistore.StoreID) error //perm:admin
+	ClientRemoveImport(ctx context.Context, importID imports.ID) error //perm:admin
 	// ClientStartDeal proposes a deal with a miner.
 	ClientStartDeal(ctx context.Context, params *StartDealParams) (*cid.Cid, error) //perm:admin
+	// ClientStatelessDeal fire-and-forget-proposes an offline deal to a miner without subsequent tracking.
+	ClientStatelessDeal(ctx context.Context, params *StartDealParams) (*cid.Cid, error) //perm:write
 	// ClientGetDealInfo returns the latest information about a given deal.
 	ClientGetDealInfo(context.Context, cid.Cid) (*DealInfo, error) //perm:read
 	// ClientListDeals returns information about the deals made by the local client.
@@ -338,12 +375,17 @@ type FullNode interface {
 	// ClientMinerQueryOffer returns a QueryOffer for the specific miner and file.
 	ClientMinerQueryOffer(ctx context.Context, miner address.Address, root cid.Cid, piece *cid.Cid) (QueryOffer, error) //perm:read
 	// ClientRetrieve initiates the retrieval of a file, as specified in the order.
-	ClientRetrieve(ctx context.Context, order RetrievalOrder, ref *FileRef) error //perm:admin
-	// ClientRetrieveWithEvents initiates the retrieval of a file, as specified in the order, and provides a channel
-	// of status updates.
-	ClientRetrieveWithEvents(ctx context.Context, order RetrievalOrder, ref *FileRef) (<-chan marketevents.RetrievalEvent, error) //perm:admin
+	ClientRetrieve(ctx context.Context, params RetrievalOrder) (*RestrievalRes, error) //perm:admin
+	// ClientRetrieveWait waits for retrieval to be complete
+	ClientRetrieveWait(ctx context.Context, deal retrievalmarket.DealID) error //perm:admin
+	// ClientExport exports a file stored in the local filestore to a system file
+	ClientExport(ctx context.Context, exportRef ExportRef, fileRef FileRef) error //perm:admin
+	// ClientListRetrievals returns information about retrievals made by the local client
+	ClientListRetrievals(ctx context.Context) ([]RetrievalInfo, error) //perm:write
+	// ClientGetRetrievalUpdates returns status of updated retrieval deals
+	ClientGetRetrievalUpdates(ctx context.Context) (<-chan RetrievalInfo, error) //perm:write
 	// ClientQueryAsk returns a signed StorageAsk from the specified miner.
-	ClientQueryAsk(ctx context.Context, p peer.ID, miner address.Address) (*storagemarket.StorageAsk, error) //perm:read
+	ClientQueryAsk(ctx context.Context, p peer.ID, miner address.Address) (*StorageAsk, error) //perm:read
 	// ClientCalcCommP calculates the CommP and data size of the specified CID
 	ClientDealPieceCID(ctx context.Context, root cid.Cid) (DataCIDSize, error) //perm:read
 	// ClientCalcCommP calculates the CommP for a specified file
@@ -367,12 +409,12 @@ type FullNode interface {
 	ClientCancelRetrievalDeal(ctx context.Context, dealid retrievalmarket.DealID) error //perm:write
 
 	// ClientUnimport removes references to the specified file from filestore
-	//ClientUnimport(path string)
+	// ClientUnimport(path string)
 
 	// ClientListImports lists imported files and their root CIDs
 	ClientListImports(ctx context.Context) ([]Import, error) //perm:write
 
-	//ClientListAsks() []Ask
+	// ClientListAsks() []Ask
 
 	// MethodGroup: State
 	// The State methods are used to query, inspect, and interact with chain state.
@@ -387,7 +429,7 @@ type FullNode interface {
 	StateCall(context.Context, *types.Message, types.TipSetKey) (*InvocResult, error) //perm:read
 	// StateReplay replays a given message, assuming it was included in a block in the specified tipset.
 	//
-	// If a tipset key is provided, and a replacing message is found on chain,
+	// If a tipset key is provided, and a replacing message is not found on chain,
 	// the method will return an error saying that the message wasn't found
 	//
 	// If no tipset key is provided, the appropriate tipset is looked up, and if
@@ -411,6 +453,8 @@ type FullNode interface {
 	StateListMessages(ctx context.Context, match *MessageMatch, tsk types.TipSetKey, toht abi.ChainEpoch) ([]cid.Cid, error) //perm:read
 	// StateDecodeParams attempts to decode the provided params, based on the recipient actor address and method number.
 	StateDecodeParams(ctx context.Context, toAddr address.Address, method abi.MethodNum, params []byte, tsk types.TipSetKey) (interface{}, error) //perm:read
+	// StateEncodeParams attempts to encode the provided json params to the binary from
+	StateEncodeParams(ctx context.Context, toActCode cid.Cid, method abi.MethodNum, params json.RawMessage) ([]byte, error) //perm:read
 
 	// StateNetworkName returns the name of the network the node is synced to
 	StateNetworkName(context.Context) (dtypes.NetworkName, error) //perm:read
@@ -424,7 +468,7 @@ type FullNode interface {
 	// StateMinerPower returns the power of the indicated miner
 	StateMinerPower(context.Context, address.Address, types.TipSetKey) (*MinerPower, error) //perm:read
 	// StateMinerInfo returns info about the indicated miner
-	StateMinerInfo(context.Context, address.Address, types.TipSetKey) (miner.MinerInfo, error) //perm:read
+	StateMinerInfo(context.Context, address.Address, types.TipSetKey) (MinerInfo, error) //perm:read
 	// StateMinerDeadlines returns all the proving deadlines for the given miner
 	StateMinerDeadlines(context.Context, address.Address, types.TipSetKey) ([]Deadline, error) //perm:read
 	// StateMinerPartitions returns all partitions in the specified deadline
@@ -441,18 +485,23 @@ type FullNode interface {
 	StateMinerInitialPledgeCollateral(context.Context, address.Address, miner.SectorPreCommitInfo, types.TipSetKey) (types.BigInt, error) //perm:read
 	// StateMinerAvailableBalance returns the portion of a miner's balance that can be withdrawn or spent
 	StateMinerAvailableBalance(context.Context, address.Address, types.TipSetKey) (types.BigInt, error) //perm:read
-	// StateMinerSectorAllocated checks if a sector is allocated
+	// StateMinerSectorAllocated checks if a sector number is marked as allocated.
 	StateMinerSectorAllocated(context.Context, address.Address, abi.SectorNumber, types.TipSetKey) (bool, error) //perm:read
-	// StateSectorPreCommitInfo returns the PreCommit info for the specified miner's sector
-	StateSectorPreCommitInfo(context.Context, address.Address, abi.SectorNumber, types.TipSetKey) (miner.SectorPreCommitOnChainInfo, error) //perm:read
+	// StateSectorPreCommitInfo returns the PreCommit info for the specified miner's sector.
+	// Returns nil and no error if the sector isn't precommitted.
+	//
+	// Note that the sector number may be allocated while PreCommitInfo is nil. This means that either allocated sector
+	// numbers were compacted, and the sector number was marked as allocated in order to reduce size of the allocated
+	// sectors bitfield, or that the sector was precommitted, but the precommit has expired.
+	StateSectorPreCommitInfo(context.Context, address.Address, abi.SectorNumber, types.TipSetKey) (*miner.SectorPreCommitOnChainInfo, error) //perm:read
 	// StateSectorGetInfo returns the on-chain info for the specified miner's sector. Returns null in case the sector info isn't found
 	// NOTE: returned info.Expiration may not be accurate in some cases, use StateSectorExpiration to get accurate
 	// expiration epoch
 	StateSectorGetInfo(context.Context, address.Address, abi.SectorNumber, types.TipSetKey) (*miner.SectorOnChainInfo, error) //perm:read
 	// StateSectorExpiration returns epoch at which given sector will expire
-	StateSectorExpiration(context.Context, address.Address, abi.SectorNumber, types.TipSetKey) (*miner.SectorExpiration, error) //perm:read
+	StateSectorExpiration(context.Context, address.Address, abi.SectorNumber, types.TipSetKey) (*lminer.SectorExpiration, error) //perm:read
 	// StateSectorPartition finds deadline/partition with the specified sector
-	StateSectorPartition(ctx context.Context, maddr address.Address, sectorNumber abi.SectorNumber, tok types.TipSetKey) (*miner.SectorLocation, error) //perm:read
+	StateSectorPartition(ctx context.Context, maddr address.Address, sectorNumber abi.SectorNumber, tok types.TipSetKey) (*lminer.SectorLocation, error) //perm:read
 	// StateSearchMsg looks back up to limit epochs in the chain for a message, and returns its receipt and the tipset where it was executed
 	//
 	// NOTE: If a replacing message is found on chain, this method will return
@@ -498,18 +547,35 @@ type FullNode interface {
 	// StateMarketParticipants returns the Escrow and Locked balances of every participant in the Storage Market
 	StateMarketParticipants(context.Context, types.TipSetKey) (map[string]MarketBalance, error) //perm:read
 	// StateMarketDeals returns information about every deal in the Storage Market
-	StateMarketDeals(context.Context, types.TipSetKey) (map[string]MarketDeal, error) //perm:read
+	StateMarketDeals(context.Context, types.TipSetKey) (map[string]*MarketDeal, error) //perm:read
 	// StateMarketStorageDeal returns information about the indicated deal
 	StateMarketStorageDeal(context.Context, abi.DealID, types.TipSetKey) (*MarketDeal, error) //perm:read
+	// StateGetAllocationForPendingDeal returns the allocation for a given deal ID of a pending deal. Returns nil if
+	// pending allocation is not found.
+	StateGetAllocationForPendingDeal(ctx context.Context, dealId abi.DealID, tsk types.TipSetKey) (*verifregtypes.Allocation, error) //perm:read
+	// StateGetAllocation returns the allocation for a given address and allocation ID.
+	StateGetAllocation(ctx context.Context, clientAddr address.Address, allocationId verifregtypes.AllocationId, tsk types.TipSetKey) (*verifregtypes.Allocation, error) //perm:read
+	// StateGetAllocations returns the all the allocations for a given client.
+	StateGetAllocations(ctx context.Context, clientAddr address.Address, tsk types.TipSetKey) (map[verifregtypes.AllocationId]verifregtypes.Allocation, error) //perm:read
+	// StateGetClaim returns the claim for a given address and claim ID.
+	StateGetClaim(ctx context.Context, providerAddr address.Address, claimId verifregtypes.ClaimId, tsk types.TipSetKey) (*verifregtypes.Claim, error) //perm:read
+	// StateGetClaims returns the all the claims for a given provider.
+	StateGetClaims(ctx context.Context, providerAddr address.Address, tsk types.TipSetKey) (map[verifregtypes.ClaimId]verifregtypes.Claim, error) //perm:read
+	// StateComputeDataCID computes DataCID from a set of on-chain deals
+	StateComputeDataCID(ctx context.Context, maddr address.Address, sectorType abi.RegisteredSealProof, deals []abi.DealID, tsk types.TipSetKey) (cid.Cid, error) //perm:read
 	// StateLookupID retrieves the ID address of the given address
 	StateLookupID(context.Context, address.Address, types.TipSetKey) (address.Address, error) //perm:read
-	// StateAccountKey returns the public key address of the given ID address
+	// StateAccountKey returns the public key address of the given ID address for secp and bls accounts
 	StateAccountKey(context.Context, address.Address, types.TipSetKey) (address.Address, error) //perm:read
+	// StateLookupRobustAddress returns the public key address of the given ID address for non-account addresses (multisig, miners etc)
+	StateLookupRobustAddress(context.Context, address.Address, types.TipSetKey) (address.Address, error) //perm:read
 	// StateChangedActors returns all the actors whose states change between the two given state CIDs
 	// TODO: Should this take tipset keys instead?
 	StateChangedActors(context.Context, cid.Cid, cid.Cid) (map[string]types.Actor, error) //perm:read
 	// StateMinerSectorCount returns the number of sectors in a miner's sector set and proving set
 	StateMinerSectorCount(context.Context, address.Address, types.TipSetKey) (MinerSectors, error) //perm:read
+	// StateMinerAllocated returns a bitfield containing all sector numbers marked as allocated in miner state
+	StateMinerAllocated(context.Context, address.Address, types.TipSetKey) (*bitfield.BitField, error) //perm:read
 	// StateCompute is a flexible command that applies the given messages on the given tipset.
 	// The messages are run as though the VM were at the provided height.
 	//
@@ -551,7 +617,7 @@ type FullNode interface {
 	// Returns nil if there is no entry in the data cap table for the
 	// address.
 	StateVerifiedClientStatus(ctx context.Context, addr address.Address, tsk types.TipSetKey) (*abi.StoragePower, error) //perm:read
-	// StateVerifiedClientStatus returns the address of the Verified Registry's root key
+	// StateVerifiedRegistryRootKey returns the address of the Verified Registry's root key
 	StateVerifiedRegistryRootKey(ctx context.Context, tsk types.TipSetKey) (address.Address, error) //perm:read
 	// StateDealProviderCollateralBounds returns the min and max collateral a storage provider
 	// can issue. It takes the deal size and verified status as parameters.
@@ -565,6 +631,23 @@ type FullNode interface {
 	StateVMCirculatingSupplyInternal(context.Context, types.TipSetKey) (CirculatingSupply, error) //perm:read
 	// StateNetworkVersion returns the network version at the given tipset
 	StateNetworkVersion(context.Context, types.TipSetKey) (apitypes.NetworkVersion, error) //perm:read
+	// StateActorCodeCIDs returns the CIDs of all the builtin actors for the given network version
+	StateActorCodeCIDs(context.Context, abinetwork.Version) (map[string]cid.Cid, error) //perm:read
+	// StateActorManifestCID returns the CID of the builtin actors manifest for the given network version
+	StateActorManifestCID(context.Context, abinetwork.Version) (cid.Cid, error) //perm:read
+
+	// StateGetRandomnessFromTickets is used to sample the chain for randomness.
+	StateGetRandomnessFromTickets(ctx context.Context, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte, tsk types.TipSetKey) (abi.Randomness, error) //perm:read
+	// StateGetRandomnessFromBeacon is used to sample the beacon for randomness.
+	StateGetRandomnessFromBeacon(ctx context.Context, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte, tsk types.TipSetKey) (abi.Randomness, error) //perm:read
+
+	// StateGetBeaconEntry returns the beacon entry for the given filecoin epoch. If
+	// the entry has not yet been produced, the call will block until the entry
+	// becomes available
+	StateGetBeaconEntry(ctx context.Context, epoch abi.ChainEpoch) (*types.BeaconEntry, error) //perm:read
+
+	// StateGetNetworkParams return current network params
+	StateGetNetworkParams(ctx context.Context) (*NetworkParams, error) //perm:read
 
 	// MethodGroup: Msig
 	// The Msig methods are used to interact with multisig wallets on the
@@ -578,14 +661,14 @@ type FullNode interface {
 	// It takes the following params: <multisig address>, <start epoch>, <end epoch>
 	MsigGetVested(context.Context, address.Address, types.TipSetKey, types.TipSetKey) (types.BigInt, error) //perm:read
 
-	//MsigGetPending returns pending transactions for the given multisig
-	//wallet. Once pending transactions are fully approved, they will no longer
-	//appear here.
+	// MsigGetPending returns pending transactions for the given multisig
+	// wallet. Once pending transactions are fully approved, they will no longer
+	// appear here.
 	MsigGetPending(context.Context, address.Address, types.TipSetKey) ([]*MsigTransaction, error) //perm:read
 
 	// MsigCreate creates a multisig wallet
 	// It takes the following params: <required number of senders>, <approving addresses>, <unlock duration>
-	//<initial balance>, <sender address of the create msg>, <gas price>
+	// <initial balance>, <sender address of the create msg>, <gas price>
 	MsigCreate(context.Context, uint64, []address.Address, abi.ChainEpoch, types.BigInt, address.Address, types.BigInt) (*MessagePrototype, error) //perm:sign
 
 	// MsigPropose proposes a multisig message
@@ -606,9 +689,13 @@ type FullNode interface {
 	MsigApproveTxnHash(context.Context, address.Address, uint64, address.Address, address.Address, types.BigInt, address.Address, uint64, []byte) (*MessagePrototype, error) //perm:sign
 
 	// MsigCancel cancels a previously-proposed multisig message
+	// It takes the following params: <multisig address>, <proposed transaction ID> <signer address>
+	MsigCancel(context.Context, address.Address, uint64, address.Address) (*MessagePrototype, error) //perm:sign
+
+	// MsigCancel cancels a previously-proposed multisig message
 	// It takes the following params: <multisig address>, <proposed transaction ID>, <recipient address>, <value to transfer>,
 	// <sender address of the cancel msg>, <method to call in the proposed message>, <params to include in the proposed message>
-	MsigCancel(context.Context, address.Address, uint64, address.Address, types.BigInt, address.Address, uint64, []byte) (*MessagePrototype, error) //perm:sign
+	MsigCancelTxnHash(context.Context, address.Address, uint64, address.Address, types.BigInt, address.Address, uint64, []byte) (*MessagePrototype, error) //perm:sign
 
 	// MsigAddPropose proposes adding a signer in the multisig
 	// It takes the following params: <multisig address>, <sender address of the propose msg>,
@@ -661,7 +748,17 @@ type FullNode interface {
 	// MethodGroup: Paych
 	// The Paych methods are for interacting with and managing payment channels
 
-	PaychGet(ctx context.Context, from, to address.Address, amt types.BigInt) (*ChannelInfo, error)                     //perm:sign
+	// PaychGet gets or creates a payment channel between address pair
+	//  The specified amount will be reserved for use. If there aren't enough non-reserved funds
+	//    available, funds will be added through an on-chain message.
+	//  - When opts.OffChain is true, this call will not cause any messages to be sent to the chain (no automatic
+	//    channel creation/funds adding). If the operation can't be performed without sending a message an error will be
+	//    returned. Note that even when this option is specified, this call can be blocked by previous operations on the
+	//    channel waiting for on-chain operations.
+	PaychGet(ctx context.Context, from, to address.Address, amt types.BigInt, opts PaychGetOpts) (*ChannelInfo, error) //perm:sign
+	// PaychFund gets or creates a payment channel between address pair.
+	// The specified amount will be added to the channel through on-chain send for future use
+	PaychFund(ctx context.Context, from, to address.Address, amt types.BigInt) (*ChannelInfo, error)                    //perm:sign
 	PaychGetWaitReady(context.Context, cid.Cid) (address.Address, error)                                                //perm:sign
 	PaychAvailableFunds(ctx context.Context, ch address.Address) (*ChannelAvailableFunds, error)                        //perm:sign
 	PaychAvailableFundsByFromTo(ctx context.Context, from, to address.Address) (*ChannelAvailableFunds, error)          //perm:sign
@@ -683,11 +780,109 @@ type FullNode interface {
 
 	NodeStatus(ctx context.Context, inclChainStatus bool) (NodeStatus, error) //perm:read
 
+	// MethodGroup: Eth
+	// These methods are used for Ethereum-compatible JSON-RPC calls
+	//
+	// EthAccounts will always return [] since we don't expect Lotus to manage private keys
+	EthAccounts(ctx context.Context) ([]ethtypes.EthAddress, error) //perm:read
+	// EthAddressToFilecoinAddress converts an EthAddress into an f410 Filecoin Address
+	EthAddressToFilecoinAddress(ctx context.Context, ethAddress ethtypes.EthAddress) (address.Address, error) //perm:read
+	// FilecoinAddressToEthAddress converts an f410 or f0 Filecoin Address to an EthAddress
+	FilecoinAddressToEthAddress(ctx context.Context, filecoinAddress address.Address) (ethtypes.EthAddress, error) //perm:read
+	// EthBlockNumber returns the height of the latest (heaviest) TipSet
+	EthBlockNumber(ctx context.Context) (ethtypes.EthUint64, error) //perm:read
+	// EthGetBlockTransactionCountByNumber returns the number of messages in the TipSet
+	EthGetBlockTransactionCountByNumber(ctx context.Context, blkNum ethtypes.EthUint64) (ethtypes.EthUint64, error) //perm:read
+	// EthGetBlockTransactionCountByHash returns the number of messages in the TipSet
+	EthGetBlockTransactionCountByHash(ctx context.Context, blkHash ethtypes.EthHash) (ethtypes.EthUint64, error) //perm:read
+
+	EthGetBlockByHash(ctx context.Context, blkHash ethtypes.EthHash, fullTxInfo bool) (ethtypes.EthBlock, error)                               //perm:read
+	EthGetBlockByNumber(ctx context.Context, blkNum string, fullTxInfo bool) (ethtypes.EthBlock, error)                                        //perm:read
+	EthGetTransactionByHash(ctx context.Context, txHash *ethtypes.EthHash) (*ethtypes.EthTx, error)                                            //perm:read
+	EthGetTransactionByHashLimited(ctx context.Context, txHash *ethtypes.EthHash, limit abi.ChainEpoch) (*ethtypes.EthTx, error)               //perm:read
+	EthGetTransactionHashByCid(ctx context.Context, cid cid.Cid) (*ethtypes.EthHash, error)                                                    //perm:read
+	EthGetMessageCidByTransactionHash(ctx context.Context, txHash *ethtypes.EthHash) (*cid.Cid, error)                                         //perm:read
+	EthGetTransactionCount(ctx context.Context, sender ethtypes.EthAddress, blkOpt string) (ethtypes.EthUint64, error)                         //perm:read
+	EthGetTransactionReceipt(ctx context.Context, txHash ethtypes.EthHash) (*EthTxReceipt, error)                                              //perm:read
+	EthGetTransactionReceiptLimited(ctx context.Context, txHash ethtypes.EthHash, limit abi.ChainEpoch) (*EthTxReceipt, error)                 //perm:read
+	EthGetTransactionByBlockHashAndIndex(ctx context.Context, blkHash ethtypes.EthHash, txIndex ethtypes.EthUint64) (ethtypes.EthTx, error)    //perm:read
+	EthGetTransactionByBlockNumberAndIndex(ctx context.Context, blkNum ethtypes.EthUint64, txIndex ethtypes.EthUint64) (ethtypes.EthTx, error) //perm:read
+
+	EthGetCode(ctx context.Context, address ethtypes.EthAddress, blkOpt string) (ethtypes.EthBytes, error)                                    //perm:read
+	EthGetStorageAt(ctx context.Context, address ethtypes.EthAddress, position ethtypes.EthBytes, blkParam string) (ethtypes.EthBytes, error) //perm:read
+	EthGetBalance(ctx context.Context, address ethtypes.EthAddress, blkParam string) (ethtypes.EthBigInt, error)                              //perm:read
+	EthChainId(ctx context.Context) (ethtypes.EthUint64, error)                                                                               //perm:read
+	EthSyncing(ctx context.Context) (ethtypes.EthSyncingResult, error)                                                                        //perm:read
+	NetVersion(ctx context.Context) (string, error)                                                                                           //perm:read
+	NetListening(ctx context.Context) (bool, error)                                                                                           //perm:read
+	EthProtocolVersion(ctx context.Context) (ethtypes.EthUint64, error)                                                                       //perm:read
+	EthGasPrice(ctx context.Context) (ethtypes.EthBigInt, error)                                                                              //perm:read
+	EthFeeHistory(ctx context.Context, p jsonrpc.RawParams) (ethtypes.EthFeeHistory, error)                                                   //perm:read
+
+	EthMaxPriorityFeePerGas(ctx context.Context) (ethtypes.EthBigInt, error)                      //perm:read
+	EthEstimateGas(ctx context.Context, tx ethtypes.EthCall) (ethtypes.EthUint64, error)          //perm:read
+	EthCall(ctx context.Context, tx ethtypes.EthCall, blkParam string) (ethtypes.EthBytes, error) //perm:read
+
+	EthSendRawTransaction(ctx context.Context, rawTx ethtypes.EthBytes) (ethtypes.EthHash, error) //perm:read
+
+	// Returns event logs matching given filter spec.
+	EthGetLogs(ctx context.Context, filter *ethtypes.EthFilterSpec) (*ethtypes.EthFilterResult, error) //perm:read
+
+	// Polling method for a filter, returns event logs which occurred since last poll.
+	// (requires write perm since timestamp of last filter execution will be written)
+	EthGetFilterChanges(ctx context.Context, id ethtypes.EthFilterID) (*ethtypes.EthFilterResult, error) //perm:read
+
+	// Returns event logs matching filter with given id.
+	// (requires write perm since timestamp of last filter execution will be written)
+	EthGetFilterLogs(ctx context.Context, id ethtypes.EthFilterID) (*ethtypes.EthFilterResult, error) //perm:read
+
+	// Installs a persistent filter based on given filter spec.
+	EthNewFilter(ctx context.Context, filter *ethtypes.EthFilterSpec) (ethtypes.EthFilterID, error) //perm:read
+
+	// Installs a persistent filter to notify when a new block arrives.
+	EthNewBlockFilter(ctx context.Context) (ethtypes.EthFilterID, error) //perm:read
+
+	// Installs a persistent filter to notify when new messages arrive in the message pool.
+	EthNewPendingTransactionFilter(ctx context.Context) (ethtypes.EthFilterID, error) //perm:read
+
+	// Uninstalls a filter with given id.
+	EthUninstallFilter(ctx context.Context, id ethtypes.EthFilterID) (bool, error) //perm:read
+
+	// Subscribe to different event types using websockets
+	// eventTypes is one or more of:
+	//  - newHeads: notify when new blocks arrive.
+	//  - pendingTransactions: notify when new messages arrive in the message pool.
+	//  - logs: notify new event logs that match a criteria
+	// params contains additional parameters used with the log event type
+	// The client will receive a stream of EthSubscriptionResponse values until EthUnsubscribe is called.
+	EthSubscribe(ctx context.Context, params jsonrpc.RawParams) (ethtypes.EthSubscriptionID, error) //perm:read
+
+	// Unsubscribe from a websocket subscription
+	EthUnsubscribe(ctx context.Context, id ethtypes.EthSubscriptionID) (bool, error) //perm:read
+
+	// Returns the client version
+	Web3ClientVersion(ctx context.Context) (string, error) //perm:read
+
 	// CreateBackup creates node backup onder the specified file name. The
 	// method requires that the lotus daemon is running with the
 	// LOTUS_BACKUP_BASE_PATH environment variable set to some path, and that
 	// the path specified when calling CreateBackup is within the base path
 	CreateBackup(ctx context.Context, fpath string) error //perm:admin
+
+	RaftState(ctx context.Context) (*RaftStateData, error) //perm:read
+	RaftLeader(ctx context.Context) (peer.ID, error)       //perm:read
+}
+
+// reverse interface to the client, called after EthSubscribe
+type EthSubscriber interface {
+	// note: the parameter is ethtypes.EthSubscriptionResponse serialized as json object
+	EthSubscription(ctx context.Context, r jsonrpc.RawParams) error // rpc_method:eth_subscription notify:true
+}
+
+type StorageAsk struct {
+	Response *storagemarket.StorageAsk
+
+	DealProtocols []string
 }
 
 type FileRef struct {
@@ -706,16 +901,28 @@ type MinerSectors struct {
 
 type ImportRes struct {
 	Root     cid.Cid
-	ImportID multistore.StoreID
+	ImportID imports.ID
 }
 
 type Import struct {
-	Key multistore.StoreID
+	Key imports.ID
 	Err string
 
-	Root     *cid.Cid
-	Source   string
+	Root *cid.Cid
+
+	// Source is the provenance of the import, e.g. "import", "unknown", else.
+	// Currently useless but may be used in the future.
+	Source string
+
+	// FilePath is the path of the original file. It is important that the file
+	// is retained at this path, because it will be referenced during
+	// the transfer (when we do the UnixFS chunking, we don't duplicate the
+	// leaves, but rather point to chunks of the original data through
+	// positional references).
 	FilePath string
+
+	// CARPath is the path of the CAR file containing the DAG for this import.
+	CARPath string
 }
 
 type DealInfo struct {
@@ -788,6 +995,10 @@ const (
 	PCHOutbound
 )
 
+type PaychGetOpts struct {
+	OffChain bool
+}
+
 type PaychStatus struct {
 	ControlAddr address.Address
 	Direction   PCHDir
@@ -805,16 +1016,23 @@ type ChannelAvailableFunds struct {
 	From address.Address
 	// To is the to address of the channel
 	To address.Address
-	// ConfirmedAmt is the amount of funds that have been confirmed on-chain
-	// for the channel
+
+	// ConfirmedAmt is the total amount of funds that have been confirmed on-chain for the channel
 	ConfirmedAmt types.BigInt
 	// PendingAmt is the amount of funds that are pending confirmation on-chain
 	PendingAmt types.BigInt
+
+	// NonReservedAmt is part of ConfirmedAmt that is available for use (e.g. when the payment channel was pre-funded)
+	NonReservedAmt types.BigInt
+	// PendingAvailableAmt is the amount of funds that are pending confirmation on-chain that will become available once confirmed
+	PendingAvailableAmt types.BigInt
+
 	// PendingWaitSentinel can be used with PaychGetWaitReady to wait for
 	// confirmation of pending funds
 	PendingWaitSentinel *cid.Cid
 	// QueuedAmt is the amount that is queued up behind a pending request
 	QueuedAmt types.BigInt
+
 	// VoucherRedeemedAmt is the amount that is redeemed by vouchers on-chain
 	// and in the local datastore
 	VoucherReedeemedAmt types.BigInt
@@ -860,6 +1078,7 @@ type QueryOffer struct {
 	Size                    uint64
 	MinPrice                types.BigInt
 	UnsealPrice             types.BigInt
+	PricePerByte            abi.TokenAmount
 	PaymentInterval         uint64
 	PaymentIntervalIncrease uint64
 	Miner                   address.Address
@@ -893,21 +1112,25 @@ type MarketDeal struct {
 }
 
 type RetrievalOrder struct {
-	// TODO: make this less unixfs specific
-	Root  cid.Cid
-	Piece *cid.Cid
-	Size  uint64
+	Root         cid.Cid
+	Piece        *cid.Cid
+	DataSelector *Selector
 
-	LocalStore *multistore.StoreID // if specified, get data from local store
-	// TODO: support offset
-	Total                   types.BigInt
+	// todo: Size/Total are only used for calculating price per byte; we should let users just pass that
+	Size  uint64
+	Total types.BigInt
+
 	UnsealPrice             types.BigInt
 	PaymentInterval         uint64
 	PaymentIntervalIncrease uint64
 	Client                  address.Address
 	Miner                   address.Address
 	MinerPeer               *retrievalmarket.RetrievalPeer
+
+	RemoteStore *RemoteStoreID `json:"RemoteStore,omitempty"`
 }
+
+type RemoteStoreID = uuid.UUID
 
 type InvocResult struct {
 	MsgCid         cid.Cid
@@ -1043,7 +1266,7 @@ type CirculatingSupply struct {
 type MiningBaseInfo struct {
 	MinerPower        types.BigInt
 	NetworkPower      types.BigInt
-	Sectors           []builtin.SectorInfo
+	Sectors           []builtin.ExtendedSectorInfo
 	WorkerKey         address.Address
 	SectorSize        abi.SectorSize
 	PrevBeaconEntry   types.BeaconEntry
@@ -1133,4 +1356,33 @@ type MsigTransaction struct {
 	Params []byte
 
 	Approved []address.Address
+}
+
+type PruneOpts struct {
+	MovingGC    bool
+	RetainState int64
+}
+
+type HotGCOpts struct {
+	Threshold float64
+	Periodic  bool
+	Moving    bool
+}
+
+type EthTxReceipt struct {
+	TransactionHash   ethtypes.EthHash     `json:"transactionHash"`
+	TransactionIndex  ethtypes.EthUint64   `json:"transactionIndex"`
+	BlockHash         ethtypes.EthHash     `json:"blockHash"`
+	BlockNumber       ethtypes.EthUint64   `json:"blockNumber"`
+	From              ethtypes.EthAddress  `json:"from"`
+	To                *ethtypes.EthAddress `json:"to"`
+	StateRoot         ethtypes.EthHash     `json:"root"`
+	Status            ethtypes.EthUint64   `json:"status"`
+	ContractAddress   *ethtypes.EthAddress `json:"contractAddress"`
+	CumulativeGasUsed ethtypes.EthUint64   `json:"cumulativeGasUsed"`
+	GasUsed           ethtypes.EthUint64   `json:"gasUsed"`
+	EffectiveGasPrice ethtypes.EthBigInt   `json:"effectiveGasPrice"`
+	LogsBloom         ethtypes.EthBytes    `json:"logsBloom"`
+	Logs              []ethtypes.EthLog    `json:"logs"`
+	Type              ethtypes.EthUint64   `json:"type"`
 }

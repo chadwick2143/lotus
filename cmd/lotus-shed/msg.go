@@ -8,27 +8,27 @@ import (
 	"fmt"
 
 	"github.com/fatih/color"
-
 	"github.com/ipfs/go-cid"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/specs-actors/v2/actors/builtin/multisig"
 
-	"github.com/filecoin-project/lotus/chain/stmgr"
+	"github.com/filecoin-project/lotus/chain/consensus"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
-	"github.com/filecoin-project/specs-actors/v2/actors/builtin/multisig"
 )
 
 var msgCmd = &cli.Command{
-	Name:      "msg",
+	Name:      "message",
+	Aliases:   []string{"msg"},
 	Usage:     "Translate message between various formats",
 	ArgsUsage: "Message in any form",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 1 {
-			return xerrors.Errorf("expected 1 argument")
+		if cctx.NArg() != 1 {
+			return lcli.IncorrectNumArgs(cctx)
 		}
 
 		msg, err := messageFromString(cctx, cctx.Args().First())
@@ -141,13 +141,22 @@ func printMessage(cctx *cli.Context, msg *types.Message) error {
 		return nil
 	}
 
-	fmt.Println("Method:", stmgr.MethodsMap[toact.Code][msg.Method].Name)
+	fmt.Println("Method:", consensus.NewActorRegistry().Methods[toact.Code][msg.Method].Name) // todo use remote
 	p, err := lcli.JsonParams(toact.Code, msg.Method, msg.Params)
 	if err != nil {
 		return err
 	}
 
 	fmt.Println("Params:", p)
+
+	if msg, err := messageFromBytes(cctx, msg.Params); err == nil {
+		fmt.Println("---")
+		color.Red("Params message:")
+
+		if err := printMessage(cctx, msg.VMMessage()); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }

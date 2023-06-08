@@ -8,6 +8,7 @@ import (
 
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	ipld "github.com/ipfs/go-ipld-format"
 	"github.com/raulk/clock"
 	"go.uber.org/multierr"
 )
@@ -47,8 +48,12 @@ func (t *TimedCacheBlockstore) Start(_ context.Context) error {
 		return fmt.Errorf("already started")
 	}
 	t.closeCh = make(chan struct{})
+
+	// Create this timer before starting the goroutine. Otherwise, creating the timer will race
+	// with adding time to the mock clock, and we could add time _first_, then stall waiting for
+	// a timer that'll never fire.
+	ticker := t.clock.Ticker(t.interval)
 	go func() {
-		ticker := t.clock.Ticker(t.interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -88,28 +93,38 @@ func (t *TimedCacheBlockstore) rotate() {
 	t.mu.Unlock()
 }
 
-func (t *TimedCacheBlockstore) Put(b blocks.Block) error {
+func (t *TimedCacheBlockstore) Flush(ctx context.Context) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if err := t.active.Flush(ctx); err != nil {
+		return err
+	}
+	return t.inactive.Flush(ctx)
+}
+
+func (t *TimedCacheBlockstore) Put(ctx context.Context, b blocks.Block) error {
 	// Don't check the inactive set here. We want to keep this block for at
 	// least one interval.
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.active.Put(b)
+	return t.active.Put(ctx, b)
 }
 
-func (t *TimedCacheBlockstore) PutMany(bs []blocks.Block) error {
+func (t *TimedCacheBlockstore) PutMany(ctx context.Context, bs []blocks.Block) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.active.PutMany(bs)
+	return t.active.PutMany(ctx, bs)
 }
 
-func (t *TimedCacheBlockstore) View(k cid.Cid, callback func([]byte) error) error {
+func (t *TimedCacheBlockstore) View(ctx context.Context, k cid.Cid, callback func([]byte) error) error {
 	// The underlying blockstore is always a "mem" blockstore so there's no difference,
 	// from a performance perspective, between view & get. So we call Get to avoid
 	// calling an arbitrary callback while holding a lock.
 	t.mu.RLock()
-	block, err := t.active.Get(k)
-	if err == ErrNotFound {
-		block, err = t.inactive.Get(k)
+	block, err := t.active.Get(ctx, k)
+	if ipld.IsNotFound(err) {
+		block, err = t.inactive.Get(ctx, k)
 	}
 	t.mu.RUnlock()
 
@@ -119,51 +134,51 @@ func (t *TimedCacheBlockstore) View(k cid.Cid, callback func([]byte) error) erro
 	return callback(block.RawData())
 }
 
-func (t *TimedCacheBlockstore) Get(k cid.Cid) (blocks.Block, error) {
+func (t *TimedCacheBlockstore) Get(ctx context.Context, k cid.Cid) (blocks.Block, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	b, err := t.active.Get(k)
-	if err == ErrNotFound {
-		b, err = t.inactive.Get(k)
+	b, err := t.active.Get(ctx, k)
+	if ipld.IsNotFound(err) {
+		b, err = t.inactive.Get(ctx, k)
 	}
 	return b, err
 }
 
-func (t *TimedCacheBlockstore) GetSize(k cid.Cid) (int, error) {
+func (t *TimedCacheBlockstore) GetSize(ctx context.Context, k cid.Cid) (int, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	size, err := t.active.GetSize(k)
-	if err == ErrNotFound {
-		size, err = t.inactive.GetSize(k)
+	size, err := t.active.GetSize(ctx, k)
+	if ipld.IsNotFound(err) {
+		size, err = t.inactive.GetSize(ctx, k)
 	}
 	return size, err
 }
 
-func (t *TimedCacheBlockstore) Has(k cid.Cid) (bool, error) {
+func (t *TimedCacheBlockstore) Has(ctx context.Context, k cid.Cid) (bool, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if has, err := t.active.Has(k); err != nil {
+	if has, err := t.active.Has(ctx, k); err != nil {
 		return false, err
 	} else if has {
 		return true, nil
 	}
-	return t.inactive.Has(k)
+	return t.inactive.Has(ctx, k)
 }
 
 func (t *TimedCacheBlockstore) HashOnRead(_ bool) {
 	// no-op
 }
 
-func (t *TimedCacheBlockstore) DeleteBlock(k cid.Cid) error {
+func (t *TimedCacheBlockstore) DeleteBlock(ctx context.Context, k cid.Cid) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return multierr.Combine(t.active.DeleteBlock(k), t.inactive.DeleteBlock(k))
+	return multierr.Combine(t.active.DeleteBlock(ctx, k), t.inactive.DeleteBlock(ctx, k))
 }
 
-func (t *TimedCacheBlockstore) DeleteMany(ks []cid.Cid) error {
+func (t *TimedCacheBlockstore) DeleteMany(ctx context.Context, ks []cid.Cid) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return multierr.Combine(t.active.DeleteMany(ks), t.inactive.DeleteMany(ks))
+	return multierr.Combine(t.active.DeleteMany(ctx, ks), t.inactive.DeleteMany(ctx, ks))
 }
 
 func (t *TimedCacheBlockstore) AllKeysChan(_ context.Context) (<-chan cid.Cid, error) {
@@ -171,11 +186,12 @@ func (t *TimedCacheBlockstore) AllKeysChan(_ context.Context) (<-chan cid.Cid, e
 	defer t.mu.RUnlock()
 
 	ch := make(chan cid.Cid, len(t.active)+len(t.inactive))
-	for c := range t.active {
-		ch <- c
+	for _, b := range t.active {
+		ch <- b.Cid()
 	}
-	for c := range t.inactive {
-		if _, ok := t.active[c]; ok {
+	for _, b := range t.inactive {
+		c := b.Cid()
+		if _, ok := t.active[string(c.Hash())]; ok {
 			continue
 		}
 		ch <- c

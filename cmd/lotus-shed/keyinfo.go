@@ -7,29 +7,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
 	"text/template"
 
-	"github.com/urfave/cli/v2"
-
-	"golang.org/x/xerrors"
-
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-base32"
-
-	"github.com/libp2p/go-libp2p-core/crypto"
-	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/urfave/cli/v2"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/wallet"
+	"github.com/filecoin-project/lotus/chain/wallet/key"
+	_ "github.com/filecoin-project/lotus/lib/sigs/bls"
+	_ "github.com/filecoin-project/lotus/lib/sigs/delegated"
+	_ "github.com/filecoin-project/lotus/lib/sigs/secp"
 	"github.com/filecoin-project/lotus/node/modules"
 	"github.com/filecoin-project/lotus/node/modules/lp2p"
 	"github.com/filecoin-project/lotus/node/repo"
-
-	_ "github.com/filecoin-project/lotus/lib/sigs/bls"
-	_ "github.com/filecoin-project/lotus/lib/sigs/secp"
 )
 
 var validTypes = []types.KeyType{types.KTBLS, types.KTSecp256k1, lp2p.KTLibp2pHost}
@@ -41,8 +38,9 @@ type keyInfoOutput struct {
 }
 
 var keyinfoCmd = &cli.Command{
-	Name:  "keyinfo",
-	Usage: "work with lotus keyinfo files (wallets and libp2p host keys)",
+	Name:    "key-info",
+	Aliases: []string{"keyinfo"},
+	Usage:   "work with lotus keyinfo files (wallets and libp2p host keys)",
 	Description: `The subcommands of keyinfo provide helpful tools for working with keyinfo files without
    having to run the lotus daemon.`,
 	Subcommands: []*cli.Command{
@@ -69,7 +67,7 @@ var keyinfoVerifyCmd = &cli.Command{
 		defer inputFile.Close() //nolint:errcheck
 		input := bufio.NewReader(inputFile)
 
-		keyContent, err := ioutil.ReadAll(input)
+		keyContent, err := io.ReadAll(input)
 		if err != nil {
 			return err
 		}
@@ -151,7 +149,7 @@ var keyinfoImportCmd = &cli.Command{
 		flagRepo := cctx.String("repo")
 
 		var input io.Reader
-		if cctx.Args().Len() == 0 {
+		if cctx.NArg() == 0 {
 			input = os.Stdin
 		} else {
 			var err error
@@ -163,7 +161,7 @@ var keyinfoImportCmd = &cli.Command{
 			input = bufio.NewReader(inputFile)
 		}
 
-		encoded, err := ioutil.ReadAll(input)
+		encoded, err := io.ReadAll(input)
 		if err != nil {
 			return err
 		}
@@ -263,7 +261,7 @@ var keyinfoInfoCmd = &cli.Command{
 		format := cctx.String("format")
 
 		var input io.Reader
-		if cctx.Args().Len() == 0 {
+		if cctx.NArg() == 0 {
 			input = os.Stdin
 		} else {
 			var err error
@@ -275,7 +273,7 @@ var keyinfoInfoCmd = &cli.Command{
 			input = bufio.NewReader(inputFile)
 		}
 
-		encoded, err := ioutil.ReadAll(input)
+		encoded, err := io.ReadAll(input)
 		if err != nil {
 			return err
 		}
@@ -320,7 +318,7 @@ var keyinfoInfoCmd = &cli.Command{
 		case types.KTSecp256k1, types.KTBLS:
 			kio.Type = keyInfo.Type
 
-			key, err := wallet.NewKey(keyInfo)
+			key, err := key.NewKey(keyInfo)
 			if err != nil {
 				return err
 			}
@@ -405,7 +403,7 @@ var keyinfoNewCmd = &cli.Command{
 
 			break
 		case types.KTSecp256k1, types.KTBLS:
-			key, err := wallet.GenerateKey(keyType)
+			key, err := key.GenerateKey(keyType)
 			if err != nil {
 				return err
 			}

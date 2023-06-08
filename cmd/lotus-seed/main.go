@@ -4,10 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
-
-	"github.com/filecoin-project/go-state-types/network"
 
 	"github.com/docker/go-units"
 	logging "github.com/ipfs/go-log/v2"
@@ -17,6 +14,7 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/network"
 
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
@@ -94,6 +92,11 @@ var preSealCmd = &cli.Command{
 			Name:  "fake-sectors",
 			Value: false,
 		},
+		&cli.UintFlag{
+			Name:  "network-version",
+			Usage: "specify network version",
+			Value: uint(build.GenesisNetworkVersion),
+		},
 	},
 	Action: func(c *cli.Context) error {
 		sdir := c.String("sector-dir")
@@ -110,7 +113,7 @@ var preSealCmd = &cli.Command{
 		var k *types.KeyInfo
 		if c.String("key") != "" {
 			k = new(types.KeyInfo)
-			kh, err := ioutil.ReadFile(c.String("key"))
+			kh, err := os.ReadFile(c.String("key"))
 			if err != nil {
 				return err
 			}
@@ -129,7 +132,12 @@ var preSealCmd = &cli.Command{
 		}
 		sectorSize := abi.SectorSize(sectorSizeInt)
 
-		spt, err := miner.SealProofTypeFromSectorSize(sectorSize, network.Version0)
+		nv := build.GenesisNetworkVersion
+		if c.IsSet("network-version") {
+			nv = network.Version(c.Uint64("network-version"))
+		}
+
+		spt, err := miner.SealProofTypeFromSectorSize(sectorSize, nv)
 		if err != nil {
 			return err
 		}

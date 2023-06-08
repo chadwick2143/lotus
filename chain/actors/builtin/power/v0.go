@@ -2,17 +2,21 @@ package power
 
 import (
 	"bytes"
+	"fmt"
 
-	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/ipfs/go-cid"
 	cbg "github.com/whyrusleeping/cbor-gen"
 
-	"github.com/filecoin-project/lotus/chain/actors/adt"
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
-
+	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/manifest"
 	power0 "github.com/filecoin-project/specs-actors/actors/builtin/power"
 	adt0 "github.com/filecoin-project/specs-actors/actors/util/adt"
+
+	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 )
 
 var _ State = (*state0)(nil)
@@ -23,6 +27,24 @@ func load0(store adt.Store, root cid.Cid) (State, error) {
 	if err != nil {
 		return nil, err
 	}
+	return &out, nil
+}
+
+func make0(store adt.Store) (State, error) {
+	out := state0{store: store}
+
+	em, err := adt0.MakeEmptyMap(store).Root()
+	if err != nil {
+		return nil, err
+	}
+
+	emm, err := adt0.MakeEmptyMultimap(store).Root()
+	if err != nil {
+		return nil, err
+	}
+
+	out.State = *power0.ConstructState(em, emm)
+
 	return &out, nil
 }
 
@@ -71,7 +93,7 @@ func (s *state0) MinerNominalPowerMeetsConsensusMinimum(a address.Address) (bool
 }
 
 func (s *state0) TotalPowerSmoothed() (builtin.FilterEstimate, error) {
-	return builtin.FromV0FilterEstimate(*s.State.ThisEpochQAPowerSmoothed), nil
+	return builtin.FilterEstimate(*s.State.ThisEpochQAPowerSmoothed), nil
 }
 
 func (s *state0) MinerCounts() (uint64, uint64, error) {
@@ -128,6 +150,30 @@ func (s *state0) ClaimsChanged(other State) (bool, error) {
 	return !s.State.Claims.Equals(other0.State.Claims), nil
 }
 
+func (s *state0) SetTotalQualityAdjPower(p abi.StoragePower) error {
+	s.State.TotalQualityAdjPower = p
+	return nil
+}
+
+func (s *state0) SetTotalRawBytePower(p abi.StoragePower) error {
+	s.State.TotalRawBytePower = p
+	return nil
+}
+
+func (s *state0) SetThisEpochQualityAdjPower(p abi.StoragePower) error {
+	s.State.ThisEpochQualityAdjPower = p
+	return nil
+}
+
+func (s *state0) SetThisEpochRawBytePower(p abi.StoragePower) error {
+	s.State.ThisEpochRawBytePower = p
+	return nil
+}
+
+func (s *state0) GetState() interface{} {
+	return &s.State
+}
+
 func (s *state0) claims() (adt.Map, error) {
 	return adt0.AsMap(s.store, s.Claims)
 }
@@ -145,4 +191,21 @@ func fromV0Claim(v0 power0.Claim) Claim {
 		RawBytePower:    v0.RawBytePower,
 		QualityAdjPower: v0.QualityAdjPower,
 	}
+}
+
+func (s *state0) ActorKey() string {
+	return manifest.PowerKey
+}
+
+func (s *state0) ActorVersion() actorstypes.Version {
+	return actorstypes.Version0
+}
+
+func (s *state0) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

@@ -4,17 +4,17 @@ import (
 	"crypto/rand"
 	"time"
 
-	"github.com/filecoin-project/lotus/build"
-	"github.com/filecoin-project/lotus/chain/types"
-	"golang.org/x/xerrors"
-
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/libp2p/go-libp2p"
-	connmgr "github.com/libp2p/go-libp2p-connmgr"
-	"github.com/libp2p/go-libp2p-core/crypto"
-	"github.com/libp2p/go-libp2p-core/peer"
-	"github.com/libp2p/go-libp2p-core/peerstore"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"go.uber.org/fx"
+	"golang.org/x/xerrors"
+
+	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/types"
 )
 
 var log = logging.Logger("p2pnode")
@@ -42,7 +42,7 @@ func PrivKey(ks types.KeyStore) (crypto.PrivKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	kbytes, err := pk.Bytes()
+	kbytes, err := crypto.MarshalPrivateKey(pk)
 	if err != nil {
 		return nil, err
 	}
@@ -69,9 +69,13 @@ func genLibp2pKey() (crypto.PrivKey, error) {
 
 func ConnectionManager(low, high uint, grace time.Duration, protected []string) func() (opts Libp2pOpts, err error) {
 	return func() (Libp2pOpts, error) {
-		cm := connmgr.NewConnManager(int(low), int(high), grace)
+		cm, err := connmgr.NewConnManager(int(low), int(high), connmgr.WithGracePeriod(grace))
+		if err != nil {
+			return Libp2pOpts{}, err
+		}
+
 		for _, p := range protected {
-			pid, err := peer.IDFromString(p)
+			pid, err := peer.Decode(p)
 			if err != nil {
 				return Libp2pOpts{}, xerrors.Errorf("failed to parse peer ID in protected peers array: %w", err)
 			}

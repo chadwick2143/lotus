@@ -4,13 +4,14 @@ import (
 	"context"
 	"testing"
 
-	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/go-state-types/big"
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	ds_sync "github.com/ipfs/go-datastore/sync"
 	"github.com/stretchr/testify/require"
 
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
+	paychtypes "github.com/filecoin-project/go-state-types/builtin/v8/paych"
 	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
 	tutils2 "github.com/filecoin-project/specs-actors/v2/support/testing"
 
@@ -23,6 +24,7 @@ import (
 // insufficient funds, then adding funds to the channel, then adding the
 // voucher again
 func TestPaychAddVoucherAfterAddFunds(t *testing.T) {
+	//stm: @TOKEN_PAYCH_WAIT_READY_001
 	ctx := context.Background()
 	store := NewStore(ds_sync.MutexWrap(ds.NewMapDatastore()))
 
@@ -46,7 +48,7 @@ func TestPaychAddVoucherAfterAddFunds(t *testing.T) {
 
 	// Send create message for a channel with value 10
 	createAmt := big.NewInt(10)
-	_, createMsgCid, err := mgr.GetPaych(ctx, from, to, createAmt)
+	_, createMsgCid, err := mgr.GetPaych(ctx, from, to, createAmt, onChainReserve)
 	require.NoError(t, err)
 
 	// Send create channel response
@@ -67,7 +69,7 @@ func TestPaychAddVoucherAfterAddFunds(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create a voucher with a value equal to the channel balance
-	voucher := paych.SignedVoucher{Amount: createAmt, Lane: 1}
+	voucher := paychtypes.SignedVoucher{Amount: createAmt, Lane: 1}
 	res, err := mgr.CreateVoucher(ctx, ch, voucher)
 	require.NoError(t, err)
 	require.NotNil(t, res.Voucher)
@@ -75,14 +77,14 @@ func TestPaychAddVoucherAfterAddFunds(t *testing.T) {
 	// Create a voucher in a different lane with an amount that exceeds the
 	// channel balance
 	excessAmt := types.NewInt(5)
-	voucher = paych.SignedVoucher{Amount: excessAmt, Lane: 2}
+	voucher = paychtypes.SignedVoucher{Amount: excessAmt, Lane: 2}
 	res, err = mgr.CreateVoucher(ctx, ch, voucher)
 	require.NoError(t, err)
 	require.Nil(t, res.Voucher)
 	require.Equal(t, res.Shortfall, excessAmt)
 
 	// Add funds so as to cover the voucher shortfall
-	_, addFundsMsgCid, err := mgr.GetPaych(ctx, from, to, excessAmt)
+	_, addFundsMsgCid, err := mgr.GetPaych(ctx, from, to, excessAmt, onChainReserve)
 	require.NoError(t, err)
 
 	// Trigger add funds confirmation

@@ -1,17 +1,23 @@
 package init
 
 import (
-	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/go-state-types/abi"
+	"crypto/sha256"
+	"fmt"
+
 	"github.com/ipfs/go-cid"
 	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 
-	"github.com/filecoin-project/lotus/chain/actors/adt"
-	"github.com/filecoin-project/lotus/node/modules/dtypes"
-
+	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/manifest"
 	init0 "github.com/filecoin-project/specs-actors/actors/builtin/init"
 	adt0 "github.com/filecoin-project/specs-actors/actors/util/adt"
+
+	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
+	"github.com/filecoin-project/lotus/node/modules/dtypes"
 )
 
 var _ State = (*state0)(nil)
@@ -22,6 +28,19 @@ func load0(store adt.Store, root cid.Cid) (State, error) {
 	if err != nil {
 		return nil, err
 	}
+	return &out, nil
+}
+
+func make0(store adt.Store, networkName string) (State, error) {
+	out := state0{store: store}
+
+	mr, err := adt0.MakeEmptyMap(store).Root()
+	if err != nil {
+		return nil, err
+	}
+
+	out.State = *init0.ConstructState(mr, networkName)
+
 	return &out, nil
 }
 
@@ -62,6 +81,11 @@ func (s *state0) SetNetworkName(name string) error {
 	return nil
 }
 
+func (s *state0) SetNextID(id abi.ActorID) error {
+	s.State.NextID = id
+	return nil
+}
+
 func (s *state0) Remove(addrs ...address.Address) (err error) {
 	m, err := adt0.AsMap(s.store, s.State.AddressMap)
 	if err != nil {
@@ -80,6 +104,43 @@ func (s *state0) Remove(addrs ...address.Address) (err error) {
 	return nil
 }
 
-func (s *state0) addressMap() (adt.Map, error) {
-	return adt0.AsMap(s.store, s.AddressMap)
+func (s *state0) SetAddressMap(mcid cid.Cid) error {
+	s.State.AddressMap = mcid
+	return nil
+}
+
+func (s *state0) GetState() interface{} {
+	return &s.State
+}
+
+func (s *state0) AddressMap() (adt.Map, error) {
+	return adt0.AsMap(s.store, s.State.AddressMap)
+}
+
+func (s *state0) AddressMapBitWidth() int {
+	return 5
+}
+
+func (s *state0) AddressMapHashFunction() func(input []byte) []byte {
+	return func(input []byte) []byte {
+		res := sha256.Sum256(input)
+		return res[:]
+	}
+}
+
+func (s *state0) ActorKey() string {
+	return manifest.InitKey
+}
+
+func (s *state0) ActorVersion() actorstypes.Version {
+	return actorstypes.Version0
+}
+
+func (s *state0) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

@@ -1,19 +1,21 @@
+//go:build testground
 // +build testground
 
 // This file makes hardcoded parameters (const) configurable as vars.
 //
 // Its purpose is to unlock various degrees of flexibility and parametrization
 // when writing Testground plans for Lotus.
-//
 package build
 
 import (
 	"math/big"
+	"time"
 
-	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/go-state-types/network"
 	"github.com/ipfs/go-cid"
 
+	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/network"
 	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
 
 	"github.com/filecoin-project/lotus/chain/actors/policy"
@@ -32,11 +34,14 @@ var (
 	MinimumBaseFee        = int64(100)
 	BlockDelaySecs        = uint64(builtin2.EpochDurationSeconds)
 	PropagationDelaySecs  = uint64(6)
+	SupportedProofTypes   = []abi.RegisteredSealProof{
+		abi.RegisteredSealProof_StackedDrg32GiBV1,
+		abi.RegisteredSealProof_StackedDrg64GiBV1,
+	}
+	ConsensusMinerMinPower  = abi.NewStoragePower(10 << 40)
+	PreCommitChallengeDelay = abi.ChainEpoch(150)
 
 	AllowableClockDriftSecs = uint64(1)
-
-	Finality            = policy.ChainFinality
-	ForkLengthThreshold = Finality
 
 	SlashablePowerDelay        = 20
 	InteractivePoRepConfidence = 6
@@ -82,27 +87,40 @@ var (
 	UpgradeBreezeHeight      abi.ChainEpoch = -1
 	BreezeGasTampingDuration abi.ChainEpoch = 0
 
-	UpgradeSmokeHeight     abi.ChainEpoch = -1
-	UpgradeIgnitionHeight  abi.ChainEpoch = -2
-	UpgradeRefuelHeight    abi.ChainEpoch = -3
-	UpgradeTapeHeight      abi.ChainEpoch = -4
-	UpgradeActorsV2Height  abi.ChainEpoch = 10
-	UpgradeLiftoffHeight   abi.ChainEpoch = -5
-	UpgradeKumquatHeight   abi.ChainEpoch = -6
-	UpgradeCalicoHeight    abi.ChainEpoch = -7
-	UpgradePersianHeight   abi.ChainEpoch = -8
-	UpgradeOrangeHeight    abi.ChainEpoch = -9
-	UpgradeClausHeight     abi.ChainEpoch = -10
-	UpgradeActorsV3Height  abi.ChainEpoch = -11
-	UpgradeNorwegianHeight abi.ChainEpoch = -12
-	UpgradeActorsV4Height  abi.ChainEpoch = -13
+	UpgradeSmokeHeight      abi.ChainEpoch = -1
+	UpgradeIgnitionHeight   abi.ChainEpoch = -2
+	UpgradeRefuelHeight     abi.ChainEpoch = -3
+	UpgradeTapeHeight       abi.ChainEpoch = -4
+	UpgradeAssemblyHeight   abi.ChainEpoch = 10
+	UpgradeLiftoffHeight    abi.ChainEpoch = -5
+	UpgradeKumquatHeight    abi.ChainEpoch = -6
+	UpgradeCalicoHeight     abi.ChainEpoch = -8
+	UpgradePersianHeight    abi.ChainEpoch = -9
+	UpgradeOrangeHeight     abi.ChainEpoch = -10
+	UpgradeClausHeight      abi.ChainEpoch = -11
+	UpgradeTrustHeight      abi.ChainEpoch = -12
+	UpgradeNorwegianHeight  abi.ChainEpoch = -13
+	UpgradeTurboHeight      abi.ChainEpoch = -14
+	UpgradeHyperdriveHeight abi.ChainEpoch = -15
+	UpgradeChocolateHeight  abi.ChainEpoch = -16
+	UpgradeOhSnapHeight     abi.ChainEpoch = -17
+	UpgradeSkyrHeight       abi.ChainEpoch = -18
+	UpgradeSharkHeight      abi.ChainEpoch = -19
+	UpgradeHyggeHeight      abi.ChainEpoch = -20
+	UpgradeLightningHeight  abi.ChainEpoch = -21
+	UpgradeThunderHeight    abi.ChainEpoch = -22
 
 	DrandSchedule = map[abi.ChainEpoch]DrandEnum{
 		0: DrandMainnet,
 	}
 
-	NewestNetworkVersion       = network.Version11
-	ActorUpgradeNetworkVersion = network.Version4
+	GenesisNetworkVersion = network.Version0
+	NetworkBundle         = "devnet"
+	BundleOverrides       map[actorstypes.Version]string
+	ActorDebugging        = true
+
+	NewestNetworkVersion       = network.Version16
+	ActorUpgradeNetworkVersion = network.Version16
 
 	Devnet      = true
 	ZeroAddress = MustParseAddress("f3yaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaby2smx7a")
@@ -112,4 +130,15 @@ var (
 	GenesisFile       = ""
 )
 
+const Finality = policy.ChainFinality
+const ForkLengthThreshold = Finality
+
 const BootstrapPeerThreshold = 1
+
+// ChainId defines the chain ID used in the Ethereum JSON-RPC endpoint.
+// As per https://github.com/ethereum-lists/chains
+const Eip155ChainId = 31415926
+
+// Reducing the delivery delay for equivocation of
+// consistent broadcast to just half a second.
+var CBDeliveryDelay = 500 * time.Millisecond

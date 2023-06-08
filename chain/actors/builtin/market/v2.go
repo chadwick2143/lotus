@@ -2,17 +2,23 @@ package market
 
 import (
 	"bytes"
+	"fmt"
+
+	"github.com/ipfs/go-cid"
+	cbg "github.com/whyrusleeping/cbor-gen"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/ipfs/go-cid"
-	cbg "github.com/whyrusleeping/cbor-gen"
-
-	"github.com/filecoin-project/lotus/chain/actors/adt"
-	"github.com/filecoin-project/lotus/chain/types"
-
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	verifregtypes "github.com/filecoin-project/go-state-types/builtin/v9/verifreg"
+	"github.com/filecoin-project/go-state-types/manifest"
 	market2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/market"
 	adt2 "github.com/filecoin-project/specs-actors/v2/actors/util/adt"
+
+	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
+	"github.com/filecoin-project/lotus/chain/types"
 )
 
 var _ State = (*state2)(nil)
@@ -23,6 +29,24 @@ func load2(store adt.Store, root cid.Cid) (State, error) {
 	if err != nil {
 		return nil, err
 	}
+	return &out, nil
+}
+
+func make2(store adt.Store) (State, error) {
+	out := state2{store: store}
+
+	ea, err := adt2.MakeEmptyArray(store).Root()
+	if err != nil {
+		return nil, err
+	}
+
+	em, err := adt2.MakeEmptyMap(store).Root()
+	if err != nil {
+		return nil, err
+	}
+
+	out.State = *market2.ConstructState(ea, em, em)
+
 	return &out, nil
 }
 
@@ -164,7 +188,14 @@ func (s *dealStates2) array() adt.Array {
 }
 
 func fromV2DealState(v2 market2.DealState) DealState {
-	return (DealState)(v2)
+	ret := DealState{
+		SectorStartEpoch: v2.SectorStartEpoch,
+		LastUpdatedEpoch: v2.LastUpdatedEpoch,
+		SlashEpoch:       v2.SlashEpoch,
+		VerifiedClaim:    0,
+	}
+
+	return ret
 }
 
 type dealProposals2 struct {
@@ -180,14 +211,24 @@ func (s *dealProposals2) Get(dealID abi.DealID) (*DealProposal, bool, error) {
 	if !found {
 		return nil, false, nil
 	}
-	proposal := fromV2DealProposal(proposal2)
+
+	proposal, err := fromV2DealProposal(proposal2)
+	if err != nil {
+		return nil, true, xerrors.Errorf("decoding proposal: %w", err)
+	}
+
 	return &proposal, true, nil
 }
 
 func (s *dealProposals2) ForEach(cb func(dealID abi.DealID, dp DealProposal) error) error {
 	var dp2 market2.DealProposal
 	return s.Array.ForEach(&dp2, func(idx int64) error {
-		return cb(abi.DealID(idx), fromV2DealProposal(dp2))
+		dp, err := fromV2DealProposal(dp2)
+		if err != nil {
+			return xerrors.Errorf("decoding proposal: %w", err)
+		}
+
+		return cb(abi.DealID(idx), dp)
 	})
 }
 
@@ -196,7 +237,12 @@ func (s *dealProposals2) decode(val *cbg.Deferred) (*DealProposal, error) {
 	if err := dp2.UnmarshalCBOR(bytes.NewReader(val.Raw)); err != nil {
 		return nil, err
 	}
-	dp := fromV2DealProposal(dp2)
+
+	dp, err := fromV2DealProposal(dp2)
+	if err != nil {
+		return nil, err
+	}
+
 	return &dp, nil
 }
 
@@ -204,6 +250,81 @@ func (s *dealProposals2) array() adt.Array {
 	return s.Array
 }
 
-func fromV2DealProposal(v2 market2.DealProposal) DealProposal {
-	return (DealProposal)(v2)
+func fromV2DealProposal(v2 market2.DealProposal) (DealProposal, error) {
+
+	label, err := labelFromGoString(v2.Label)
+
+	if err != nil {
+		return DealProposal{}, xerrors.Errorf("error setting deal label: %w", err)
+	}
+
+	return DealProposal{
+		PieceCID:     v2.PieceCID,
+		PieceSize:    v2.PieceSize,
+		VerifiedDeal: v2.VerifiedDeal,
+		Client:       v2.Client,
+		Provider:     v2.Provider,
+
+		Label: label,
+
+		StartEpoch:           v2.StartEpoch,
+		EndEpoch:             v2.EndEpoch,
+		StoragePricePerEpoch: v2.StoragePricePerEpoch,
+
+		ProviderCollateral: v2.ProviderCollateral,
+		ClientCollateral:   v2.ClientCollateral,
+	}, nil
+}
+
+func (s *state2) GetState() interface{} {
+	return &s.State
+}
+
+var _ PublishStorageDealsReturn = (*publishStorageDealsReturn2)(nil)
+
+func decodePublishStorageDealsReturn2(b []byte) (PublishStorageDealsReturn, error) {
+	var retval market2.PublishStorageDealsReturn
+	if err := retval.UnmarshalCBOR(bytes.NewReader(b)); err != nil {
+		return nil, xerrors.Errorf("failed to unmarshal PublishStorageDealsReturn: %w", err)
+	}
+
+	return &publishStorageDealsReturn2{retval}, nil
+}
+
+type publishStorageDealsReturn2 struct {
+	market2.PublishStorageDealsReturn
+}
+
+func (r *publishStorageDealsReturn2) IsDealValid(index uint64) (bool, int, error) {
+
+	// PublishStorageDeals only succeeded if all deals were valid in this version of actors
+	return true, int(index), nil
+
+}
+
+func (r *publishStorageDealsReturn2) DealIDs() ([]abi.DealID, error) {
+	return r.IDs, nil
+}
+
+func (s *state2) GetAllocationIdForPendingDeal(dealId abi.DealID) (verifregtypes.AllocationId, error) {
+
+	return verifregtypes.NoAllocationID, xerrors.Errorf("unsupported before actors v9")
+
+}
+
+func (s *state2) ActorKey() string {
+	return manifest.MarketKey
+}
+
+func (s *state2) ActorVersion() actorstypes.Version {
+	return actorstypes.Version2
+}
+
+func (s *state2) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

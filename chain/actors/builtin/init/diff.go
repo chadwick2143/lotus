@@ -3,20 +3,21 @@ package init
 import (
 	"bytes"
 
+	typegen "github.com/whyrusleeping/cbor-gen"
+
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
-	typegen "github.com/whyrusleeping/cbor-gen"
 
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 )
 
 func DiffAddressMap(pre, cur State) (*AddressMapChanges, error) {
-	prem, err := pre.addressMap()
+	prem, err := pre.AddressMap()
 	if err != nil {
 		return nil, err
 	}
 
-	curm, err := cur.addressMap()
+	curm, err := cur.AddressMap()
 	if err != nil {
 		return nil, err
 	}

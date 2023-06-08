@@ -4,16 +4,10 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
 
-	"github.com/filecoin-project/lotus/blockstore"
-	"github.com/filecoin-project/lotus/chain/vm"
-	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
-	"github.com/filecoin-project/lotus/journal"
-	"github.com/filecoin-project/lotus/node/modules/testing"
 	"github.com/google/uuid"
 	"github.com/mitchellh/go-homedir"
 	"github.com/urfave/cli/v2"
@@ -22,12 +16,18 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/network"
 
+	"github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/gen"
 	genesis2 "github.com/filecoin-project/lotus/chain/gen/genesis"
 	"github.com/filecoin-project/lotus/chain/types"
+	"github.com/filecoin-project/lotus/chain/vm"
 	"github.com/filecoin-project/lotus/genesis"
+	"github.com/filecoin-project/lotus/journal"
+	"github.com/filecoin-project/lotus/node/modules/testing"
+	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper"
 )
 
 var genesisCmd = &cli.Command{
@@ -39,7 +39,9 @@ var genesisCmd = &cli.Command{
 		genesisAddMsigsCmd,
 		genesisSetVRKCmd,
 		genesisSetRemainderCmd,
+		genesisSetActorVersionCmd,
 		genesisCarCmd,
+		genesisSetVRKSignersCmd,
 	},
 }
 
@@ -56,6 +58,7 @@ var genesisNewCmd = &cli.Command{
 			return xerrors.New("seed genesis new [genesis.json]")
 		}
 		out := genesis.Template{
+			NetworkVersion:   build.GenesisNetworkVersion,
 			Accounts:         []genesis.Actor{},
 			Miners:           []genesis.Miner{},
 			VerifregRootKey:  gen.DefaultVerifregRootkeyActor,
@@ -76,7 +79,7 @@ var genesisNewCmd = &cli.Command{
 			return err
 		}
 
-		if err := ioutil.WriteFile(genf, genb, 0644); err != nil {
+		if err := os.WriteFile(genf, genb, 0644); err != nil {
 			return err
 		}
 
@@ -89,7 +92,7 @@ var genesisAddMinerCmd = &cli.Command{
 	Description: "add genesis miner",
 	Flags:       []cli.Flag{},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 2 {
+		if cctx.NArg() != 2 {
 			return xerrors.New("seed genesis add-miner [genesis.json] [preseal.json]")
 		}
 
@@ -99,7 +102,7 @@ var genesisAddMinerCmd = &cli.Command{
 		}
 
 		var template genesis.Template
-		genb, err := ioutil.ReadFile(genf)
+		genb, err := os.ReadFile(genf)
 		if err != nil {
 			return xerrors.Errorf("read genesis template: %w", err)
 		}
@@ -113,7 +116,7 @@ var genesisAddMinerCmd = &cli.Command{
 			return xerrors.Errorf("expand preseal file path: %w", err)
 		}
 		miners := map[string]genesis.Miner{}
-		minb, err := ioutil.ReadFile(minf)
+		minb, err := os.ReadFile(minf)
 		if err != nil {
 			return xerrors.Errorf("read preseal file: %w", err)
 		}
@@ -152,7 +155,7 @@ var genesisAddMinerCmd = &cli.Command{
 			return err
 		}
 
-		if err := ioutil.WriteFile(genf, genb, 0644); err != nil {
+		if err := os.WriteFile(genf, genb, 0644); err != nil {
 			return err
 		}
 
@@ -177,7 +180,7 @@ type GenAccountEntry struct {
 var genesisAddMsigsCmd = &cli.Command{
 	Name: "add-msigs",
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() < 2 {
+		if cctx.NArg() < 2 {
 			return fmt.Errorf("must specify template file and csv file with accounts")
 		}
 
@@ -192,7 +195,7 @@ var genesisAddMsigsCmd = &cli.Command{
 		}
 
 		var template genesis.Template
-		b, err := ioutil.ReadFile(genf)
+		b, err := os.ReadFile(genf)
 		if err != nil {
 			return xerrors.Errorf("read genesis template: %w", err)
 		}
@@ -233,7 +236,7 @@ var genesisAddMsigsCmd = &cli.Command{
 			return err
 		}
 
-		if err := ioutil.WriteFile(genf, b, 0644); err != nil {
+		if err := os.WriteFile(genf, b, 0644); err != nil {
 			return err
 		}
 		return nil
@@ -325,7 +328,7 @@ var genesisSetVRKCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 1 {
+		if cctx.NArg() != 1 {
 			return fmt.Errorf("must specify template file")
 		}
 
@@ -335,7 +338,7 @@ var genesisSetVRKCmd = &cli.Command{
 		}
 
 		var template genesis.Template
-		b, err := ioutil.ReadFile(genf)
+		b, err := os.ReadFile(genf)
 		if err != nil {
 			return xerrors.Errorf("read genesis template: %w", err)
 		}
@@ -400,7 +403,7 @@ var genesisSetVRKCmd = &cli.Command{
 			return err
 		}
 
-		if err := ioutil.WriteFile(genf, b, 0644); err != nil {
+		if err := os.WriteFile(genf, b, 0644); err != nil {
 			return err
 		}
 		return nil
@@ -421,7 +424,7 @@ var genesisSetRemainderCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if cctx.Args().Len() != 1 {
+		if cctx.NArg() != 1 {
 			return fmt.Errorf("must specify template file")
 		}
 
@@ -431,7 +434,7 @@ var genesisSetRemainderCmd = &cli.Command{
 		}
 
 		var template genesis.Template
-		b, err := ioutil.ReadFile(genf)
+		b, err := os.ReadFile(genf)
 		if err != nil {
 			return xerrors.Errorf("read genesis template: %w", err)
 		}
@@ -496,7 +499,57 @@ var genesisSetRemainderCmd = &cli.Command{
 			return err
 		}
 
-		if err := ioutil.WriteFile(genf, b, 0644); err != nil {
+		if err := os.WriteFile(genf, b, 0644); err != nil {
+			return err
+		}
+		return nil
+	},
+}
+
+var genesisSetActorVersionCmd = &cli.Command{
+	Name:  "set-network-version",
+	Usage: "Set the version that this network will start from",
+	Flags: []cli.Flag{
+		&cli.IntFlag{
+			Name:  "network-version",
+			Usage: "network version to start genesis with",
+			Value: int(build.GenesisNetworkVersion),
+		},
+	},
+	ArgsUsage: "<genesisFile>",
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() != 1 {
+			return fmt.Errorf("must specify genesis file")
+		}
+
+		genf, err := homedir.Expand(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var template genesis.Template
+		b, err := os.ReadFile(genf)
+		if err != nil {
+			return xerrors.Errorf("read genesis template: %w", err)
+		}
+
+		if err := json.Unmarshal(b, &template); err != nil {
+			return xerrors.Errorf("unmarshal genesis template: %w", err)
+		}
+
+		nv := network.Version(cctx.Int("network-version"))
+		if nv > build.TestNetworkVersion {
+			return xerrors.Errorf("invalid network version: %d", nv)
+		}
+
+		template.NetworkVersion = nv
+
+		b, err = json.MarshalIndent(&template, "", "  ")
+		if err != nil {
+			return err
+		}
+
+		if err := os.WriteFile(genf, b, 0644); err != nil {
 			return err
 		}
 		return nil
@@ -521,9 +574,96 @@ var genesisCarCmd = &cli.Command{
 		}
 		ofile := c.String("out")
 		jrnl := journal.NilJournal()
-		bstor := blockstore.NewMemorySync()
+		bstor := blockstore.WrapIDStore(blockstore.NewMemorySync())
 		sbldr := vm.Syscalls(ffiwrapper.ProofVerifier)
+
 		_, err := testing.MakeGenesis(ofile, c.Args().First())(bstor, sbldr, jrnl)()
 		return err
+	},
+}
+
+var genesisSetVRKSignersCmd = &cli.Command{
+	Name:  "set-signers",
+	Usage: "",
+	Flags: []cli.Flag{
+		&cli.IntFlag{
+			Name:  "threshold",
+			Usage: "change the verifreg signer threshold",
+		},
+		&cli.StringSliceFlag{
+			Name:  "signers",
+			Usage: "verifreg signers",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if cctx.NArg() != 1 {
+			return fmt.Errorf("must specify template file")
+		}
+
+		genf, err := homedir.Expand(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var template genesis.Template
+		b, err := os.ReadFile(genf)
+		if err != nil {
+			return xerrors.Errorf("read genesis template: %w", err)
+		}
+
+		if err := json.Unmarshal(b, &template); err != nil {
+			return xerrors.Errorf("unmarshal genesis template: %w", err)
+		}
+
+		var signers []address.Address
+		var rootkeyMultisig genesis.MultisigMeta
+		if cctx.IsSet("signers") {
+			for _, s := range cctx.StringSlice("signers") {
+				signer, err := address.NewFromString(s)
+				if err != nil {
+					return err
+				}
+				signers = append(signers, signer)
+				template.Accounts = append(template.Accounts, genesis.Actor{
+					Type:    genesis.TAccount,
+					Balance: big.Mul(big.NewInt(50_000), big.NewInt(int64(build.FilecoinPrecision))),
+					Meta:    (&genesis.AccountMeta{Owner: signer}).ActorMeta(),
+				})
+			}
+			rootkeyMultisig = genesis.MultisigMeta{
+				Signers:         signers,
+				Threshold:       1,
+				VestingDuration: 0,
+				VestingStart:    0,
+			}
+
+		}
+
+		if cctx.IsSet("threshold") {
+			rootkeyMultisig = genesis.MultisigMeta{
+				Signers:         signers,
+				Threshold:       cctx.Int("threshold"),
+				VestingDuration: 0,
+				VestingStart:    0,
+			}
+		}
+
+		newVrk := genesis.Actor{
+			Type:    genesis.TMultisig,
+			Balance: big.NewInt(0),
+			Meta:    rootkeyMultisig.ActorMeta(),
+		}
+
+		template.VerifregRootKey = newVrk
+
+		b, err = json.MarshalIndent(&template, "", "  ")
+		if err != nil {
+			return err
+		}
+
+		if err := os.WriteFile(genf, b, 0644); err != nil {
+			return err
+		}
+		return nil
 	},
 }

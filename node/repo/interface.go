@@ -8,10 +8,9 @@ import (
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/filecoin-project/lotus/blockstore"
-	"github.com/filecoin-project/lotus/extern/sector-storage/fsutil"
-	"github.com/filecoin-project/lotus/extern/sector-storage/stores"
-
 	"github.com/filecoin-project/lotus/chain/types"
+	"github.com/filecoin-project/lotus/storage/sealer/fsutil"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
 // BlockstoreDomain represents the domain of a blockstore.
@@ -52,6 +51,9 @@ type LockedRepo interface {
 	// Close closes repo and removes lock.
 	Close() error
 
+	// returns the type of this repo
+	RepoType() RepoType
+
 	// Returns datastore defined in this repo.
 	// The supplied context must only be used to initialize the datastore.
 	// The implementation should not retain the context for usage throughout
@@ -67,12 +69,15 @@ type LockedRepo interface {
 	// SplitstorePath returns the path for the SplitStore
 	SplitstorePath() (string, error)
 
+	// SqlitePath returns the path for the Sqlite database
+	SqlitePath() (string, error)
+
 	// Returns config in this repo
 	Config() (interface{}, error)
 	SetConfig(func(interface{})) error
 
-	GetStorage() (stores.StorageConfig, error)
-	SetStorage(func(*stores.StorageConfig)) error
+	GetStorage() (storiface.StorageConfig, error)
+	SetStorage(func(*storiface.StorageConfig)) error
 	Stat(path string) (fsutil.FsStat, error)
 	DiskUsage(path string) (int64, error)
 

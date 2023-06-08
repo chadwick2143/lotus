@@ -1,13 +1,16 @@
+// stm: #integration
 package stmgr_test
 
 import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"testing"
 
 	"github.com/ipfs/go-cid"
+	"github.com/ipfs/go-datastore"
 	ipldcbor "github.com/ipfs/go-ipld-cbor"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/stretchr/testify/require"
@@ -16,8 +19,10 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-state-types/cbor"
-
+	"github.com/filecoin-project/go-state-types/network"
+	rtt "github.com/filecoin-project/go-state-types/rt"
 	builtin0 "github.com/filecoin-project/specs-actors/actors/builtin"
 	init2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/init"
 	rt2 "github.com/filecoin-project/specs-actors/v2/actors/runtime"
@@ -25,9 +30,14 @@ import (
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/aerrors"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	_init "github.com/filecoin-project/lotus/chain/actors/builtin/init"
 	"github.com/filecoin-project/lotus/chain/actors/policy"
+	"github.com/filecoin-project/lotus/chain/consensus"
+	"github.com/filecoin-project/lotus/chain/consensus/filcns"
 	"github.com/filecoin-project/lotus/chain/gen"
+	"github.com/filecoin-project/lotus/chain/index"
+	"github.com/filecoin-project/lotus/chain/stmgr"
 	. "github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
@@ -104,6 +114,9 @@ func (ta *testActor) TestMethod(rt rt2.Runtime, params *abi.EmptyValue) *abi.Emp
 }
 
 func TestForkHeightTriggers(t *testing.T) {
+	//stm: @CHAIN_STATETREE_GET_ACTOR_001, @CHAIN_STATETREE_FLUSH_001, @TOKEN_WALLET_SIGN_001
+	//stm: @CHAIN_GEN_NEXT_TIPSET_001
+	//stm: @CHAIN_STATE_RESOLVE_TO_KEY_ADDR_001, @CHAIN_STATE_SET_VM_CONSTRUCTOR_001
 	logging.SetAllLoggers(logging.LevelInfo)
 
 	ctx := context.TODO()
@@ -119,11 +132,11 @@ func TestForkHeightTriggers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sm, err := NewStateManagerWithUpgradeSchedule(
-		cg.ChainStore(), UpgradeSchedule{{
-			Network: 1,
+	sm, err := NewStateManager(
+		cg.ChainStore(), consensus.NewTipSetExecutor(filcns.RewardFunc), cg.StateManager().VMSys(), UpgradeSchedule{{
+			Network: network.Version1,
 			Height:  testForkHeight,
-			Migration: func(ctx context.Context, sm *StateManager, cache MigrationCache, cb ExecCallback,
+			Migration: func(ctx context.Context, sm *StateManager, cache MigrationCache, cb ExecMonitor,
 				root cid.Cid, height abi.ChainEpoch, ts *types.TipSet) (cid.Cid, error) {
 				cst := ipldcbor.NewCborStore(sm.ChainStore().StateBlockstore())
 
@@ -156,16 +169,17 @@ func TestForkHeightTriggers(t *testing.T) {
 				}
 
 				return st.Flush(ctx)
-			}}})
+			}}}, cg.BeaconSchedule(), datastore.NewMapDatastore(), index.DummyMsgIndex)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	inv := vm.NewActorRegistry()
-	inv.Register(nil, testActor{})
+	inv := consensus.NewActorRegistry()
+	registry := builtin.MakeRegistryLegacy([]rtt.VMActor{testActor{}})
+	inv.Register(actorstypes.Version0, nil, registry)
 
-	sm.SetVMConstructor(func(ctx context.Context, vmopt *vm.VMOpts) (*vm.VM, error) {
-		nvm, err := vm.NewVM(ctx, vmopt)
+	sm.SetVMConstructor(func(ctx context.Context, vmopt *vm.VMOpts) (vm.Interface, error) {
+		nvm, err := vm.NewLegacyVM(ctx, vmopt)
 		if err != nil {
 			return nil, err
 		}
@@ -239,8 +253,23 @@ func TestForkHeightTriggers(t *testing.T) {
 }
 
 func TestForkRefuseCall(t *testing.T) {
+	//stm: @CHAIN_GEN_NEXT_TIPSET_001, @CHAIN_GEN_NEXT_TIPSET_FROM_MINERS_001
+	//stm: @CHAIN_STATE_RESOLVE_TO_KEY_ADDR_001, @CHAIN_STATE_SET_VM_CONSTRUCTOR_001, @CHAIN_STATE_CALL_001
 	logging.SetAllLoggers(logging.LevelInfo)
 
+	for after := 0; after < 3; after++ {
+		for before := 0; before < 3; before++ {
+			// Makes the lints happy...
+			after := after
+			before := before
+			t.Run(fmt.Sprintf("after:%d,before:%d", after, before), func(t *testing.T) {
+				testForkRefuseCall(t, before, after)
+			})
+		}
+	}
+
+}
+func testForkRefuseCall(t *testing.T, nullsBefore, nullsAfter int) {
 	ctx := context.TODO()
 
 	cg, err := gen.NewGenerator()
@@ -248,24 +277,27 @@ func TestForkRefuseCall(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sm, err := NewStateManagerWithUpgradeSchedule(
-		cg.ChainStore(), UpgradeSchedule{{
-			Network:   1,
+	var migrationCount int
+	sm, err := NewStateManager(
+		cg.ChainStore(), consensus.NewTipSetExecutor(filcns.RewardFunc), cg.StateManager().VMSys(), UpgradeSchedule{{
+			Network:   network.Version1,
 			Expensive: true,
 			Height:    testForkHeight,
-			Migration: func(ctx context.Context, sm *StateManager, cache MigrationCache, cb ExecCallback,
+			Migration: func(ctx context.Context, sm *StateManager, cache MigrationCache, cb ExecMonitor,
 				root cid.Cid, height abi.ChainEpoch, ts *types.TipSet) (cid.Cid, error) {
+				migrationCount++
 				return root, nil
-			}}})
+			}}}, cg.BeaconSchedule(), datastore.NewMapDatastore(), index.DummyMsgIndex)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	inv := vm.NewActorRegistry()
-	inv.Register(nil, testActor{})
+	inv := consensus.NewActorRegistry()
+	registry := builtin.MakeRegistryLegacy([]rtt.VMActor{testActor{}})
+	inv.Register(actorstypes.Version0, nil, registry)
 
-	sm.SetVMConstructor(func(ctx context.Context, vmopt *vm.VMOpts) (*vm.VM, error) {
-		nvm, err := vm.NewVM(ctx, vmopt)
+	sm.SetVMConstructor(func(ctx context.Context, vmopt *vm.VMOpts) (vm.Interface, error) {
+		nvm, err := vm.NewLegacyVM(ctx, vmopt)
 		if err != nil {
 			return nil, err
 		}
@@ -291,35 +323,60 @@ func TestForkRefuseCall(t *testing.T) {
 		GasFeeCap:  types.NewInt(0),
 	}
 
-	for i := 0; i < 50; i++ {
-		ts, err := cg.NextTipSet()
+	nullStart := abi.ChainEpoch(testForkHeight - nullsBefore)
+	nullLength := abi.ChainEpoch(nullsBefore + nullsAfter)
+
+	for i := 0; i < testForkHeight*2; i++ {
+		pts := cg.CurTipset.TipSet()
+		skip := abi.ChainEpoch(0)
+		if pts.Height() == nullStart {
+			skip = nullLength
+		}
+		ts, err := cg.NextTipSetFromMiners(pts, cg.Miners, skip)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		ret, err := sm.CallWithGas(ctx, m, nil, ts.TipSet.TipSet())
-		switch ts.TipSet.TipSet().Height() {
-		case testForkHeight, testForkHeight + 1:
+		parentHeight := pts.Height()
+		currentHeight := ts.TipSet.TipSet().Height()
+
+		// CallWithGas calls on top of the given tipset.
+		ret, err := sm.CallWithGas(ctx, m, nil, ts.TipSet.TipSet(), true)
+		if parentHeight <= testForkHeight && currentHeight >= testForkHeight {
 			// If I had a fork, or I _will_ have a fork, it should fail.
 			require.Equal(t, ErrExpensiveFork, err)
-		default:
+		} else {
 			require.NoError(t, err)
 			require.True(t, ret.MsgRct.ExitCode.IsSuccess())
 		}
-		// Call just runs on the parent state for a tipset, so we only
-		// expect an error at the fork height.
+
+		// Call always applies the message to the "next block" after the tipset's parent state.
 		ret, err = sm.Call(ctx, m, ts.TipSet.TipSet())
-		switch ts.TipSet.TipSet().Height() {
-		case testForkHeight + 1:
+		if parentHeight <= testForkHeight && currentHeight >= testForkHeight {
 			require.Equal(t, ErrExpensiveFork, err)
-		default:
+		} else {
 			require.NoError(t, err)
 			require.True(t, ret.MsgRct.ExitCode.IsSuccess())
 		}
+
+		// Calls without a tipset should walk back to the last non-fork tipset.
+		// We _verify_ that the migration wasn't run multiple times at the end of the
+		// test.
+		ret, err = sm.CallWithGas(ctx, m, nil, nil, true)
+		require.NoError(t, err)
+		require.True(t, ret.MsgRct.ExitCode.IsSuccess())
+
+		ret, err = sm.Call(ctx, m, nil)
+		require.NoError(t, err)
+		require.True(t, ret.MsgRct.ExitCode.IsSuccess())
 	}
+	// Make sure we didn't execute the migration multiple times.
+	require.Equal(t, migrationCount, 1)
 }
 
 func TestForkPreMigration(t *testing.T) {
+	//stm: @CHAIN_GEN_NEXT_TIPSET_001,
+	//stm: @CHAIN_STATE_RESOLVE_TO_KEY_ADDR_001, @CHAIN_STATE_SET_VM_CONSTRUCTOR_001
 	logging.SetAllLoggers(logging.LevelInfo)
 
 	cg, err := gen.NewGenerator()
@@ -359,11 +416,11 @@ func TestForkPreMigration(t *testing.T) {
 
 	counter := make(chan struct{}, 10)
 
-	sm, err := NewStateManagerWithUpgradeSchedule(
-		cg.ChainStore(), UpgradeSchedule{{
-			Network: 1,
+	sm, err := NewStateManager(
+		cg.ChainStore(), consensus.NewTipSetExecutor(filcns.RewardFunc), cg.StateManager().VMSys(), UpgradeSchedule{{
+			Network: network.Version1,
 			Height:  testForkHeight,
-			Migration: func(ctx context.Context, sm *StateManager, cache MigrationCache, cb ExecCallback,
+			Migration: func(ctx context.Context, sm *StateManager, cache MigrationCache, cb ExecMonitor,
 				root cid.Cid, height abi.ChainEpoch, ts *types.TipSet) (cid.Cid, error) {
 
 				// Make sure the test that should be canceled, is canceled.
@@ -448,7 +505,7 @@ func TestForkPreMigration(t *testing.T) {
 					return nil
 				},
 			}}},
-		})
+		}, cg.BeaconSchedule(), datastore.NewMapDatastore(), index.DummyMsgIndex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,11 +514,12 @@ func TestForkPreMigration(t *testing.T) {
 		require.NoError(t, sm.Stop(context.Background()))
 	}()
 
-	inv := vm.NewActorRegistry()
-	inv.Register(nil, testActor{})
+	inv := consensus.NewActorRegistry()
+	registry := builtin.MakeRegistryLegacy([]rtt.VMActor{testActor{}})
+	inv.Register(actorstypes.Version0, nil, registry)
 
-	sm.SetVMConstructor(func(ctx context.Context, vmopt *vm.VMOpts) (*vm.VM, error) {
-		nvm, err := vm.NewVM(ctx, vmopt)
+	sm.SetVMConstructor(func(ctx context.Context, vmopt *vm.VMOpts) (vm.Interface, error) {
+		nvm, err := vm.NewLegacyVM(ctx, vmopt)
 		if err != nil {
 			return nil, err
 		}
@@ -480,4 +538,174 @@ func TestForkPreMigration(t *testing.T) {
 	// We have 5 pre-migration steps, and the migration. They should all have written something
 	// to this channel.
 	require.Equal(t, 6, len(counter))
+}
+
+func TestDisablePreMigration(t *testing.T) {
+	logging.SetAllLoggers(logging.LevelInfo)
+
+	cg, err := gen.NewGenerator()
+	require.NoError(t, err)
+
+	err = os.Setenv(EnvDisablePreMigrations, "1")
+	require.NoError(t, err)
+
+	defer func() {
+		err := os.Unsetenv(EnvDisablePreMigrations)
+		require.NoError(t, err)
+	}()
+
+	counter := make(chan struct{}, 10)
+
+	sm, err := NewStateManager(
+		cg.ChainStore(),
+		consensus.NewTipSetExecutor(filcns.RewardFunc),
+		cg.StateManager().VMSys(),
+		UpgradeSchedule{{
+			Network: network.Version1,
+			Height:  testForkHeight,
+			Migration: func(_ context.Context, _ *StateManager, _ MigrationCache, _ ExecMonitor,
+				root cid.Cid, _ abi.ChainEpoch, _ *types.TipSet) (cid.Cid, error) {
+
+				counter <- struct{}{}
+
+				return root, nil
+			},
+			PreMigrations: []PreMigration{{
+				StartWithin: 20,
+				PreMigration: func(ctx context.Context, _ *StateManager, _ MigrationCache,
+					_ cid.Cid, _ abi.ChainEpoch, _ *types.TipSet) error {
+					panic("should be skipped")
+				},
+			}}},
+		},
+		cg.BeaconSchedule(),
+		datastore.NewMapDatastore(),
+		index.DummyMsgIndex,
+	)
+	require.NoError(t, err)
+	require.NoError(t, sm.Start(context.Background()))
+	defer func() {
+		require.NoError(t, sm.Stop(context.Background()))
+	}()
+
+	inv := consensus.NewActorRegistry()
+	registry := builtin.MakeRegistryLegacy([]rtt.VMActor{testActor{}})
+	inv.Register(actorstypes.Version0, nil, registry)
+
+	sm.SetVMConstructor(func(ctx context.Context, vmopt *vm.VMOpts) (vm.Interface, error) {
+		nvm, err := vm.NewLegacyVM(ctx, vmopt)
+		require.NoError(t, err)
+		nvm.SetInvoker(inv)
+		return nvm, nil
+	})
+
+	cg.SetStateManager(sm)
+
+	for i := 0; i < 50; i++ {
+		_, err := cg.NextTipSet()
+		require.NoError(t, err)
+	}
+
+	require.Equal(t, 1, len(counter))
+}
+
+func TestMigrtionCache(t *testing.T) {
+	logging.SetAllLoggers(logging.LevelInfo)
+
+	cg, err := gen.NewGenerator()
+	require.NoError(t, err)
+
+	counter := make(chan struct{}, 10)
+	metadataDs := datastore.NewMapDatastore()
+
+	sm, err := NewStateManager(
+		cg.ChainStore(),
+		consensus.NewTipSetExecutor(filcns.RewardFunc),
+		cg.StateManager().VMSys(),
+		UpgradeSchedule{{
+			Network: network.Version1,
+			Height:  testForkHeight,
+			Migration: func(_ context.Context, _ *StateManager, _ MigrationCache, _ ExecMonitor,
+				root cid.Cid, _ abi.ChainEpoch, _ *types.TipSet) (cid.Cid, error) {
+
+				counter <- struct{}{}
+
+				return root, nil
+			}},
+		},
+		cg.BeaconSchedule(),
+		metadataDs,
+		index.DummyMsgIndex,
+	)
+	require.NoError(t, err)
+	require.NoError(t, sm.Start(context.Background()))
+	defer func() {
+		require.NoError(t, sm.Stop(context.Background()))
+	}()
+
+	inv := consensus.NewActorRegistry()
+	registry := builtin.MakeRegistryLegacy([]rtt.VMActor{testActor{}})
+	inv.Register(actorstypes.Version0, nil, registry)
+
+	sm.SetVMConstructor(func(ctx context.Context, vmopt *vm.VMOpts) (vm.Interface, error) {
+		nvm, err := vm.NewLegacyVM(ctx, vmopt)
+		require.NoError(t, err)
+		nvm.SetInvoker(inv)
+		return nvm, nil
+	})
+
+	cg.SetStateManager(sm)
+
+	for i := 0; i < 50; i++ {
+		_, err := cg.NextTipSet()
+		require.NoError(t, err)
+	}
+
+	ts, err := cg.ChainStore().GetTipsetByHeight(context.Background(), testForkHeight, nil, false)
+	require.NoError(t, err)
+
+	root, _, err := stmgr.ComputeState(context.Background(), sm, testForkHeight+1, []*types.Message{}, ts)
+	require.NoError(t, err)
+	t.Log(root)
+
+	require.Equal(t, 1, len(counter))
+
+	{
+		sm, err := NewStateManager(
+			cg.ChainStore(),
+			consensus.NewTipSetExecutor(filcns.RewardFunc),
+			cg.StateManager().VMSys(),
+			UpgradeSchedule{{
+				Network: network.Version1,
+				Height:  testForkHeight,
+				Migration: func(_ context.Context, _ *StateManager, _ MigrationCache, _ ExecMonitor,
+					root cid.Cid, _ abi.ChainEpoch, _ *types.TipSet) (cid.Cid, error) {
+
+					counter <- struct{}{}
+
+					return root, nil
+				}},
+			},
+			cg.BeaconSchedule(),
+			metadataDs,
+			index.DummyMsgIndex,
+		)
+		require.NoError(t, err)
+		sm.SetVMConstructor(func(ctx context.Context, vmopt *vm.VMOpts) (vm.Interface, error) {
+			nvm, err := vm.NewLegacyVM(ctx, vmopt)
+			require.NoError(t, err)
+			nvm.SetInvoker(inv)
+			return nvm, nil
+		})
+
+		ctx := context.Background()
+
+		base, _, err := sm.ExecutionTrace(ctx, ts)
+		require.NoError(t, err)
+		_, err = sm.HandleStateForks(context.Background(), base, ts.Height(), nil, ts)
+		require.NoError(t, err)
+
+		// Should not have increased as we should be using the cached results in the metadataDs
+		require.Equal(t, 1, len(counter))
+	}
 }

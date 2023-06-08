@@ -3,51 +3,54 @@ package multisig
 import (
 	"fmt"
 
+	"github.com/ipfs/go-cid"
 	"github.com/minio/blake2b-simd"
 	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	builtintypes "github.com/filecoin-project/go-state-types/builtin"
+	msig11 "github.com/filecoin-project/go-state-types/builtin/v11/multisig"
 	"github.com/filecoin-project/go-state-types/cbor"
-	"github.com/ipfs/go-cid"
-
-	msig4 "github.com/filecoin-project/specs-actors/v4/actors/builtin/multisig"
-
+	"github.com/filecoin-project/go-state-types/manifest"
 	builtin0 "github.com/filecoin-project/specs-actors/actors/builtin"
-
 	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
-
 	builtin3 "github.com/filecoin-project/specs-actors/v3/actors/builtin"
-
 	builtin4 "github.com/filecoin-project/specs-actors/v4/actors/builtin"
+	builtin5 "github.com/filecoin-project/specs-actors/v5/actors/builtin"
+	builtin6 "github.com/filecoin-project/specs-actors/v6/actors/builtin"
+	builtin7 "github.com/filecoin-project/specs-actors/v7/actors/builtin"
 
 	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
-func init() {
-
-	builtin.RegisterActorState(builtin0.MultisigActorCodeID, func(store adt.Store, root cid.Cid) (cbor.Marshaler, error) {
-		return load0(store, root)
-	})
-
-	builtin.RegisterActorState(builtin2.MultisigActorCodeID, func(store adt.Store, root cid.Cid) (cbor.Marshaler, error) {
-		return load2(store, root)
-	})
-
-	builtin.RegisterActorState(builtin3.MultisigActorCodeID, func(store adt.Store, root cid.Cid) (cbor.Marshaler, error) {
-		return load3(store, root)
-	})
-
-	builtin.RegisterActorState(builtin4.MultisigActorCodeID, func(store adt.Store, root cid.Cid) (cbor.Marshaler, error) {
-		return load4(store, root)
-	})
-}
-
 func Load(store adt.Store, act *types.Actor) (State, error) {
+	if name, av, ok := actors.GetActorMetaByCode(act.Code); ok {
+		if name != manifest.MultisigKey {
+			return nil, xerrors.Errorf("actor code is not multisig: %s", name)
+		}
+
+		switch av {
+
+		case actorstypes.Version8:
+			return load8(store, act.Head)
+
+		case actorstypes.Version9:
+			return load9(store, act.Head)
+
+		case actorstypes.Version10:
+			return load10(store, act.Head)
+
+		case actorstypes.Version11:
+			return load11(store, act.Head)
+
+		}
+	}
+
 	switch act.Code {
 
 	case builtin0.MultisigActorCodeID:
@@ -62,12 +65,66 @@ func Load(store adt.Store, act *types.Actor) (State, error) {
 	case builtin4.MultisigActorCodeID:
 		return load4(store, act.Head)
 
+	case builtin5.MultisigActorCodeID:
+		return load5(store, act.Head)
+
+	case builtin6.MultisigActorCodeID:
+		return load6(store, act.Head)
+
+	case builtin7.MultisigActorCodeID:
+		return load7(store, act.Head)
+
 	}
+
 	return nil, xerrors.Errorf("unknown actor code %s", act.Code)
+}
+
+func MakeState(store adt.Store, av actorstypes.Version, signers []address.Address, threshold uint64, startEpoch abi.ChainEpoch, unlockDuration abi.ChainEpoch, initialBalance abi.TokenAmount) (State, error) {
+	switch av {
+
+	case actorstypes.Version0:
+		return make0(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	case actorstypes.Version2:
+		return make2(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	case actorstypes.Version3:
+		return make3(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	case actorstypes.Version4:
+		return make4(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	case actorstypes.Version5:
+		return make5(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	case actorstypes.Version6:
+		return make6(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	case actorstypes.Version7:
+		return make7(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	case actorstypes.Version8:
+		return make8(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	case actorstypes.Version9:
+		return make9(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	case actorstypes.Version10:
+		return make10(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	case actorstypes.Version11:
+		return make11(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+
+	}
+	return nil, xerrors.Errorf("unknown actor version %d", av)
 }
 
 type State interface {
 	cbor.Marshaler
+
+	Code() cid.Cid
+	ActorKey() string
+	ActorVersion() actorstypes.Version
 
 	LockedBalance(epoch abi.ChainEpoch) (abi.TokenAmount, error)
 	StartEpoch() (abi.ChainEpoch, error)
@@ -81,26 +138,48 @@ type State interface {
 
 	transactions() (adt.Map, error)
 	decodeTransaction(val *cbg.Deferred) (Transaction, error)
+	GetState() interface{}
 }
 
-type Transaction = msig4.Transaction
+type Transaction = msig11.Transaction
 
-var Methods = builtin4.MethodsMultisig
+var Methods = builtintypes.MethodsMultisig
 
-func Message(version actors.Version, from address.Address) MessageBuilder {
+func Message(version actorstypes.Version, from address.Address) MessageBuilder {
 	switch version {
 
-	case actors.Version0:
+	case actorstypes.Version0:
 		return message0{from}
 
-	case actors.Version2:
+	case actorstypes.Version2:
 		return message2{message0{from}}
 
-	case actors.Version3:
+	case actorstypes.Version3:
 		return message3{message0{from}}
 
-	case actors.Version4:
+	case actorstypes.Version4:
 		return message4{message0{from}}
+
+	case actorstypes.Version5:
+		return message5{message0{from}}
+
+	case actorstypes.Version6:
+		return message6{message0{from}}
+
+	case actorstypes.Version7:
+		return message7{message0{from}}
+
+	case actorstypes.Version8:
+		return message8{message0{from}}
+
+	case actorstypes.Version9:
+		return message9{message0{from}}
+
+	case actorstypes.Version10:
+		return message10{message0{from}}
+
+	case actorstypes.Version11:
+		return message11{message0{from}}
 	default:
 		panic(fmt.Sprintf("unsupported actors version: %d", version))
 	}
@@ -124,12 +203,13 @@ type MessageBuilder interface {
 }
 
 // this type is the same between v0 and v2
-type ProposalHashData = msig4.ProposalHashData
-type ProposeReturn = msig4.ProposeReturn
-type ProposeParams = msig4.ProposeParams
+type ProposalHashData = msig11.ProposalHashData
+type ProposeReturn = msig11.ProposeReturn
+type ProposeParams = msig11.ProposeParams
+type ApproveReturn = msig11.ApproveReturn
 
 func txnParams(id uint64, data *ProposalHashData) ([]byte, error) {
-	params := msig4.TxnIDParams{ID: msig4.TxnID(id)}
+	params := msig11.TxnIDParams{ID: msig11.TxnID(id)}
 	if data != nil {
 		if data.Requester.Protocol() != address.ID {
 			return nil, xerrors.Errorf("proposer address must be an ID address, was %s", data.Requester)
@@ -149,4 +229,20 @@ func txnParams(id uint64, data *ProposalHashData) ([]byte, error) {
 	}
 
 	return actors.SerializeParams(&params)
+}
+
+func AllCodes() []cid.Cid {
+	return []cid.Cid{
+		(&state0{}).Code(),
+		(&state2{}).Code(),
+		(&state3{}).Code(),
+		(&state4{}).Code(),
+		(&state5{}).Code(),
+		(&state6{}).Code(),
+		(&state7{}).Code(),
+		(&state8{}).Code(),
+		(&state9{}).Code(),
+		(&state10{}).Code(),
+		(&state11{}).Code(),
+	}
 }

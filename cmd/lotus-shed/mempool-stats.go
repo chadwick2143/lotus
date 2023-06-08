@@ -13,11 +13,13 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/builtin"
+
 	lapi "github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
-	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
+	lbuiltin "github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
 )
@@ -75,8 +77,14 @@ type msgInfo struct {
 
 var mpoolStatsCmd = &cli.Command{
 	Name: "mpool-stats",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "http-server-timeout",
+			Value: "30s",
+		},
+	},
 	Action: func(cctx *cli.Context) error {
-		logging.SetLogLevel("rpc", "ERROR")
+		_ = logging.SetLogLevel("rpc", "ERROR")
 
 		if err := view.Register(AgeView, SizeView, InboundRate, InclusionRate, MsgWait); err != nil {
 			return err
@@ -91,8 +99,18 @@ var mpoolStatsCmd = &cli.Command{
 
 		http.Handle("/debug/metrics", expo)
 
+		timeout, err := time.ParseDuration(cctx.String("http-server-timeout"))
+		if err != nil {
+			return xerrors.Errorf("invalid time string %s: %x", cctx.String("http-server-timeout"), err)
+		}
+
 		go func() {
-			if err := http.ListenAndServe(":10555", nil); err != nil {
+			server := &http.Server{
+				Addr:              ":10555",
+				ReadHeaderTimeout: timeout,
+			}
+
+			if err := server.ListenAndServe(); err != nil {
 				panic(err)
 			}
 		}()
@@ -122,7 +140,7 @@ var mpoolStatsCmd = &cli.Command{
 				return false, err
 			}
 
-			ism := builtin.IsStorageMinerActor(act.Code)
+			ism := lbuiltin.IsStorageMinerActor(act.Code)
 			mcache[addr] = ism
 			return ism, nil
 		}
@@ -144,7 +162,7 @@ var mpoolStatsCmd = &cli.Command{
 						seen: time.Now(),
 					}
 
-					if u.Message.Message.Method == miner.Methods.SubmitWindowedPoSt {
+					if u.Message.Message.Method == builtin.MethodsMiner.SubmitWindowedPoSt {
 
 						miner, err := isMiner(u.Message.Message.To)
 						if err != nil {

@@ -7,7 +7,6 @@ import (
 
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/crypto"
-
 	"github.com/filecoin-project/test-vectors/schema"
 
 	"github.com/filecoin-project/lotus/api/v0api"
@@ -47,6 +46,7 @@ func (r *RecordingRand) loadHead() {
 
 func (r *RecordingRand) GetChainRandomness(ctx context.Context, pers crypto.DomainSeparationTag, round abi.ChainEpoch, entropy []byte) ([]byte, error) {
 	r.once.Do(r.loadHead)
+	// FullNode's v0 ChainGetRandomnessFromTickets handles whether we should be looking forward or back
 	ret, err := r.api.ChainGetRandomnessFromTickets(ctx, r.head, pers, round, entropy)
 	if err != nil {
 		return ret, err
@@ -72,7 +72,7 @@ func (r *RecordingRand) GetChainRandomness(ctx context.Context, pers crypto.Doma
 
 func (r *RecordingRand) GetBeaconRandomness(ctx context.Context, pers crypto.DomainSeparationTag, round abi.ChainEpoch, entropy []byte) ([]byte, error) {
 	r.once.Do(r.loadHead)
-	ret, err := r.api.ChainGetRandomnessFromBeacon(ctx, r.head, pers, round, entropy)
+	ret, err := r.api.StateGetRandomnessFromBeacon(ctx, pers, round, entropy, r.head)
 	if err != nil {
 		return ret, err
 	}

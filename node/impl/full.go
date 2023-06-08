@@ -4,9 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/libp2p/go-libp2p-core/peer"
-
 	logging "github.com/ipfs/go-log/v2"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/build"
@@ -14,6 +13,7 @@ import (
 	"github.com/filecoin-project/lotus/node/impl/common"
 	"github.com/filecoin-project/lotus/node/impl/full"
 	"github.com/filecoin-project/lotus/node/impl/market"
+	"github.com/filecoin-project/lotus/node/impl/net"
 	"github.com/filecoin-project/lotus/node/impl/paych"
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
 	"github.com/filecoin-project/lotus/node/modules/lp2p"
@@ -23,6 +23,7 @@ var log = logging.Logger("node")
 
 type FullNodeAPI struct {
 	common.CommonAPI
+	net.NetAPI
 	full.ChainAPI
 	client.API
 	full.MpoolAPI
@@ -33,14 +34,15 @@ type FullNodeAPI struct {
 	full.MsigAPI
 	full.WalletAPI
 	full.SyncAPI
-	full.BeaconAPI
+	full.RaftAPI
+	full.EthAPI
 
 	DS          dtypes.MetadataDS
 	NetworkName dtypes.NetworkName
 }
 
 func (n *FullNodeAPI) CreateBackup(ctx context.Context, fpath string) error {
-	return backup(n.DS, fpath)
+	return backup(ctx, n.DS, fpath)
 }
 
 func (n *FullNodeAPI) NodeStatus(ctx context.Context, inclChainStatus bool) (status api.NodeStatus, err error) {
@@ -115,6 +117,14 @@ func (n *FullNodeAPI) NodeStatus(ctx context.Context, inclChainStatus bool) (sta
 	}
 
 	return status, nil
+}
+
+func (n *FullNodeAPI) RaftState(ctx context.Context) (*api.RaftStateData, error) {
+	return n.RaftAPI.GetRaftState(ctx)
+}
+
+func (n *FullNodeAPI) RaftLeader(ctx context.Context) (peer.ID, error) {
+	return n.RaftAPI.Leader(ctx)
 }
 
 var _ api.FullNode = &FullNodeAPI{}

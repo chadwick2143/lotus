@@ -1,15 +1,20 @@
 package reward
 
 import (
-	"github.com/filecoin-project/go-state-types/abi"
+	"fmt"
+
 	"github.com/ipfs/go-cid"
 
-	"github.com/filecoin-project/lotus/chain/actors/adt"
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
-
+	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/filecoin-project/go-state-types/manifest"
 	miner0 "github.com/filecoin-project/specs-actors/actors/builtin/miner"
 	reward0 "github.com/filecoin-project/specs-actors/actors/builtin/reward"
 	smoothing0 "github.com/filecoin-project/specs-actors/actors/util/smoothing"
+
+	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 )
 
 var _ State = (*state0)(nil)
@@ -20,6 +25,12 @@ func load0(store adt.Store, root cid.Cid) (State, error) {
 	if err != nil {
 		return nil, err
 	}
+	return &out, nil
+}
+
+func make0(store adt.Store, currRealizedPower abi.StoragePower) (State, error) {
+	out := state0{store: store}
+	out.State = *reward0.ConstructState(currRealizedPower)
 	return &out, nil
 }
 
@@ -34,7 +45,7 @@ func (s *state0) ThisEpochReward() (abi.TokenAmount, error) {
 
 func (s *state0) ThisEpochRewardSmoothed() (builtin.FilterEstimate, error) {
 
-	return builtin.FromV0FilterEstimate(*s.State.ThisEpochRewardSmoothed), nil
+	return builtin.FilterEstimate(*s.State.ThisEpochRewardSmoothed), nil
 
 }
 
@@ -82,4 +93,25 @@ func (s *state0) PreCommitDepositForPower(networkQAPower builtin.FilterEstimate,
 			VelocityEstimate: networkQAPower.VelocityEstimate,
 		},
 		sectorWeight), nil
+}
+
+func (s *state0) GetState() interface{} {
+	return &s.State
+}
+
+func (s *state0) ActorKey() string {
+	return manifest.RewardKey
+}
+
+func (s *state0) ActorVersion() actorstypes.Version {
+	return actorstypes.Version0
+}
+
+func (s *state0) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

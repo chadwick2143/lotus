@@ -63,7 +63,7 @@ func (sm *mockStateManager) setPaychState(a address.Address, actor *types.Actor,
 	sm.paychState[a] = mockPchState{actor, state}
 }
 
-func (sm *mockStateManager) ResolveToKeyAddress(ctx context.Context, addr address.Address, ts *types.TipSet) (address.Address, error) {
+func (sm *mockStateManager) ResolveToDeterministicAddress(ctx context.Context, addr address.Address, ts *types.TipSet) (address.Address, error) {
 	sm.lk.Lock()
 	defer sm.lk.Unlock()
 	keyAddr, ok := sm.accountState[addr]
@@ -136,7 +136,7 @@ func newMockPaychAPI() *mockPaychAPI {
 func (pchapi *mockPaychAPI) StateWaitMsg(ctx context.Context, mcid cid.Cid, confidence uint64, limit abi.ChainEpoch, allowReplaced bool) (*api.MsgLookup, error) {
 	pchapi.lk.Lock()
 
-	response := make(chan types.MessageReceipt)
+	response := make(chan types.MessageReceipt, 1)
 
 	if response, ok := pchapi.waitingResponses[mcid]; ok {
 		defer pchapi.lk.Unlock()
@@ -151,8 +151,12 @@ func (pchapi *mockPaychAPI) StateWaitMsg(ctx context.Context, mcid cid.Cid, conf
 	pchapi.waitingCalls[mcid] = &waitingCall{response: response}
 	pchapi.lk.Unlock()
 
-	receipt := <-response
-	return &api.MsgLookup{Receipt: receipt}, nil
+	select {
+	case receipt := <-response:
+		return &api.MsgLookup{Receipt: receipt}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (pchapi *mockPaychAPI) receiveMsgResponse(mcid cid.Cid, receipt types.MessageReceipt) {
@@ -246,5 +250,5 @@ func (pchapi *mockPaychAPI) addSigningKey(key []byte) {
 }
 
 func (pchapi *mockPaychAPI) StateNetworkVersion(ctx context.Context, tsk types.TipSetKey) (network.Version, error) {
-	return build.NewestNetworkVersion, nil
+	return build.TestNetworkVersion, nil
 }

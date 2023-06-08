@@ -10,8 +10,8 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/big"
+
 	"github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
 )
@@ -19,27 +19,32 @@ import (
 var baseFeeUpperBoundFactor = types.NewInt(10)
 
 // CheckMessages performs a set of logic checks for a list of messages, prior to submitting it to the mpool
-func (mp *MessagePool) CheckMessages(protos []*api.MessagePrototype) ([][]api.MessageCheckStatus, error) {
+func (mp *MessagePool) CheckMessages(ctx context.Context, protos []*api.MessagePrototype) ([][]api.MessageCheckStatus, error) {
 	flex := make([]bool, len(protos))
 	msgs := make([]*types.Message, len(protos))
 	for i, p := range protos {
 		flex[i] = !p.ValidNonce
 		msgs[i] = &p.Message
 	}
-	return mp.checkMessages(msgs, false, flex)
+	return mp.checkMessages(ctx, msgs, false, flex)
 }
 
 // CheckPendingMessages performs a set of logical sets for all messages pending from a given actor
-func (mp *MessagePool) CheckPendingMessages(from address.Address) ([][]api.MessageCheckStatus, error) {
+func (mp *MessagePool) CheckPendingMessages(ctx context.Context, from address.Address) ([][]api.MessageCheckStatus, error) {
 	var msgs []*types.Message
-	mp.lk.Lock()
-	mset, ok := mp.pending[from]
+	mp.lk.RLock()
+	mset, ok, err := mp.getPendingMset(ctx, from)
+	if err != nil {
+		mp.lk.RUnlock()
+		return nil, xerrors.Errorf("errored while getting pending mset: %w", err)
+	}
 	if ok {
+		msgs = make([]*types.Message, 0, len(mset.msgs))
 		for _, sm := range mset.msgs {
 			msgs = append(msgs, &sm.Message)
 		}
 	}
-	mp.lk.Unlock()
+	mp.lk.RUnlock()
 
 	if len(msgs) == 0 {
 		return nil, nil
@@ -49,22 +54,26 @@ func (mp *MessagePool) CheckPendingMessages(from address.Address) ([][]api.Messa
 		return msgs[i].Nonce < msgs[j].Nonce
 	})
 
-	return mp.checkMessages(msgs, true, nil)
+	return mp.checkMessages(ctx, msgs, true, nil)
 }
 
 // CheckReplaceMessages performs a set of logical checks for related messages while performing a
 // replacement.
-func (mp *MessagePool) CheckReplaceMessages(replace []*types.Message) ([][]api.MessageCheckStatus, error) {
+func (mp *MessagePool) CheckReplaceMessages(ctx context.Context, replace []*types.Message) ([][]api.MessageCheckStatus, error) {
 	msgMap := make(map[address.Address]map[uint64]*types.Message)
 	count := 0
 
-	mp.lk.Lock()
+	mp.lk.RLock()
 	for _, m := range replace {
 		mmap, ok := msgMap[m.From]
 		if !ok {
 			mmap = make(map[uint64]*types.Message)
 			msgMap[m.From] = mmap
-			mset, ok := mp.pending[m.From]
+			mset, ok, err := mp.getPendingMset(ctx, m.From)
+			if err != nil {
+				mp.lk.RUnlock()
+				return nil, xerrors.Errorf("errored while getting pending mset: %w", err)
+			}
 			if ok {
 				count += len(mset.msgs)
 				for _, sm := range mset.msgs {
@@ -76,7 +85,7 @@ func (mp *MessagePool) CheckReplaceMessages(replace []*types.Message) ([][]api.M
 		}
 		mmap[m.Nonce] = m
 	}
-	mp.lk.Unlock()
+	mp.lk.RUnlock()
 
 	msgs := make([]*types.Message, 0, count)
 	start := 0
@@ -94,20 +103,20 @@ func (mp *MessagePool) CheckReplaceMessages(replace []*types.Message) ([][]api.M
 		start = end
 	}
 
-	return mp.checkMessages(msgs, true, nil)
+	return mp.checkMessages(ctx, msgs, true, nil)
 }
 
 // flexibleNonces should be either nil or of len(msgs), it signifies that message at given index
 // has non-determied nonce at this point
-func (mp *MessagePool) checkMessages(msgs []*types.Message, interned bool, flexibleNonces []bool) (result [][]api.MessageCheckStatus, err error) {
+func (mp *MessagePool) checkMessages(ctx context.Context, msgs []*types.Message, interned bool, flexibleNonces []bool) (result [][]api.MessageCheckStatus, err error) {
 	if mp.api.IsLite() {
 		return nil, nil
 	}
-	mp.curTsLk.Lock()
+	mp.curTsLk.RLock()
 	curTs := mp.curTs
-	mp.curTsLk.Unlock()
+	mp.curTsLk.RUnlock()
 
-	epoch := curTs.Height()
+	epoch := curTs.Height() + 1
 
 	var baseFee big.Int
 	if len(curTs.Blocks()) > 0 {
@@ -143,24 +152,28 @@ func (mp *MessagePool) checkMessages(msgs []*types.Message, interned bool, flexi
 
 		st, ok := state[m.From]
 		if !ok {
-			mp.lk.Lock()
-			mset, ok := mp.pending[m.From]
+			mp.lk.RLock()
+			mset, ok, err := mp.getPendingMset(ctx, m.From)
+			if err != nil {
+				mp.lk.RUnlock()
+				return nil, xerrors.Errorf("errored while getting pending mset: %w", err)
+			}
 			if ok && !interned {
 				st = &actorState{nextNonce: mset.nextNonce, requiredFunds: mset.requiredFunds}
 				for _, m := range mset.msgs {
 					st.requiredFunds = new(stdbig.Int).Add(st.requiredFunds, m.Message.Value.Int)
 				}
 				state[m.From] = st
-				mp.lk.Unlock()
+				mp.lk.RUnlock()
 
 				check.OK = true
 				check.Hint = map[string]interface{}{
 					"nonce": st.nextNonce,
 				}
 			} else {
-				mp.lk.Unlock()
+				mp.lk.RUnlock()
 
-				stateNonce, err := mp.getStateNonce(m.From, curTs)
+				stateNonce, err := mp.getStateNonce(ctx, m.From, curTs)
 				if err != nil {
 					check.OK = false
 					check.Err = fmt.Sprintf("error retrieving state nonce: %s", err.Error())
@@ -193,7 +206,7 @@ func (mp *MessagePool) checkMessages(msgs []*types.Message, interned bool, flexi
 
 		balance, ok := balances[m.From]
 		if !ok {
-			balance, err = mp.getStateBalance(m.From, curTs)
+			balance, err = mp.getStateBalance(ctx, m.From, curTs)
 			if err != nil {
 				check.OK = false
 				check.Err = fmt.Sprintf("error retrieving state balance: %s", err)
@@ -243,7 +256,7 @@ func (mp *MessagePool) checkMessages(msgs []*types.Message, interned bool, flexi
 			},
 		}
 
-		if len(bytes) > 32*1024-128 { // 128 bytes to account for signature size
+		if len(bytes) > MaxMessageSize-128 { // 128 bytes to account for signature size
 			check.OK = false
 			check.Err = "message too big"
 		} else {
@@ -259,8 +272,14 @@ func (mp *MessagePool) checkMessages(msgs []*types.Message, interned bool, flexi
 				Code: api.CheckStatusMessageValidity,
 			},
 		}
-
-		if err := m.ValidForBlockInclusion(0, build.NewestNetworkVersion); err != nil {
+		nv, err := mp.getNtwkVersion(epoch)
+		if err != nil {
+			check.OK = false
+			check.Err = fmt.Sprintf("error retrieving network version: %s", err.Error())
+		} else {
+			check.OK = true
+		}
+		if err := m.ValidForBlockInclusion(0, nv); err != nil {
 			check.OK = false
 			check.Err = fmt.Sprintf("syntactically invalid message: %s", err.Error())
 		} else {

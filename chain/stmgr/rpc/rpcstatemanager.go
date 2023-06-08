@@ -3,16 +3,17 @@ package rpcstmgr
 import (
 	"context"
 
+	cbor "github.com/ipfs/go-ipld-cbor"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
+
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/paych"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/types"
-	cbor "github.com/ipfs/go-ipld-cbor"
 )
 
 type RPCStateManager struct {
@@ -47,7 +48,7 @@ func (s *RPCStateManager) LookupID(ctx context.Context, addr address.Address, ts
 	return s.gapi.StateLookupID(ctx, addr, ts.Key())
 }
 
-func (s *RPCStateManager) ResolveToKeyAddress(ctx context.Context, addr address.Address, ts *types.TipSet) (address.Address, error) {
+func (s *RPCStateManager) ResolveToDeterministicAddress(ctx context.Context, addr address.Address, ts *types.TipSet) (address.Address, error) {
 	return s.gapi.StateAccountKey(ctx, addr, ts.Key())
 }
 

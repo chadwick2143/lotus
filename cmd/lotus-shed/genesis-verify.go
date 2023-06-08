@@ -6,8 +6,6 @@ import (
 	"os"
 	"sort"
 
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
-
 	"github.com/fatih/color"
 	"github.com/ipfs/go-datastore"
 	cbor "github.com/ipfs/go-ipld-cbor"
@@ -20,9 +18,12 @@ import (
 	"github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/account"
+	_init "github.com/filecoin-project/lotus/chain/actors/builtin/init"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/multisig"
+	"github.com/filecoin-project/lotus/chain/consensus/filcns"
 	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/store"
@@ -50,9 +51,9 @@ var genesisVerifyCmd = &cli.Command{
 		if !cctx.Args().Present() {
 			return fmt.Errorf("must pass genesis car file")
 		}
-		bs := blockstore.FromDatastore(datastore.NewMapDatastore())
+		bs := blockstore.NewMemory()
 
-		cs := store.NewChainStore(bs, bs, datastore.NewMapDatastore(), nil, nil)
+		cs := store.NewChainStore(bs, bs, datastore.NewMapDatastore(), filcns.Weight, nil)
 		defer cs.Close() //nolint:errcheck
 
 		cf := cctx.Args().Get(0)
@@ -61,14 +62,12 @@ var genesisVerifyCmd = &cli.Command{
 			return xerrors.Errorf("opening the car file: %w", err)
 		}
 
-		ts, err := cs.Import(f)
+		ts, err := cs.Import(cctx.Context, f)
 		if err != nil {
 			return err
 		}
 
-		sm := stmgr.NewStateManager(cs)
-
-		total, err := stmgr.CheckTotalFIL(context.TODO(), sm, ts)
+		total, err := stmgr.CheckTotalFIL(context.TODO(), cs, ts)
 		if err != nil {
 			return err
 		}
@@ -173,6 +172,24 @@ var genesisVerifyCmd = &cli.Command{
 			}
 			fmt.Printf("]\n")
 		}
+
+		act, err := stree.GetActor(_init.Address)
+		if err != nil {
+			return err
+		}
+
+		ias, err := _init.Load(store, act)
+		if err != nil {
+			return err
+		}
+
+		nn, err := ias.NetworkName()
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("Network name: ", nn)
+
 		return nil
 	},
 }

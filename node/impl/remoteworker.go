@@ -12,7 +12,7 @@ import (
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/api/client"
-	sectorstorage "github.com/filecoin-project/lotus/extern/sector-storage"
+	"github.com/filecoin-project/lotus/storage/sealer"
 )
 
 type remoteWorker struct {
@@ -38,6 +38,16 @@ func connectRemoteWorker(ctx context.Context, fa api.Common, url string) (*remot
 		return nil, xerrors.Errorf("creating jsonrpc client: %w", err)
 	}
 
+	wver, err := wapi.Version(ctx)
+	if err != nil {
+		closer()
+		return nil, err
+	}
+
+	if !wver.EqMajorMinor(api.WorkerAPIVersion0) {
+		return nil, xerrors.Errorf("unsupported worker api version: %s (expected %s)", wver, api.WorkerAPIVersion0)
+	}
+
 	return &remoteWorker{wapi, closer}, nil
 }
 
@@ -46,4 +56,4 @@ func (r *remoteWorker) Close() error {
 	return nil
 }
 
-var _ sectorstorage.Worker = &remoteWorker{}
+var _ sealer.Worker = &remoteWorker{}

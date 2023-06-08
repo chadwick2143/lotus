@@ -7,10 +7,9 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/libp2p/go-libp2p-core/host"
-	"github.com/libp2p/go-libp2p-core/network"
-	"github.com/libp2p/go-libp2p-core/peer"
-
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"go.opencensus.io/trace"
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
@@ -151,11 +150,19 @@ func (c *client) doRequest(
 // errors. Peer penalization should happen here then, before returning, so
 // we can apply the correct penalties depending on the cause of the error.
 // FIXME: Add the `peer` as argument once we implement penalties.
-func (c *client) processResponse(req *Request, res *Response, tipsets []*types.TipSet) (*validatedResponse, error) {
-	err := res.statusToError()
+func (c *client) processResponse(req *Request, res *Response, tipsets []*types.TipSet) (r *validatedResponse, err error) {
+	err = res.statusToError()
 	if err != nil {
 		return nil, xerrors.Errorf("status error: %s", err)
 	}
+
+	defer func() {
+		if rerr := recover(); rerr != nil {
+			log.Errorf("process response error: %s", rerr)
+			err = xerrors.Errorf("process response error: %s", rerr)
+			return
+		}
+	}()
 
 	options := parseOptions(req.Options)
 	if options.noOptionsSet() {
@@ -389,14 +396,14 @@ func (c *client) sendRequestToPeer(ctx context.Context, peer peer.ID, req *Reque
 	}()
 	// -- TRACE --
 
-	supported, err := c.host.Peerstore().SupportsProtocols(peer, BlockSyncProtocolID, ChainExchangeProtocolID)
+	supported, err := c.host.Peerstore().SupportsProtocols(peer, ChainExchangeProtocolID)
 	if err != nil {
 		c.RemovePeer(peer)
 		return nil, xerrors.Errorf("failed to get protocols for peer: %w", err)
 	}
-	if len(supported) == 0 || (supported[0] != BlockSyncProtocolID && supported[0] != ChainExchangeProtocolID) {
+	if len(supported) == 0 || (supported[0] != ChainExchangeProtocolID) {
 		return nil, xerrors.Errorf("peer %s does not support protocols %s",
-			peer, []string{BlockSyncProtocolID, ChainExchangeProtocolID})
+			peer, []string{ChainExchangeProtocolID})
 	}
 
 	connectionStart := build.Clock.Now()
@@ -405,7 +412,7 @@ func (c *client) sendRequestToPeer(ctx context.Context, peer peer.ID, req *Reque
 	stream, err := c.host.NewStream(
 		network.WithNoDial(ctx, "should already have connection"),
 		peer,
-		ChainExchangeProtocolID, BlockSyncProtocolID)
+		ChainExchangeProtocolID)
 	if err != nil {
 		c.RemovePeer(peer)
 		return nil, xerrors.Errorf("failed to open stream to peer: %w", err)
@@ -422,7 +429,10 @@ func (c *client) sendRequestToPeer(ctx context.Context, peer peer.ID, req *Reque
 		return nil, err
 	}
 	_ = stream.SetWriteDeadline(time.Time{}) // clear deadline // FIXME: Needs
-	//  its own API (https://github.com/libp2p/go-libp2p-core/issues/162).
+	//  its own API (https://github.com/libp2p/go-libp2p/core/issues/162).
+	if err := stream.CloseWrite(); err != nil {
+		log.Warnw("CloseWrite err", "error", err)
+	}
 
 	// Read response.
 	var res Response

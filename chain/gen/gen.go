@@ -3,17 +3,12 @@ package gen
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
 	"sync/atomic"
 	"time"
 
-	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/go-state-types/big"
-	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/google/uuid"
 	"github.com/ipfs/go-blockservice"
 	"github.com/ipfs/go-cid"
@@ -22,28 +17,36 @@ import (
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ipfs/go-merkledag"
 	"github.com/ipld/go-car"
-	"go.opencensus.io/trace"
 	"golang.org/x/xerrors"
 
-	proof2 "github.com/filecoin-project/specs-actors/v2/actors/runtime/proof"
+	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/crypto"
+	"github.com/filecoin-project/go-state-types/network"
+	proof7 "github.com/filecoin-project/specs-actors/v7/actors/runtime/proof"
 
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/blockstore"
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/beacon"
+	"github.com/filecoin-project/lotus/chain/consensus"
+	"github.com/filecoin-project/lotus/chain/consensus/filcns"
 	genesis2 "github.com/filecoin-project/lotus/chain/gen/genesis"
+	"github.com/filecoin-project/lotus/chain/index"
+	"github.com/filecoin-project/lotus/chain/rand"
 	"github.com/filecoin-project/lotus/chain/stmgr"
 	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/vm"
 	"github.com/filecoin-project/lotus/chain/wallet"
 	"github.com/filecoin-project/lotus/cmd/lotus-seed/seed"
-	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
 	"github.com/filecoin-project/lotus/genesis"
 	"github.com/filecoin-project/lotus/journal"
-	"github.com/filecoin-project/lotus/lib/sigs"
 	"github.com/filecoin-project/lotus/node/repo"
+	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
 const msgsPerBlock = 20
@@ -51,7 +54,7 @@ const msgsPerBlock = 20
 //nolint:deadcode,varcheck
 var log = logging.Logger("gen")
 
-var ValidWpostForTesting = []proof2.PoStProof{{
+var ValidWpostForTesting = []proof7.PoStProof{{
 	ProofBytes: []byte("valid proof"),
 }}
 
@@ -75,9 +78,10 @@ type ChainGen struct {
 
 	w *wallet.LocalWallet
 
-	eppProvs    map[address.Address]WinningPoStProver
-	Miners      []address.Address
-	receivers   []address.Address
+	eppProvs  map[address.Address]WinningPoStProver
+	Miners    []address.Address
+	receivers []address.Address
+	// a SecP address
 	banker      address.Address
 	bankerNonce uint64
 
@@ -110,7 +114,7 @@ var DefaultRemainderAccountActor = genesis.Actor{
 	Meta:    remAccMeta.ActorMeta(),
 }
 
-func NewGeneratorWithSectors(numSectors int) (*ChainGen, error) {
+func NewGeneratorWithSectorsAndUpgradeSchedule(numSectors int, us stmgr.UpgradeSchedule) (*ChainGen, error) {
 	j := journal.NilJournal()
 	// TODO: we really shouldn't modify a global variable here.
 	policy.SetSupportedProofTypes(abi.RegisteredSealProof_StackedDrg2KiBV1)
@@ -164,7 +168,7 @@ func NewGeneratorWithSectors(numSectors int) (*ChainGen, error) {
 
 	maddr1 := genesis2.MinerAddress(0)
 
-	m1temp, err := ioutil.TempDir("", "preseal")
+	m1temp, err := os.MkdirTemp("", "preseal")
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +180,7 @@ func NewGeneratorWithSectors(numSectors int) (*ChainGen, error) {
 
 	maddr2 := genesis2.MinerAddress(1)
 
-	m2temp, err := ioutil.TempDir("", "preseal")
+	m2temp, err := os.MkdirTemp("", "preseal")
 	if err != nil {
 		return nil, err
 	}
@@ -198,6 +202,7 @@ func NewGeneratorWithSectors(numSectors int) (*ChainGen, error) {
 	sys := vm.Syscalls(&genFakeVerifier{})
 
 	tpl := genesis.Template{
+		NetworkVersion: network.Version0,
 		Accounts: []genesis.Actor{
 			{
 				Type:    genesis.TAccount,
@@ -230,12 +235,12 @@ func NewGeneratorWithSectors(numSectors int) (*ChainGen, error) {
 		return nil, xerrors.Errorf("make genesis block failed: %w", err)
 	}
 
-	cs := store.NewChainStore(bs, bs, ds, sys, j)
+	cs := store.NewChainStore(bs, bs, ds, filcns.Weight, j)
 
 	genfb := &types.FullBlock{Header: genb.Genesis}
 	gents := store.NewFullTipSet([]*types.FullBlock{genfb})
 
-	if err := cs.SetGenesis(genb.Genesis); err != nil {
+	if err := cs.SetGenesis(context.TODO(), genb.Genesis); err != nil {
 		return nil, xerrors.Errorf("set genesis failed: %w", err)
 	}
 
@@ -244,8 +249,6 @@ func NewGeneratorWithSectors(numSectors int) (*ChainGen, error) {
 		mgen[genesis2.MinerAddress(uint64(i))] = &wppProvider{}
 	}
 
-	sm := stmgr.NewStateManager(cs)
-
 	miners := []address.Address{maddr1, maddr2}
 
 	beac := beacon.Schedule{{Start: 0, Beacon: beacon.NewMockBeacon(time.Second)}}
@@ -253,6 +256,11 @@ func NewGeneratorWithSectors(numSectors int) (*ChainGen, error) {
 	//if err != nil {
 	//return nil, xerrors.Errorf("creating drand beacon: %w", err)
 	//}
+
+	sm, err := stmgr.NewStateManager(cs, consensus.NewTipSetExecutor(filcns.RewardFunc), sys, us, beac, ds, index.DummyMsgIndex)
+	if err != nil {
+		return nil, xerrors.Errorf("initing stmgr: %w", err)
+	}
 
 	gen := &ChainGen{
 		bs:           bs,
@@ -282,6 +290,18 @@ func NewGenerator() (*ChainGen, error) {
 	return NewGeneratorWithSectors(1)
 }
 
+func NewGeneratorWithSectors(numSectors int) (*ChainGen, error) {
+	return NewGeneratorWithSectorsAndUpgradeSchedule(numSectors, filcns.DefaultUpgradeSchedule())
+}
+
+func NewGeneratorWithUpgradeSchedule(us stmgr.UpgradeSchedule) (*ChainGen, error) {
+	return NewGeneratorWithSectorsAndUpgradeSchedule(1, us)
+}
+
+func (cg *ChainGen) Blockstore() blockstore.Blockstore {
+	return cg.bs
+}
+
 func (cg *ChainGen) StateManager() *stmgr.StateManager {
 	return cg.sm
 }
@@ -292,6 +312,10 @@ func (cg *ChainGen) SetStateManager(sm *stmgr.StateManager) {
 
 func (cg *ChainGen) ChainStore() *store.ChainStore {
 	return cg.cs
+}
+
+func (cg *ChainGen) BeaconSchedule() beacon.Schedule {
+	return cg.beacon
 }
 
 func (cg *ChainGen) Genesis() *types.BlockHeader {
@@ -352,7 +376,7 @@ func (cg *ChainGen) nextBlockProof(ctx context.Context, pts *types.TipSet, m add
 		buf.Write(pts.MinTicket().VRFProof)
 	}
 
-	ticketRand, err := store.DrawRandomness(rbase.Data, crypto.DomainSeparationTag_TicketProduction, round-build.TicketRandomnessLookback, buf.Bytes())
+	ticketRand, err := rand.DrawRandomness(rbase.Data, crypto.DomainSeparationTag_TicketProduction, round-build.TicketRandomnessLookback, buf.Bytes())
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -384,12 +408,15 @@ type MinedTipSet struct {
 }
 
 func (cg *ChainGen) NextTipSet() (*MinedTipSet, error) {
-	mts, err := cg.NextTipSetFromMiners(cg.CurTipset.TipSet(), cg.Miners)
+	return cg.NextTipSetWithNulls(0)
+}
+
+func (cg *ChainGen) NextTipSetWithNulls(nulls abi.ChainEpoch) (*MinedTipSet, error) {
+	mts, err := cg.NextTipSetFromMiners(cg.CurTipset.TipSet(), cg.Miners, nulls)
 	if err != nil {
 		return nil, err
 	}
 
-	cg.CurTipset = mts.TipSet
 	return mts, nil
 }
 
@@ -397,7 +424,7 @@ func (cg *ChainGen) SetWinningPoStProver(m address.Address, wpp WinningPoStProve
 	cg.eppProvs[m] = wpp
 }
 
-func (cg *ChainGen) NextTipSetFromMiners(base *types.TipSet, miners []address.Address) (*MinedTipSet, error) {
+func (cg *ChainGen) NextTipSetFromMiners(base *types.TipSet, miners []address.Address, nulls abi.ChainEpoch) (*MinedTipSet, error) {
 	ms, err := cg.GetMessages(cg)
 	if err != nil {
 		return nil, xerrors.Errorf("get random messages: %w", err)
@@ -408,10 +435,12 @@ func (cg *ChainGen) NextTipSetFromMiners(base *types.TipSet, miners []address.Ad
 		msgs[i] = ms
 	}
 
-	fts, err := cg.NextTipSetFromMinersWithMessages(base, miners, msgs)
+	fts, err := cg.NextTipSetFromMinersWithMessagesAndNulls(base, miners, msgs, nulls)
 	if err != nil {
 		return nil, err
 	}
+
+	cg.CurTipset = fts
 
 	return &MinedTipSet{
 		TipSet:   fts,
@@ -419,10 +448,10 @@ func (cg *ChainGen) NextTipSetFromMiners(base *types.TipSet, miners []address.Ad
 	}, nil
 }
 
-func (cg *ChainGen) NextTipSetFromMinersWithMessages(base *types.TipSet, miners []address.Address, msgs [][]*types.SignedMessage) (*store.FullTipSet, error) {
+func (cg *ChainGen) NextTipSetFromMinersWithMessagesAndNulls(base *types.TipSet, miners []address.Address, msgs [][]*types.SignedMessage, nulls abi.ChainEpoch) (*store.FullTipSet, error) {
 	var blks []*types.FullBlock
 
-	for round := base.Height() + 1; len(blks) == 0; round++ {
+	for round := base.Height() + nulls + 1; len(blks) == 0; round++ {
 		for mi, m := range miners {
 			bvals, et, ticket, err := cg.nextBlockProof(context.TODO(), base, m, round)
 			if err != nil {
@@ -431,7 +460,7 @@ func (cg *ChainGen) NextTipSetFromMinersWithMessages(base *types.TipSet, miners 
 
 			if et != nil {
 				// TODO: maybe think about passing in more real parameters to this?
-				wpost, err := cg.eppProvs[m].ComputeProof(context.TODO(), nil, nil)
+				wpost, err := cg.eppProvs[m].ComputeProof(context.TODO(), nil, nil, round, network.Version0)
 				if err != nil {
 					return nil, err
 				}
@@ -439,10 +468,6 @@ func (cg *ChainGen) NextTipSetFromMinersWithMessages(base *types.TipSet, miners 
 				fblk, err := cg.makeBlock(base, m, ticket, et, bvals, round, wpost, msgs[mi])
 				if err != nil {
 					return nil, xerrors.Errorf("making a block for next tipset failed: %w", err)
-				}
-
-				if err := cg.cs.PersistBlockHeaders(fblk.Header); err != nil {
-					return nil, xerrors.Errorf("chainstore AddBlock: %w", err)
 				}
 
 				blks = append(blks, fblk)
@@ -455,12 +480,14 @@ func (cg *ChainGen) NextTipSetFromMinersWithMessages(base *types.TipSet, miners 
 		return nil, err
 	}
 
+	cg.CurTipset = fts
+
 	return fts, nil
 }
 
 func (cg *ChainGen) makeBlock(parents *types.TipSet, m address.Address, vrfticket *types.Ticket,
 	eticket *types.ElectionProof, bvals []types.BeaconEntry, height abi.ChainEpoch,
-	wpost []proof2.PoStProof, msgs []*types.SignedMessage) (*types.FullBlock, error) {
+	wpost []proof7.PoStProof, msgs []*types.SignedMessage) (*types.FullBlock, error) {
 
 	var ts uint64
 	if cg.Timestamper != nil {
@@ -469,7 +496,7 @@ func (cg *ChainGen) makeBlock(parents *types.TipSet, m address.Address, vrfticke
 		ts = parents.MinTimestamp() + uint64(height-parents.Height())*build.BlockDelaySecs
 	}
 
-	fblk, err := MinerCreateBlock(context.TODO(), cg.sm, cg.w, &api.BlockTemplate{
+	fblk, err := filcns.NewFilecoinExpectedConsensus(cg.sm, nil, nil, nil).CreateBlock(context.TODO(), cg.w, &api.BlockTemplate{
 		Miner:            m,
 		Parents:          parents.Key(),
 		Ticket:           vrfticket,
@@ -553,8 +580,8 @@ func (cg *ChainGen) YieldRepo() (repo.Repo, error) {
 }
 
 type MiningCheckAPI interface {
-	ChainGetRandomnessFromBeacon(ctx context.Context, tsk types.TipSetKey, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte) (abi.Randomness, error)
-	ChainGetRandomnessFromTickets(ctx context.Context, tsk types.TipSetKey, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte) (abi.Randomness, error)
+	StateGetRandomnessFromBeacon(ctx context.Context, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte, tsk types.TipSetKey) (abi.Randomness, error)
+	StateGetRandomnessFromTickets(ctx context.Context, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte, tsk types.TipSetKey) (abi.Randomness, error)
 
 	MinerGetBaseInfo(context.Context, address.Address, abi.ChainEpoch, types.TipSetKey) (*api.MiningBaseInfo, error)
 
@@ -564,26 +591,16 @@ type MiningCheckAPI interface {
 type mca struct {
 	w   *wallet.LocalWallet
 	sm  *stmgr.StateManager
-	pv  ffiwrapper.Verifier
+	pv  storiface.Verifier
 	bcn beacon.Schedule
 }
 
-func (mca mca) ChainGetRandomnessFromTickets(ctx context.Context, tsk types.TipSetKey, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte) (abi.Randomness, error) {
-	pts, err := mca.sm.ChainStore().LoadTipSet(tsk)
-	if err != nil {
-		return nil, xerrors.Errorf("loading tipset key: %w", err)
-	}
-
-	return mca.sm.ChainStore().GetChainRandomness(ctx, pts.Cids(), personalization, randEpoch, entropy)
+func (mca mca) StateGetRandomnessFromTickets(ctx context.Context, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte, tsk types.TipSetKey) (abi.Randomness, error) {
+	return mca.sm.GetRandomnessFromTickets(ctx, personalization, randEpoch, entropy, tsk)
 }
 
-func (mca mca) ChainGetRandomnessFromBeacon(ctx context.Context, tsk types.TipSetKey, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte) (abi.Randomness, error) {
-	pts, err := mca.sm.ChainStore().LoadTipSet(tsk)
-	if err != nil {
-		return nil, xerrors.Errorf("loading tipset key: %w", err)
-	}
-
-	return mca.sm.ChainStore().GetBeaconRandomness(ctx, pts.Cids(), personalization, randEpoch, entropy)
+func (mca mca) StateGetRandomnessFromBeacon(ctx context.Context, personalization crypto.DomainSeparationTag, randEpoch abi.ChainEpoch, entropy []byte, tsk types.TipSetKey) (abi.Randomness, error) {
+	return mca.sm.GetRandomnessFromBeacon(ctx, personalization, randEpoch, entropy, tsk)
 }
 
 func (mca mca) MinerGetBaseInfo(ctx context.Context, maddr address.Address, epoch abi.ChainEpoch, tsk types.TipSetKey) (*api.MiningBaseInfo, error) {
@@ -598,7 +615,7 @@ func (mca mca) WalletSign(ctx context.Context, a address.Address, v []byte) (*cr
 
 type WinningPoStProver interface {
 	GenerateCandidates(context.Context, abi.PoStRandomness, uint64) ([]uint64, error)
-	ComputeProof(context.Context, []proof2.SectorInfo, abi.PoStRandomness) ([]proof2.PoStProof, error)
+	ComputeProof(context.Context, []proof7.ExtendedSectorInfo, abi.PoStRandomness, abi.ChainEpoch, network.Version) ([]proof7.PoStProof, error)
 }
 
 type wppProvider struct{}
@@ -607,11 +624,9 @@ func (wpp *wppProvider) GenerateCandidates(ctx context.Context, _ abi.PoStRandom
 	return []uint64{0}, nil
 }
 
-func (wpp *wppProvider) ComputeProof(context.Context, []proof2.SectorInfo, abi.PoStRandomness) ([]proof2.PoStProof, error) {
+func (wpp *wppProvider) ComputeProof(context.Context, []proof7.ExtendedSectorInfo, abi.PoStRandomness, abi.ChainEpoch, network.Version) ([]proof7.PoStProof, error) {
 	return ValidWpostForTesting, nil
 }
-
-var b64 = base64.URLEncoding.WithPadding(base64.NoPadding)
 
 func IsRoundWinner(ctx context.Context, ts *types.TipSet, round abi.ChainEpoch,
 	miner address.Address, brand types.BeaconEntry, mbi *api.MiningBaseInfo, a MiningCheckAPI) (*types.ElectionProof, error) {
@@ -621,7 +636,7 @@ func IsRoundWinner(ctx context.Context, ts *types.TipSet, round abi.ChainEpoch,
 		return nil, xerrors.Errorf("failed to cbor marshal address: %w", err)
 	}
 
-	electionRand, err := store.DrawRandomness(brand.Data, crypto.DomainSeparationTag_ElectionProofProduction, round, buf.Bytes())
+	electionRand, err := rand.DrawRandomness(brand.Data, crypto.DomainSeparationTag_ElectionProofProduction, round, buf.Bytes())
 	if err != nil {
 		return nil, xerrors.Errorf("failed to draw randomness: %w", err)
 	}
@@ -634,15 +649,6 @@ func IsRoundWinner(ctx context.Context, ts *types.TipSet, round abi.ChainEpoch,
 	ep := &types.ElectionProof{VRFProof: vrfout}
 	j := ep.ComputeWinCount(mbi.MinerPower, mbi.NetworkPower)
 	ep.WinCount = j
-
-	log.Infow("completed winAttemptVRF",
-		"beaconRound", brand.Round,
-		"beaconDataB64", b64.EncodeToString(brand.Data),
-		"electionRandB64", b64.EncodeToString(electionRand),
-		"vrfB64", b64.EncodeToString(vrfout),
-		"winCount", j,
-	)
-
 	if j < 1 {
 		return nil, nil
 	}
@@ -651,22 +657,6 @@ func IsRoundWinner(ctx context.Context, ts *types.TipSet, round abi.ChainEpoch,
 }
 
 type SignFunc func(context.Context, address.Address, []byte) (*crypto.Signature, error)
-
-func VerifyVRF(ctx context.Context, worker address.Address, vrfBase, vrfproof []byte) error {
-	_, span := trace.StartSpan(ctx, "VerifyVRF")
-	defer span.End()
-
-	sig := &crypto.Signature{
-		Type: crypto.SigTypeBLS,
-		Data: vrfproof,
-	}
-
-	if err := sigs.Verify(sig, worker, vrfBase); err != nil {
-		return xerrors.Errorf("vrf was invalid: %w", err)
-	}
-
-	return nil
-}
 
 func ComputeVRF(ctx context.Context, sign SignFunc, worker address.Address, sigInput []byte) ([]byte, error) {
 	sig, err := sign(ctx, worker, sigInput)
@@ -683,17 +673,25 @@ func ComputeVRF(ctx context.Context, sign SignFunc, worker address.Address, sigI
 
 type genFakeVerifier struct{}
 
-var _ ffiwrapper.Verifier = (*genFakeVerifier)(nil)
+var _ storiface.Verifier = (*genFakeVerifier)(nil)
 
-func (m genFakeVerifier) VerifySeal(svi proof2.SealVerifyInfo) (bool, error) {
+func (m genFakeVerifier) VerifySeal(svi proof7.SealVerifyInfo) (bool, error) {
 	return true, nil
 }
 
-func (m genFakeVerifier) VerifyWinningPoSt(ctx context.Context, info proof2.WinningPoStVerifyInfo) (bool, error) {
+func (m genFakeVerifier) VerifyAggregateSeals(aggregate proof7.AggregateSealVerifyProofAndInfos) (bool, error) {
 	panic("not supported")
 }
 
-func (m genFakeVerifier) VerifyWindowPoSt(ctx context.Context, info proof2.WindowPoStVerifyInfo) (bool, error) {
+func (m genFakeVerifier) VerifyReplicaUpdate(update proof7.ReplicaUpdateInfo) (bool, error) {
+	panic("not supported")
+}
+
+func (m genFakeVerifier) VerifyWinningPoSt(ctx context.Context, info proof7.WinningPoStVerifyInfo) (bool, error) {
+	panic("not supported")
+}
+
+func (m genFakeVerifier) VerifyWindowPoSt(ctx context.Context, info proof7.WindowPoStVerifyInfo) (bool, error) {
 	panic("not supported")
 }
 

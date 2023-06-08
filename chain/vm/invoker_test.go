@@ -1,27 +1,41 @@
+// stm: #unit
 package vm
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"testing"
 
-	"github.com/filecoin-project/go-state-types/network"
-
+	cid "github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	"github.com/stretchr/testify/assert"
 	cbg "github.com/whyrusleeping/cbor-gen"
 
+	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
+	cbor2 "github.com/filecoin-project/go-state-types/cbor"
 	"github.com/filecoin-project/go-state-types/exitcode"
-
+	"github.com/filecoin-project/go-state-types/network"
+	"github.com/filecoin-project/go-state-types/rt"
 	runtime2 "github.com/filecoin-project/specs-actors/v2/actors/runtime"
 
 	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/aerrors"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 )
 
 type basicContract struct{}
+
+func (b basicContract) Code() cid.Cid {
+	return cid.Undef
+}
+
+func (b basicContract) State() cbor2.Er {
+	// works well enough as a dummy state
+	return new(basicParams)
+}
+
 type basicParams struct {
 	B byte
 }
@@ -80,16 +94,42 @@ func (basicContract) InvokeSomething10(rt runtime2.Runtime, params *basicParams)
 	return nil
 }
 
+type basicRtMessage struct{}
+
+var _ runtime2.Message = (*basicRtMessage)(nil)
+
+func (*basicRtMessage) Caller() address.Address {
+	a, err := address.NewIDAddress(0)
+	if err != nil {
+		panic(err)
+	}
+	return a
+}
+
+func (*basicRtMessage) Receiver() address.Address {
+	a, err := address.NewIDAddress(1)
+	if err != nil {
+		panic(err)
+	}
+	return a
+}
+
+func (*basicRtMessage) ValueReceived() abi.TokenAmount {
+	return big.NewInt(0)
+}
+
 func TestInvokerBasic(t *testing.T) {
+	//stm: @INVOKER_TRANSFORM_001
 	inv := ActorRegistry{}
-	code, err := inv.transform(basicContract{})
+	registry := builtin.MakeRegistryLegacy([]rt.VMActor{basicContract{}})
+	code, err := inv.transform(registry[0])
 	assert.NoError(t, err)
 
 	{
 		bParam, err := actors.SerializeParams(&basicParams{B: 1})
 		assert.NoError(t, err)
 
-		_, aerr := code[0](&Runtime{}, bParam)
+		_, aerr := code[0](&Runtime{Message: &basicRtMessage{}}, bParam)
 
 		assert.Equal(t, exitcode.ExitCode(1), aerrors.RetCode(aerr), "return code should be 1")
 		if aerrors.IsFatal(aerr) {
@@ -101,7 +141,7 @@ func TestInvokerBasic(t *testing.T) {
 		bParam, err := actors.SerializeParams(&basicParams{B: 2})
 		assert.NoError(t, err)
 
-		_, aerr := code[10](&Runtime{}, bParam)
+		_, aerr := code[10](&Runtime{Message: &basicRtMessage{}}, bParam)
 		assert.Equal(t, exitcode.ExitCode(12), aerrors.RetCode(aerr), "return code should be 12")
 		if aerrors.IsFatal(aerr) {
 			t.Fatal("err should not be fatal")
@@ -110,9 +150,8 @@ func TestInvokerBasic(t *testing.T) {
 
 	{
 		_, aerr := code[1](&Runtime{
-			vm: &VM{ntwkVersion: func(ctx context.Context, epoch abi.ChainEpoch) network.Version {
-				return network.Version0
-			}},
+			vm:      &LegacyVM{networkVersion: network.Version0},
+			Message: &basicRtMessage{},
 		}, []byte{99})
 		if aerrors.IsFatal(aerr) {
 			t.Fatal("err should not be fatal")
@@ -122,9 +161,8 @@ func TestInvokerBasic(t *testing.T) {
 
 	{
 		_, aerr := code[1](&Runtime{
-			vm: &VM{ntwkVersion: func(ctx context.Context, epoch abi.ChainEpoch) network.Version {
-				return network.Version7
-			}},
+			vm:      &LegacyVM{networkVersion: network.Version7},
+			Message: &basicRtMessage{},
 		}, []byte{99})
 		if aerrors.IsFatal(aerr) {
 			t.Fatal("err should not be fatal")

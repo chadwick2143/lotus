@@ -1,3 +1,4 @@
+// stm: #unit
 package adt
 
 import (
@@ -5,14 +6,12 @@ import (
 	"context"
 	"testing"
 
+	cbornode "github.com/ipfs/go-ipld-cbor"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	cbornode "github.com/ipfs/go-ipld-cbor"
 	typegen "github.com/whyrusleeping/cbor-gen"
 
 	"github.com/filecoin-project/go-state-types/abi"
-
 	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
 	adt2 "github.com/filecoin-project/specs-actors/v2/actors/util/adt"
 
@@ -44,6 +43,7 @@ func TestDiffAdtArray(t *testing.T) {
 
 	changes := new(TestDiffArray)
 
+	//stm: @CHAIN_ADT_ARRAY_DIFF_001
 	assert.NoError(t, DiffAdtArray(arrA, arrB, changes))
 	assert.NotNil(t, changes)
 
@@ -98,6 +98,7 @@ func TestDiffAdtMap(t *testing.T) {
 
 	changes := new(TestDiffMap)
 
+	//stm: @CHAIN_ADT_MAP_DIFF_001
 	assert.NoError(t, DiffAdtMap(mapA, mapB, changes))
 	assert.NotNil(t, changes)
 

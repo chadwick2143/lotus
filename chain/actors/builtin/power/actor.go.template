@@ -1,9 +1,11 @@
 package power
 
 import (
+	"github.com/ipfs/go-cid"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/big"
-	"github.com/ipfs/go-cid"
+	"github.com/filecoin-project/lotus/chain/actors"
 	cbg "github.com/whyrusleeping/cbor-gen"
 	"golang.org/x/xerrors"
 
@@ -13,17 +15,15 @@ import (
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/types"
-{{range .versions}}
-	builtin{{.}} "github.com/filecoin-project/specs-actors{{import .}}actors/builtin"
-{{end}}
-)
+	"github.com/filecoin-project/go-state-types/manifest"
 
-func init() {
 {{range .versions}}
-	builtin.RegisterActorState(builtin{{.}}.StoragePowerActorCodeID, func(store adt.Store, root cid.Cid) (cbor.Marshaler, error) {
-		return load{{.}}(store, root)
-	})
-{{end}}}
+    {{if (le . 7)}}
+	    builtin{{.}} "github.com/filecoin-project/specs-actors{{import .}}actors/builtin"
+    {{end}}
+{{end}}
+    builtin{{.latestVersion}} "github.com/filecoin-project/go-state-types/builtin"
+)
 
 var (
 	Address = builtin{{.latestVersion}}.StoragePowerActorAddr
@@ -31,22 +31,55 @@ var (
 )
 
 func Load(store adt.Store, act *types.Actor) (State, error) {
+	if name, av, ok := actors.GetActorMetaByCode(act.Code); ok {
+       if name != manifest.PowerKey {
+          return nil, xerrors.Errorf("actor code is not power: %s", name)
+       }
+
+       switch av {
+            {{range .versions}}
+                {{if (ge . 8)}}
+                case actorstypes.Version{{.}}:
+                     return load{{.}}(store, act.Head)
+                 {{end}}
+            {{end}}
+       }
+	}
+
 	switch act.Code {
 {{range .versions}}
-	case builtin{{.}}.StoragePowerActorCodeID:
-		return load{{.}}(store, act.Head)
+    {{if (le . 7)}}
+        case builtin{{.}}.StoragePowerActorCodeID:
+            return load{{.}}(store, act.Head)
+    {{end}}
 {{end}}
 	}
+
 	return nil, xerrors.Errorf("unknown actor code %s", act.Code)
+}
+
+func MakeState(store adt.Store, av actorstypes.Version) (State, error) {
+	switch av {
+{{range .versions}}
+	case actorstypes.Version{{.}}:
+		return make{{.}}(store)
+{{end}}
+}
+	return nil, xerrors.Errorf("unknown actor version %d", av)
 }
 
 type State interface {
 	cbor.Marshaler
 
+    Code() cid.Cid
+    ActorKey() string
+    ActorVersion() actorstypes.Version
+
 	TotalLocked() (abi.TokenAmount, error)
 	TotalPower() (Claim, error)
 	TotalCommitted() (Claim, error)
 	TotalPowerSmoothed() (builtin.FilterEstimate, error)
+	GetState() interface{}
 
 	// MinerCounts returns the number of miners. Participating is the number
 	// with power above the minimum miner threshold.
@@ -56,6 +89,12 @@ type State interface {
 	ListAllMiners() ([]address.Address, error)
 	ForEachClaim(func(miner address.Address, claim Claim) error) error
 	ClaimsChanged(State) (bool, error)
+
+	// Testing or genesis setup only
+	SetTotalQualityAdjPower(abi.StoragePower) error
+	SetTotalRawBytePower(abi.StoragePower) error
+	SetThisEpochQualityAdjPower(abi.StoragePower) error
+	SetThisEpochRawBytePower(abi.StoragePower) error
 
 	// Diff helpers. Used by Diff* functions internally.
 	claims() (adt.Map, error)
@@ -75,4 +114,11 @@ func AddClaims(a Claim, b Claim) Claim {
 		RawBytePower:    big.Add(a.RawBytePower, b.RawBytePower),
 		QualityAdjPower: big.Add(a.QualityAdjPower, b.QualityAdjPower),
 	}
+}
+
+func AllCodes() []cid.Cid {
+	return []cid.Cid{ {{range .versions}}
+        (&state{{.}}{}).Code(),
+    {{- end}}
+    }
 }

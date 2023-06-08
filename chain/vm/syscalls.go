@@ -17,17 +17,18 @@ import (
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/network"
+	runtime7 "github.com/filecoin-project/specs-actors/v7/actors/runtime"
+	proof7 "github.com/filecoin-project/specs-actors/v7/actors/runtime/proof"
+
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/actors/policy"
 	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/types"
-	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
 	"github.com/filecoin-project/lotus/lib/sigs"
-
-	runtime2 "github.com/filecoin-project/specs-actors/v2/actors/runtime"
-	proof2 "github.com/filecoin-project/specs-actors/v2/actors/runtime/proof"
+	"github.com/filecoin-project/lotus/storage/sealer/ffiwrapper"
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
 func init() {
@@ -36,10 +37,10 @@ func init() {
 
 // Actual type is defined in chain/types/vmcontext.go because the VMContext interface is there
 
-type SyscallBuilder func(ctx context.Context, rt *Runtime) runtime2.Syscalls
+type SyscallBuilder func(ctx context.Context, rt *Runtime) runtime7.Syscalls
 
-func Syscalls(verifier ffiwrapper.Verifier) SyscallBuilder {
-	return func(ctx context.Context, rt *Runtime) runtime2.Syscalls {
+func Syscalls(verifier storiface.Verifier) SyscallBuilder {
+	return func(ctx context.Context, rt *Runtime) runtime7.Syscalls {
 
 		return &syscallShim{
 			ctx:            ctx,
@@ -65,7 +66,7 @@ type syscallShim struct {
 	actor          address.Address
 	cstate         *state.StateTree
 	cst            cbor.IpldStore
-	verifier       ffiwrapper.Verifier
+	verifier       storiface.Verifier
 }
 
 func (ss *syscallShim) ComputeUnsealedSectorCID(st abi.RegisteredSealProof, pieces []abi.PieceInfo) (cid.Cid, error) {
@@ -90,7 +91,7 @@ func (ss *syscallShim) HashBlake2b(data []byte) [32]byte {
 // Checks validity of the submitted consensus fault with the two block headers needed to prove the fault
 // and an optional extra one to check common ancestry (as needed).
 // Note that the blocks are ordered: the method requires a.Epoch() <= b.Epoch().
-func (ss *syscallShim) VerifyConsensusFault(a, b, extra []byte) (*runtime2.ConsensusFault, error) {
+func (ss *syscallShim) VerifyConsensusFault(a, b, extra []byte) (*runtime7.ConsensusFault, error) {
 	// Note that block syntax is not validated. Any validly signed block will be accepted pursuant to the below conditions.
 	// Whether or not it could ever have been accepted in a chain is not checked/does not matter here.
 	// for that reason when checking block parent relationships, rather than instantiating a Tipset to do so
@@ -104,8 +105,18 @@ func (ss *syscallShim) VerifyConsensusFault(a, b, extra []byte) (*runtime2.Conse
 		return nil, xerrors.Errorf("cannot decode first block header: %w", decodeErr)
 	}
 
+	// A _valid_ block must use an ID address, but that's not what we're checking here. We're
+	// just making sure that adding additional address protocols won't lead to consensus issues.
+	if !abi.AddressValidForNetworkVersion(blockA.Miner, ss.networkVersion) {
+		return nil, xerrors.Errorf("address protocol unsupported in current network version: %d", blockA.Miner.Protocol())
+	}
+
 	if decodeErr := blockB.UnmarshalCBOR(bytes.NewReader(b)); decodeErr != nil {
 		return nil, xerrors.Errorf("cannot decode second block header: %f", decodeErr)
+	}
+
+	if !abi.AddressValidForNetworkVersion(blockB.Miner, ss.networkVersion) {
+		return nil, xerrors.Errorf("address protocol unsupported in current network version: %d", blockB.Miner.Protocol())
 	}
 
 	// workaround chain halt
@@ -133,14 +144,14 @@ func (ss *syscallShim) VerifyConsensusFault(a, b, extra []byte) (*runtime2.Conse
 	}
 
 	// (2) check for the consensus faults themselves
-	var consensusFault *runtime2.ConsensusFault
+	var consensusFault *runtime7.ConsensusFault
 
 	// (a) double-fork mining fault
 	if blockA.Height == blockB.Height {
-		consensusFault = &runtime2.ConsensusFault{
+		consensusFault = &runtime7.ConsensusFault{
 			Target: blockA.Miner,
 			Epoch:  blockB.Height,
-			Type:   runtime2.ConsensusFaultDoubleForkMining,
+			Type:   runtime7.ConsensusFaultDoubleForkMining,
 		}
 	}
 
@@ -148,10 +159,10 @@ func (ss *syscallShim) VerifyConsensusFault(a, b, extra []byte) (*runtime2.Conse
 	// strictly speaking no need to compare heights based on double fork mining check above,
 	// but at same height this would be a different fault.
 	if types.CidArrsEqual(blockA.Parents, blockB.Parents) && blockA.Height != blockB.Height {
-		consensusFault = &runtime2.ConsensusFault{
+		consensusFault = &runtime7.ConsensusFault{
 			Target: blockA.Miner,
 			Epoch:  blockB.Height,
-			Type:   runtime2.ConsensusFaultTimeOffsetMining,
+			Type:   runtime7.ConsensusFaultTimeOffsetMining,
 		}
 	}
 
@@ -169,12 +180,16 @@ func (ss *syscallShim) VerifyConsensusFault(a, b, extra []byte) (*runtime2.Conse
 			return nil, xerrors.Errorf("cannot decode extra: %w", decodeErr)
 		}
 
+		if !abi.AddressValidForNetworkVersion(blockC.Miner, ss.networkVersion) {
+			return nil, xerrors.Errorf("address protocol unsupported in current network version: %d", blockC.Miner.Protocol())
+		}
+
 		if types.CidArrsEqual(blockA.Parents, blockC.Parents) && blockA.Height == blockC.Height &&
 			types.CidArrsContains(blockB.Parents, blockC.Cid()) && !types.CidArrsContains(blockB.Parents, blockA.Cid()) {
-			consensusFault = &runtime2.ConsensusFault{
+			consensusFault = &runtime7.ConsensusFault{
 				Target: blockA.Miner,
 				Epoch:  blockB.Height,
-				Type:   runtime2.ConsensusFaultParentGrinding,
+				Type:   runtime7.ConsensusFaultParentGrinding,
 			}
 		}
 	}
@@ -240,11 +255,11 @@ func (ss *syscallShim) workerKeyAtLookback(height abi.ChainEpoch) (address.Addre
 		return address.Undef, err
 	}
 
-	return ResolveToKeyAddr(ss.cstate, ss.cst, info.Worker)
+	return ResolveToDeterministicAddr(ss.cstate, ss.cst, info.Worker)
 }
 
-func (ss *syscallShim) VerifyPoSt(proof proof2.WindowPoStVerifyInfo) error {
-	ok, err := ss.verifier.VerifyWindowPoSt(context.TODO(), proof)
+func (ss *syscallShim) VerifyPoSt(info proof7.WindowPoStVerifyInfo) error {
+	ok, err := ss.verifier.VerifyWindowPoSt(context.TODO(), info)
 	if err != nil {
 		return err
 	}
@@ -254,9 +269,9 @@ func (ss *syscallShim) VerifyPoSt(proof proof2.WindowPoStVerifyInfo) error {
 	return nil
 }
 
-func (ss *syscallShim) VerifySeal(info proof2.SealVerifyInfo) error {
-	//_, span := trace.StartSpan(ctx, "ValidatePoRep")
-	//defer span.End()
+func (ss *syscallShim) VerifySeal(info proof7.SealVerifyInfo) error {
+	// _, span := trace.StartSpan(ctx, "ValidatePoRep")
+	// defer span.End()
 
 	miner, err := address.NewIDAddress(uint64(info.Miner))
 	if err != nil {
@@ -267,9 +282,9 @@ func (ss *syscallShim) VerifySeal(info proof2.SealVerifyInfo) error {
 	proof := info.Proof
 	seed := []byte(info.InteractiveRandomness)
 
-	log.Debugf("Verif r:%x; d:%x; m:%s; t:%x; s:%x; N:%d; p:%x", info.SealedCID, info.UnsealedCID, miner, ticket, seed, info.SectorID.Number, proof)
+	log.Debugf("Verif r:%s; d:%s; m:%s; t:%x; s:%x; N:%d; p:%x", info.SealedCID, info.UnsealedCID, miner, ticket, seed, info.SectorID.Number, proof)
 
-	//func(ctx context.Context, maddr address.Address, ssize abi.SectorSize, commD, commR, ticket, proof, seed []byte, sectorID abi.SectorNumber)
+	// func(ctx context.Context, maddr address.Address, ssize abi.SectorSize, commD, commR, ticket, proof, seed []byte, sectorID abi.SectorNumber)
 	ok, err := ss.verifier.VerifySeal(info)
 	if err != nil {
 		return xerrors.Errorf("failed to validate PoRep: %w", err)
@@ -281,10 +296,36 @@ func (ss *syscallShim) VerifySeal(info proof2.SealVerifyInfo) error {
 	return nil
 }
 
+func (ss *syscallShim) VerifyAggregateSeals(aggregate proof7.AggregateSealVerifyProofAndInfos) error {
+	ok, err := ss.verifier.VerifyAggregateSeals(aggregate)
+	if err != nil {
+		return xerrors.Errorf("failed to verify aggregated PoRep: %w", err)
+	}
+
+	if !ok {
+		return fmt.Errorf("invalid aggregate proof")
+	}
+
+	return nil
+}
+
+func (ss *syscallShim) VerifyReplicaUpdate(update proof7.ReplicaUpdateInfo) error {
+	ok, err := ss.verifier.VerifyReplicaUpdate(update)
+	if err != nil {
+		return xerrors.Errorf("failed to verify replica update: %w", err)
+	}
+
+	if !ok {
+		return fmt.Errorf("invalid replica update")
+	}
+
+	return nil
+}
+
 func (ss *syscallShim) VerifySignature(sig crypto.Signature, addr address.Address, input []byte) error {
 	// TODO: in genesis setup, we are currently faking signatures
 
-	kaddr, err := ResolveToKeyAddr(ss.cstate, ss.cst, addr)
+	kaddr, err := ResolveToDeterministicAddr(ss.cstate, ss.cst, addr)
 	if err != nil {
 		return err
 	}
@@ -294,7 +335,7 @@ func (ss *syscallShim) VerifySignature(sig crypto.Signature, addr address.Addres
 
 var BatchSealVerifyParallelism = goruntime.NumCPU()
 
-func (ss *syscallShim) BatchVerifySeals(inp map[address.Address][]proof2.SealVerifyInfo) (map[address.Address][]bool, error) {
+func (ss *syscallShim) BatchVerifySeals(inp map[address.Address][]proof7.SealVerifyInfo) (map[address.Address][]bool, error) {
 	out := make(map[address.Address][]bool)
 
 	sema := make(chan struct{}, BatchSealVerifyParallelism)
@@ -306,7 +347,7 @@ func (ss *syscallShim) BatchVerifySeals(inp map[address.Address][]proof2.SealVer
 
 		for i, s := range seals {
 			wg.Add(1)
-			go func(ma address.Address, ix int, svi proof2.SealVerifyInfo, res []bool) {
+			go func(ma address.Address, ix int, svi proof7.SealVerifyInfo, res []bool) {
 				defer wg.Done()
 				sema <- struct{}{}
 

@@ -1,6 +1,8 @@
 package multisig
 
 import (
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
+	"github.com/ipfs/go-cid"
 	"fmt"
 
 	"github.com/minio/blake2b-simd"
@@ -10,38 +12,66 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/cbor"
-	"github.com/ipfs/go-cid"
 
-	msig{{.latestVersion}} "github.com/filecoin-project/specs-actors/v4/actors/builtin/multisig"
+	msig{{.latestVersion}} "github.com/filecoin-project/go-state-types/builtin{{import .latestVersion}}multisig"
 {{range .versions}}
-	builtin{{.}} "github.com/filecoin-project/specs-actors{{import .}}actors/builtin"
+    {{if (le . 7)}}
+	    builtin{{.}} "github.com/filecoin-project/specs-actors{{import .}}actors/builtin"
+    {{end}}
 {{end}}
+
+    builtintypes "github.com/filecoin-project/go-state-types/builtin"
+	"github.com/filecoin-project/go-state-types/manifest"
 
 	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/types"
 )
 
-func init() {
-{{range .versions}}
-	builtin.RegisterActorState(builtin{{.}}.MultisigActorCodeID, func(store adt.Store, root cid.Cid) (cbor.Marshaler, error) {
-		return load{{.}}(store, root)
-	})
-{{end}}}
-
 func Load(store adt.Store, act *types.Actor) (State, error) {
+	if name, av, ok := actors.GetActorMetaByCode(act.Code); ok {
+       if name != manifest.MultisigKey {
+          return nil, xerrors.Errorf("actor code is not multisig: %s", name)
+       }
+
+       switch av {
+            {{range .versions}}
+                {{if (ge . 8)}}
+                case actorstypes.Version{{.}}:
+                     return load{{.}}(store, act.Head)
+                 {{end}}
+            {{end}}
+       }
+	}
+
 	switch act.Code {
 {{range .versions}}
-	case builtin{{.}}.MultisigActorCodeID:
-		return load{{.}}(store, act.Head)
+    {{if (le . 7)}}
+        case builtin{{.}}.MultisigActorCodeID:
+            return load{{.}}(store, act.Head)
+    {{end}}
 {{end}}
 	}
+
 	return nil, xerrors.Errorf("unknown actor code %s", act.Code)
+}
+
+func MakeState(store adt.Store, av actorstypes.Version, signers []address.Address, threshold uint64, startEpoch abi.ChainEpoch, unlockDuration abi.ChainEpoch, initialBalance abi.TokenAmount) (State, error) {
+	switch av {
+{{range .versions}}
+	case actorstypes.Version{{.}}:
+		return make{{.}}(store, signers, threshold, startEpoch, unlockDuration, initialBalance)
+{{end}}
+}
+	return nil, xerrors.Errorf("unknown actor version %d", av)
 }
 
 type State interface {
 	cbor.Marshaler
+
+    Code() cid.Cid
+    ActorKey() string
+    ActorVersion() actorstypes.Version
 
 	LockedBalance(epoch abi.ChainEpoch) (abi.TokenAmount, error)
 	StartEpoch() (abi.ChainEpoch, error)
@@ -55,16 +85,17 @@ type State interface {
 
 	transactions() (adt.Map, error)
 	decodeTransaction(val *cbg.Deferred) (Transaction, error)
+	GetState() interface{}
 }
 
 type Transaction = msig{{.latestVersion}}.Transaction
 
-var Methods = builtin{{.latestVersion}}.MethodsMultisig
+var Methods = builtintypes.MethodsMultisig
 
-func Message(version actors.Version, from address.Address) MessageBuilder {
+func Message(version actorstypes.Version, from address.Address) MessageBuilder {
 	switch version {
 {{range .versions}}
-	case actors.Version{{.}}:
+	case actorstypes.Version{{.}}:
 		return message{{.}}{{"{"}}{{if (ge . 2)}}message0{from}{{else}}from{{end}}}
 {{end}}	default:
 		panic(fmt.Sprintf("unsupported actors version: %d", version))
@@ -92,6 +123,7 @@ type MessageBuilder interface {
 type ProposalHashData = msig{{.latestVersion}}.ProposalHashData
 type ProposeReturn = msig{{.latestVersion}}.ProposeReturn
 type ProposeParams = msig{{.latestVersion}}.ProposeParams
+type ApproveReturn = msig{{.latestVersion}}.ApproveReturn
 
 func txnParams(id uint64, data *ProposalHashData) ([]byte, error) {
 	params := msig{{.latestVersion}}.TxnIDParams{ID: msig{{.latestVersion}}.TxnID(id)}
@@ -114,4 +146,11 @@ func txnParams(id uint64, data *ProposalHashData) ([]byte, error) {
 	}
 
 	return actors.SerializeParams(&params)
+}
+
+func AllCodes() []cid.Cid {
+	return []cid.Cid{ {{range .versions}}
+        (&state{{.}}{}).Code(),
+    {{- end}}
+    }
 }

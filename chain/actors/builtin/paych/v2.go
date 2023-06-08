@@ -1,16 +1,20 @@
 package paych
 
 import (
+	"fmt"
+
 	"github.com/ipfs/go-cid"
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-state-types/big"
-
-	"github.com/filecoin-project/lotus/chain/actors/adt"
-
+	"github.com/filecoin-project/go-state-types/manifest"
 	paych2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/paych"
 	adt2 "github.com/filecoin-project/specs-actors/v2/actors/util/adt"
+
+	"github.com/filecoin-project/lotus/chain/actors"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
 )
 
 var _ State = (*state2)(nil)
@@ -21,6 +25,12 @@ func load2(store adt.Store, root cid.Cid) (State, error) {
 	if err != nil {
 		return nil, err
 	}
+	return &out, nil
+}
+
+func make2(store adt.Store) (State, error) {
+	out := state2{store: store}
+	out.State = paych2.State{}
 	return &out, nil
 }
 
@@ -74,6 +84,10 @@ func (s *state2) LaneCount() (uint64, error) {
 	return lsamt.Length(), nil
 }
 
+func (s *state2) GetState() interface{} {
+	return &s.State
+}
+
 // Iterate lane states
 func (s *state2) ForEachLaneState(cb func(idx uint64, dl LaneState) error) error {
 	// Get the lane state from the chain
@@ -101,4 +115,21 @@ func (ls *laneState2) Redeemed() (big.Int, error) {
 
 func (ls *laneState2) Nonce() (uint64, error) {
 	return ls.LaneState.Nonce, nil
+}
+
+func (s *state2) ActorKey() string {
+	return manifest.PaychKey
+}
+
+func (s *state2) ActorVersion() actorstypes.Version {
+	return actorstypes.Version2
+}
+
+func (s *state2) Code() cid.Cid {
+	code, ok := actors.GetActorCodeID(s.ActorVersion(), s.ActorKey())
+	if !ok {
+		panic(fmt.Errorf("didn't find actor %v code id for actor version %d", s.ActorKey(), s.ActorVersion()))
+	}
+
+	return code
 }

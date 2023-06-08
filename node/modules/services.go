@@ -8,11 +8,12 @@ import (
 
 	"github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/namespace"
-	eventbus "github.com/libp2p/go-eventbus"
-	event "github.com/libp2p/go-libp2p-core/event"
-	"github.com/libp2p/go-libp2p-core/host"
-	"github.com/libp2p/go-libp2p-core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/event"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/filecoin-project/lotus/chain"
 	"github.com/filecoin-project/lotus/chain/beacon"
 	"github.com/filecoin-project/lotus/chain/beacon/drand"
+	"github.com/filecoin-project/lotus/chain/consensus"
 	"github.com/filecoin-project/lotus/chain/exchange"
 	"github.com/filecoin-project/lotus/chain/messagepool"
 	"github.com/filecoin-project/lotus/chain/stmgr"
@@ -30,9 +32,11 @@ import (
 	"github.com/filecoin-project/lotus/chain/sub"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/journal"
+	"github.com/filecoin-project/lotus/journal/fsjournal"
 	"github.com/filecoin-project/lotus/lib/peermgr"
 	marketevents "github.com/filecoin-project/lotus/markets/loggers"
 	"github.com/filecoin-project/lotus/node/hello"
+	"github.com/filecoin-project/lotus/node/impl/full"
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
 	"github.com/filecoin-project/lotus/node/modules/helpers"
 	"github.com/filecoin-project/lotus/node/repo"
@@ -81,7 +85,7 @@ func RunHello(mctx helpers.MetricsCtx, lc fx.Lifecycle, h host.Host, svc *hello.
 	return nil
 }
 
-func protosContains(protos []string, search string) bool {
+func protosContains(protos []protocol.ID, search protocol.ID) bool {
 	for _, p := range protos {
 		if p == search {
 			return true
@@ -95,7 +99,6 @@ func RunPeerMgr(mctx helpers.MetricsCtx, lc fx.Lifecycle, pmgr *peermgr.PeerMgr)
 }
 
 func RunChainExchange(h host.Host, svc exchange.Server) {
-	h.SetStreamHandler(exchange.BlockSyncProtocolID, svc.HandleStream)     // old
 	h.SetStreamHandler(exchange.ChainExchangeProtocolID, svc.HandleStream) // new
 }
 
@@ -135,11 +138,19 @@ func waitForSync(stmgr *stmgr.StateManager, epochs int, subscribe func()) {
 	})
 }
 
-func HandleIncomingBlocks(mctx helpers.MetricsCtx, lc fx.Lifecycle, ps *pubsub.PubSub, s *chain.Syncer, bserv dtypes.ChainBlockService, chain *store.ChainStore, stmgr *stmgr.StateManager, h host.Host, nn dtypes.NetworkName) {
+func HandleIncomingBlocks(mctx helpers.MetricsCtx,
+	lc fx.Lifecycle,
+	ps *pubsub.PubSub,
+	s *chain.Syncer,
+	bserv dtypes.ChainBlockService,
+	chain *store.ChainStore,
+	cns consensus.Consensus,
+	h host.Host,
+	nn dtypes.NetworkName) {
 	ctx := helpers.LifecycleCtx(mctx, lc)
 
 	v := sub.NewBlockValidator(
-		h.ID(), chain, stmgr,
+		h.ID(), chain, cns,
 		func(p peer.ID) {
 			ps.BlacklistPeer(p)
 			h.ConnManager().TagPeer(p, "badblock", -1000)
@@ -188,6 +199,36 @@ func HandleIncomingMessages(mctx helpers.MetricsCtx, lc fx.Lifecycle, ps *pubsub
 	waitForSync(stmgr, pubsubMsgsSyncEpochs, subscribe)
 }
 
+func RelayIndexerMessages(lc fx.Lifecycle, ps *pubsub.PubSub, nn dtypes.NetworkName, h host.Host, chainModule full.ChainModuleAPI, stateModule full.StateModuleAPI) error {
+	topicName := build.IndexerIngestTopic(nn)
+
+	v := sub.NewIndexerMessageValidator(h.ID(), chainModule, stateModule)
+
+	if err := ps.RegisterTopicValidator(topicName, v.Validate); err != nil {
+		return xerrors.Errorf("failed to register validator for topic %s, err: %w", topicName, err)
+	}
+
+	topicHandle, err := ps.Join(topicName)
+	if err != nil {
+		return xerrors.Errorf("failed to join pubsub topic %s: %w", topicName, err)
+	}
+	cancelFunc, err := topicHandle.Relay()
+	if err != nil {
+		return xerrors.Errorf("failed to relay to pubsub messages for topic %s: %w", topicName, err)
+	}
+
+	// Cancel message relay on shutdown.
+	lc.Append(fx.Hook{
+		OnStop: func(_ context.Context) error {
+			cancelFunc()
+			return nil
+		},
+	})
+
+	log.Infof("relaying messages for pubsub topic %s", topicName)
+	return nil
+}
+
 func NewLocalDiscovery(lc fx.Lifecycle, ds dtypes.MetadataDS) (*discoveryimpl.Local, error) {
 	local, err := discoveryimpl.NewLocal(namespace.Wrap(ds, datastore.NewKey("/deals/local")))
 	if err != nil {
@@ -218,8 +259,8 @@ func BuiltinDrandConfig() dtypes.DrandSchedule {
 	return build.DrandConfigSchedule()
 }
 
-func RandomSchedule(p RandomBeaconParams, _ dtypes.AfterGenesisSet) (beacon.Schedule, error) {
-	gen, err := p.Cs.GetGenesis()
+func RandomSchedule(lc fx.Lifecycle, mctx helpers.MetricsCtx, p RandomBeaconParams, _ dtypes.AfterGenesisSet) (beacon.Schedule, error) {
+	gen, err := p.Cs.GetGenesis(helpers.LifecycleCtx(mctx, lc))
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +278,7 @@ func RandomSchedule(p RandomBeaconParams, _ dtypes.AfterGenesisSet) (beacon.Sche
 }
 
 func OpenFilesystemJournal(lr repo.LockedRepo, lc fx.Lifecycle, disabled journal.DisabledEvents) (journal.Journal, error) {
-	jrnl, err := journal.OpenFSJournal(lr, disabled)
+	jrnl, err := fsjournal.OpenFSJournal(lr, disabled)
 	if err != nil {
 		return nil, err
 	}

@@ -4,15 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"reflect"
 	"sync/atomic"
 	"time"
 
-	"github.com/filecoin-project/lotus/chain/actors/builtin"
-	"github.com/filecoin-project/lotus/metrics"
-
 	block "github.com/ipfs/go-block-format"
-	cid "github.com/ipfs/go-cid"
+	"github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	logging "github.com/ipfs/go-log/v2"
 	mh "github.com/multiformats/go-multihash"
@@ -24,6 +20,7 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	builtin_types "github.com/filecoin-project/go-state-types/builtin"
 	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/go-state-types/exitcode"
 	"github.com/filecoin-project/go-state-types/network"
@@ -32,30 +29,28 @@ import (
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors/adt"
 	"github.com/filecoin-project/lotus/chain/actors/aerrors"
+	"github.com/filecoin-project/lotus/chain/actors/builtin"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/account"
-	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/reward"
 	"github.com/filecoin-project/lotus/chain/state"
 	"github.com/filecoin-project/lotus/chain/types"
+	"github.com/filecoin-project/lotus/metrics"
 )
 
 const MaxCallDepth = 4096
+const CborCodec = 0x51
 
 var (
 	log            = logging.Logger("vm")
-	actorLog       = logging.Logger("actors")
+	actorLog       = logging.WithSkip(logging.Logger("actors"), 1)
 	gasOnActorExec = newGasCharge("OnActorExec", 0, 0)
 )
 
-// stat counters
-var (
-	StatSends   uint64
-	StatApplied uint64
-)
-
-// ResolveToKeyAddr returns the public key type of address (`BLS`/`SECP256K1`) of an account actor identified by `addr`.
-func ResolveToKeyAddr(state types.StateTree, cst cbor.IpldStore, addr address.Address) (address.Address, error) {
-	if addr.Protocol() == address.BLS || addr.Protocol() == address.SECP256K1 {
+// ResolveToDeterministicAddr returns the public key type of address
+// (`BLS`/`SECP256K1`) of an actor identified by `addr`, or its
+// delegated address.
+func ResolveToDeterministicAddr(state types.StateTree, cst cbor.IpldStore, addr address.Address) (address.Address, error) {
+	if addr.Protocol() == address.BLS || addr.Protocol() == address.SECP256K1 || addr.Protocol() == address.Delegated {
 		return addr, nil
 	}
 
@@ -64,12 +59,19 @@ func ResolveToKeyAddr(state types.StateTree, cst cbor.IpldStore, addr address.Ad
 		return address.Undef, xerrors.Errorf("failed to find actor: %s", addr)
 	}
 
+	if state.Version() >= types.StateTreeVersion5 {
+		if act.Address != nil {
+			// If there _is_ an f4 address, return it as "key" address
+			return *act.Address, nil
+		}
+	}
+
 	aast, err := account.Load(adt.WrapStore(context.TODO(), cst), act)
 	if err != nil {
 		return address.Undef, xerrors.Errorf("failed to get account actor state for %s: %w", addr, err)
 	}
-
 	return aast.PubkeyAddress()
+
 }
 
 var (
@@ -83,10 +85,10 @@ type gasChargingBlocks struct {
 	under     cbor.IpldBlockstore
 }
 
-func (bs *gasChargingBlocks) View(c cid.Cid, cb func([]byte) error) error {
+func (bs *gasChargingBlocks) View(ctx context.Context, c cid.Cid, cb func([]byte) error) error {
 	if v, ok := bs.under.(blockstore.Viewer); ok {
 		bs.chargeGas(bs.pricelist.OnIpldGet())
-		return v.View(c, func(b []byte) error {
+		return v.View(ctx, c, func(b []byte) error {
 			// we have successfully retrieved the value; charge for it, even if the user-provided function fails.
 			bs.chargeGas(newGasCharge("OnIpldViewEnd", 0, 0).WithExtra(len(b)))
 			bs.chargeGas(gasOnActorExec)
@@ -94,16 +96,16 @@ func (bs *gasChargingBlocks) View(c cid.Cid, cb func([]byte) error) error {
 		})
 	}
 	// the underlying blockstore doesn't implement the viewer interface, fall back to normal Get behaviour.
-	blk, err := bs.Get(c)
+	blk, err := bs.Get(ctx, c)
 	if err == nil && blk != nil {
 		return cb(blk.RawData())
 	}
 	return err
 }
 
-func (bs *gasChargingBlocks) Get(c cid.Cid) (block.Block, error) {
+func (bs *gasChargingBlocks) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 	bs.chargeGas(bs.pricelist.OnIpldGet())
-	blk, err := bs.under.Get(c)
+	blk, err := bs.under.Get(ctx, c)
 	if err != nil {
 		return nil, aerrors.Escalate(err, "failed to get block from blockstore")
 	}
@@ -113,17 +115,21 @@ func (bs *gasChargingBlocks) Get(c cid.Cid) (block.Block, error) {
 	return blk, nil
 }
 
-func (bs *gasChargingBlocks) Put(blk block.Block) error {
+func (bs *gasChargingBlocks) Put(ctx context.Context, blk block.Block) error {
 	bs.chargeGas(bs.pricelist.OnIpldPut(len(blk.RawData())))
 
-	if err := bs.under.Put(blk); err != nil {
+	if err := bs.under.Put(ctx, blk); err != nil {
 		return aerrors.Escalate(err, "failed to write data to disk")
 	}
 	bs.chargeGas(gasOnActorExec)
 	return nil
 }
 
-func (vm *VM) makeRuntime(ctx context.Context, msg *types.Message, parent *Runtime) *Runtime {
+func (vm *LegacyVM) makeRuntime(ctx context.Context, msg *types.Message, parent *Runtime) *Runtime {
+	paramsCodec := uint64(0)
+	if len(msg.Params) > 0 {
+		paramsCodec = CborCodec
+	}
 	rt := &Runtime{
 		ctx:         ctx,
 		vm:          vm,
@@ -139,7 +145,14 @@ func (vm *VM) makeRuntime(ctx context.Context, msg *types.Message, parent *Runti
 		pricelist:        PricelistByEpoch(vm.blockHeight),
 		allowInternal:    true,
 		callerValidated:  false,
-		executionTrace:   types.ExecutionTrace{Msg: msg},
+		executionTrace: types.ExecutionTrace{Msg: types.MessageTrace{
+			From:        msg.From,
+			To:          msg.To,
+			Value:       msg.Value,
+			Method:      msg.Method,
+			Params:      msg.Params,
+			ParamsCodec: paramsCodec,
+		}},
 	}
 
 	if parent != nil {
@@ -170,7 +183,7 @@ func (vm *VM) makeRuntime(ctx context.Context, msg *types.Message, parent *Runti
 	}
 	vmm.From = resF
 
-	if vm.ntwkVersion(ctx, vm.blockHeight) <= network.Version3 {
+	if vm.networkVersion <= network.Version3 {
 		rt.Message = &vmm
 	} else {
 		resT, _ := rt.ResolveAddress(msg.To)
@@ -189,7 +202,7 @@ func (vm *VM) makeRuntime(ctx context.Context, msg *types.Message, parent *Runti
 }
 
 type UnsafeVM struct {
-	VM *VM
+	VM *LegacyVM
 }
 
 func (vm *UnsafeVM) MakeRuntime(ctx context.Context, msg *types.Message) *Runtime {
@@ -200,20 +213,23 @@ type (
 	CircSupplyCalculator func(context.Context, abi.ChainEpoch, *state.StateTree) (abi.TokenAmount, error)
 	NtwkVersionGetter    func(context.Context, abi.ChainEpoch) network.Version
 	LookbackStateGetter  func(context.Context, abi.ChainEpoch) (*state.StateTree, error)
+	TipSetGetter         func(context.Context, abi.ChainEpoch) (types.TipSetKey, error)
 )
 
-type VM struct {
+var _ Interface = (*LegacyVM)(nil)
+
+type LegacyVM struct {
 	cstate         *state.StateTree
-	base           cid.Cid
 	cst            *cbor.BasicIpldStore
 	buf            *blockstore.BufferedBlockstore
 	blockHeight    abi.ChainEpoch
 	areg           *ActorRegistry
 	rand           Rand
 	circSupplyCalc CircSupplyCalculator
-	ntwkVersion    NtwkVersionGetter
+	networkVersion network.Version
 	baseFee        abi.TokenAmount
 	lbStateGet     LookbackStateGetter
+	baseCircSupply abi.TokenAmount
 
 	Syscalls SyscallBuilder
 }
@@ -221,16 +237,28 @@ type VM struct {
 type VMOpts struct {
 	StateBase      cid.Cid
 	Epoch          abi.ChainEpoch
+	Timestamp      uint64
 	Rand           Rand
 	Bstore         blockstore.Blockstore
+	Actors         *ActorRegistry
 	Syscalls       SyscallBuilder
 	CircSupplyCalc CircSupplyCalculator
-	NtwkVersion    NtwkVersionGetter // TODO: stebalien: In what cases do we actually need this? It seems like even when creating new networks we want to use the 'global'/build-default version getter
+	NetworkVersion network.Version
 	BaseFee        abi.TokenAmount
 	LookbackState  LookbackStateGetter
+	TipSetGetter   TipSetGetter
+	Tracing        bool
+	// ReturnEvents decodes and returns emitted events.
+	ReturnEvents bool
+	// ExecutionLane specifies the execution priority of the created vm
+	ExecutionLane ExecutionLane
 }
 
-func NewVM(ctx context.Context, opts *VMOpts) (*VM, error) {
+func NewLegacyVM(ctx context.Context, opts *VMOpts) (*LegacyVM, error) {
+	if opts.NetworkVersion >= network.Version16 {
+		return nil, xerrors.Errorf("the legacy VM does not support network versions 16+")
+	}
+
 	buf := blockstore.NewBuffered(opts.Bstore)
 	cst := cbor.NewCborStore(buf)
 	state, err := state.LoadStateTree(cst, opts.StateBase)
@@ -238,18 +266,23 @@ func NewVM(ctx context.Context, opts *VMOpts) (*VM, error) {
 		return nil, err
 	}
 
-	return &VM{
+	baseCirc, err := opts.CircSupplyCalc(ctx, opts.Epoch, state)
+	if err != nil {
+		return nil, err
+	}
+
+	return &LegacyVM{
 		cstate:         state,
-		base:           opts.StateBase,
 		cst:            cst,
 		buf:            buf,
 		blockHeight:    opts.Epoch,
-		areg:           NewActorRegistry(),
+		areg:           opts.Actors,
 		rand:           opts.Rand, // TODO: Probably should be a syscall
 		circSupplyCalc: opts.CircSupplyCalc,
-		ntwkVersion:    opts.NtwkVersion,
+		networkVersion: opts.NetworkVersion,
 		Syscalls:       opts.Syscalls,
 		baseFee:        opts.BaseFee,
+		baseCircSupply: baseCirc,
 		lbStateGet:     opts.LookbackState,
 	}, nil
 }
@@ -265,16 +298,17 @@ type ApplyRet struct {
 	ExecutionTrace types.ExecutionTrace
 	Duration       time.Duration
 	GasCosts       *GasOutputs
+	Events         []types.Event
 }
 
-func (vm *VM) send(ctx context.Context, msg *types.Message, parent *Runtime,
+func (vm *LegacyVM) send(ctx context.Context, msg *types.Message, parent *Runtime,
 	gasCharge *GasCharge, start time.Time) ([]byte, aerrors.ActorError, *Runtime) {
 	defer atomic.AddUint64(&StatSends, 1)
 
 	st := vm.cstate
 
 	rt := vm.makeRuntime(ctx, msg, parent)
-	if EnableGasTracing {
+	if EnableDetailedTracing {
 		rt.lastGasChargeTime = start
 		if parent != nil {
 			rt.lastGasChargeTime = parent.lastGasChargeTime
@@ -308,7 +342,7 @@ func (vm *VM) send(ctx context.Context, msg *types.Message, parent *Runtime,
 					return nil, aerrors.Wrapf(err, "could not create account")
 				}
 				toActor = a
-				if vm.ntwkVersion(ctx, vm.blockHeight) <= network.Version3 {
+				if vm.networkVersion <= network.Version3 {
 					// Leave the rt.Message as is
 				} else {
 					nmsg := Message{
@@ -335,7 +369,7 @@ func (vm *VM) send(ctx context.Context, msg *types.Message, parent *Runtime,
 		defer rt.chargeGasSafe(newGasCharge("OnMethodInvocationDone", 0, 0))
 
 		if types.BigCmp(msg.Value, types.NewInt(0)) != 0 {
-			if err := vm.transfer(msg.From, msg.To, msg.Value); err != nil {
+			if err := vm.transfer(msg.From, msg.To, msg.Value, vm.networkVersion); err != nil {
 				return nil, aerrors.Wrap(err, "failed to transfer funds")
 			}
 		}
@@ -349,15 +383,14 @@ func (vm *VM) send(ctx context.Context, msg *types.Message, parent *Runtime,
 		return nil, nil
 	}()
 
-	mr := types.MessageReceipt{
-		ExitCode: aerrors.RetCode(err),
-		Return:   ret,
-		GasUsed:  rt.gasUsed,
+	retCodec := uint64(0)
+	if len(ret) > 0 {
+		retCodec = CborCodec
 	}
-	rt.executionTrace.MsgRct = &mr
-	rt.executionTrace.Duration = time.Since(start)
-	if err != nil {
-		rt.executionTrace.Error = err.Error()
+	rt.executionTrace.MsgRct = types.ReturnTrace{
+		ExitCode:    aerrors.RetCode(err),
+		Return:      ret,
+		ReturnCodec: retCodec,
 	}
 
 	return ret, err, rt
@@ -386,7 +419,7 @@ func checkMessage(msg *types.Message) error {
 	return nil
 }
 
-func (vm *VM) ApplyImplicitMessage(ctx context.Context, msg *types.Message) (*ApplyRet, error) {
+func (vm *LegacyVM) ApplyImplicitMessage(ctx context.Context, msg *types.Message) (*ApplyRet, error) {
 	start := build.Clock.Now()
 	defer atomic.AddUint64(&StatApplied, 1)
 	ret, actorErr, rt := vm.send(ctx, msg, nil, nil, start)
@@ -404,7 +437,7 @@ func (vm *VM) ApplyImplicitMessage(ctx context.Context, msg *types.Message) (*Ap
 	}, actorErr
 }
 
-func (vm *VM) ApplyMessage(ctx context.Context, cmsg types.ChainMsg) (*ApplyRet, error) {
+func (vm *LegacyVM) ApplyMessage(ctx context.Context, cmsg types.ChainMsg) (*ApplyRet, error) {
 	start := build.Clock.Now()
 	ctx, span := trace.StartSpan(ctx, "vm.ApplyMessage")
 	defer span.End()
@@ -437,6 +470,8 @@ func (vm *VM) ApplyMessage(ctx context.Context, cmsg types.ChainMsg) (*ApplyRet,
 			},
 			GasCosts: &gasOutputs,
 			Duration: time.Since(start),
+			ActorErr: aerrors.Newf(exitcode.SysErrOutOfGas,
+				"message gas limit does not cover on-chain gas costs"),
 		}, nil
 	}
 
@@ -566,7 +601,7 @@ func (vm *VM) ApplyMessage(ctx context.Context, cmsg types.ChainMsg) (*ApplyRet,
 		gasUsed = 0
 	}
 
-	burn, err := vm.ShouldBurn(st, msg, errcode)
+	burn, err := vm.ShouldBurn(ctx, st, msg, errcode)
 	if err != nil {
 		return nil, xerrors.Errorf("deciding whether should burn failed: %w", err)
 	}
@@ -609,41 +644,37 @@ func (vm *VM) ApplyMessage(ctx context.Context, cmsg types.ChainMsg) (*ApplyRet,
 	}, nil
 }
 
-func (vm *VM) ShouldBurn(st *state.StateTree, msg *types.Message, errcode exitcode.ExitCode) (bool, error) {
-	// Check to see if we should burn funds. We avoid burning on successful
-	// window post. This won't catch _indirect_ window post calls, but this
-	// is the best we can get for now.
-	if vm.blockHeight > build.UpgradeClausHeight && errcode == exitcode.Ok && msg.Method == miner.Methods.SubmitWindowedPoSt {
-		// Ok, we've checked the _method_, but we still need to check
-		// the target actor. It would be nice if we could just look at
-		// the trace, but I'm not sure if that's safe?
-		if toActor, err := st.GetActor(msg.To); err != nil {
-			// If the actor wasn't found, we probably deleted it or something. Move on.
-			if !xerrors.Is(err, types.ErrActorNotFound) {
-				// Otherwise, this should never fail and something is very wrong.
-				return false, xerrors.Errorf("failed to lookup target actor: %w", err)
+func (vm *LegacyVM) ShouldBurn(ctx context.Context, st *state.StateTree, msg *types.Message, errcode exitcode.ExitCode) (bool, error) {
+	if vm.networkVersion <= network.Version12 {
+		// Check to see if we should burn funds. We avoid burning on successful
+		// window post. This won't catch _indirect_ window post calls, but this
+		// is the best we can get for now.
+		if vm.blockHeight > build.UpgradeClausHeight && errcode == exitcode.Ok && msg.Method == builtin_types.MethodsMiner.SubmitWindowedPoSt {
+			// Ok, we've checked the _method_, but we still need to check
+			// the target actor. It would be nice if we could just look at
+			// the trace, but I'm not sure if that's safe?
+			if toActor, err := st.GetActor(msg.To); err != nil {
+				// If the actor wasn't found, we probably deleted it or something. Move on.
+				if !xerrors.Is(err, types.ErrActorNotFound) {
+					// Otherwise, this should never fail and something is very wrong.
+					return false, xerrors.Errorf("failed to lookup target actor: %w", err)
+				}
+			} else if builtin.IsStorageMinerActor(toActor.Code) {
+				// Ok, this is a storage miner and we've processed a window post. Remove the burn.
+				return false, nil
 			}
-		} else if builtin.IsStorageMinerActor(toActor.Code) {
-			// Ok, this is a storage miner and we've processed a window post. Remove the burn.
-			return false, nil
 		}
+
+		return true, nil
 	}
 
+	// Any "don't burn" rules from Network v13 onwards go here, for now we always return true
 	return true, nil
-}
-
-func (vm *VM) ActorBalance(addr address.Address) (types.BigInt, aerrors.ActorError) {
-	act, err := vm.cstate.GetActor(addr)
-	if err != nil {
-		return types.EmptyInt, aerrors.Absorb(err, 1, "failed to find actor")
-	}
-
-	return act.Balance, nil
 }
 
 type vmFlushKey struct{}
 
-func (vm *VM) Flush(ctx context.Context) (cid.Cid, error) {
+func (vm *LegacyVM) Flush(ctx context.Context) (cid.Cid, error) {
 	_, span := trace.StartSpan(ctx, "vm.Flush")
 	defer span.End()
 
@@ -662,35 +693,10 @@ func (vm *VM) Flush(ctx context.Context) (cid.Cid, error) {
 	return root, nil
 }
 
-// MutateState usage: MutateState(ctx, idAddr, func(cst cbor.IpldStore, st *ActorStateType) error {...})
-func (vm *VM) MutateState(ctx context.Context, addr address.Address, fn interface{}) error {
-	act, err := vm.cstate.GetActor(addr)
-	if err != nil {
-		return xerrors.Errorf("actor not found: %w", err)
-	}
-
-	st := reflect.New(reflect.TypeOf(fn).In(1).Elem())
-	if err := vm.cst.Get(ctx, act.Head, st.Interface()); err != nil {
-		return xerrors.Errorf("read actor head: %w", err)
-	}
-
-	out := reflect.ValueOf(fn).Call([]reflect.Value{reflect.ValueOf(vm.cst), st})
-	if !out[0].IsNil() && out[0].Interface().(error) != nil {
-		return out[0].Interface().(error)
-	}
-
-	head, err := vm.cst.Put(ctx, st.Interface())
-	if err != nil {
-		return xerrors.Errorf("put new actor head: %w", err)
-	}
-
-	act.Head = head
-
-	if err := vm.cstate.SetActor(addr, act); err != nil {
-		return xerrors.Errorf("set actor: %w", err)
-	}
-
-	return nil
+// Get the buffered blockstore associated with the LegacyVM. This includes any temporary blocks produced
+// during this LegacyVM's execution.
+func (vm *LegacyVM) ActorStore(ctx context.Context) adt.Store {
+	return adt.WrapStore(ctx, vm.cst)
 }
 
 func linksForObj(blk block.Block, cb func(cid.Cid)) error {
@@ -729,7 +735,7 @@ func Copy(ctx context.Context, from, to blockstore.Blockstore, root cid.Cid) err
 
 	go func() {
 		for b := range toFlush {
-			if err := to.PutMany(b); err != nil {
+			if err := to.PutMany(ctx, b); err != nil {
 				close(freeBufs)
 				errFlushChan <- xerrors.Errorf("batch put in copy: %w", err)
 				return
@@ -758,7 +764,7 @@ func Copy(ctx context.Context, from, to blockstore.Blockstore, root cid.Cid) err
 		return nil
 	}
 
-	if err := copyRec(from, to, root, batchCp); err != nil {
+	if err := copyRec(ctx, from, to, root, batchCp); err != nil {
 		return xerrors.Errorf("copyRec: %w", err)
 	}
 
@@ -783,13 +789,13 @@ func Copy(ctx context.Context, from, to blockstore.Blockstore, root cid.Cid) err
 	return nil
 }
 
-func copyRec(from, to blockstore.Blockstore, root cid.Cid, cp func(block.Block) error) error {
+func copyRec(ctx context.Context, from, to blockstore.Blockstore, root cid.Cid, cp func(block.Block) error) error {
 	if root.Prefix().MhType == 0 {
 		// identity cid, skip
 		return nil
 	}
 
-	blk, err := from.Get(root)
+	blk, err := from.Get(ctx, root)
 	if err != nil {
 		return xerrors.Errorf("get %s failed: %w", root, err)
 	}
@@ -814,7 +820,7 @@ func copyRec(from, to blockstore.Blockstore, root cid.Cid, cp func(block.Block) 
 			}
 		} else {
 			// If we have an object, we already have its children, skip the object.
-			has, err := to.Has(link)
+			has, err := to.Has(ctx, link)
 			if err != nil {
 				lerr = xerrors.Errorf("has: %w", err)
 				return
@@ -824,7 +830,7 @@ func copyRec(from, to blockstore.Blockstore, root cid.Cid, cp func(block.Block) 
 			}
 		}
 
-		if err := copyRec(from, to, link, cp); err != nil {
+		if err := copyRec(ctx, from, to, link, cp); err != nil {
 			lerr = err
 			return
 		}
@@ -842,15 +848,11 @@ func copyRec(from, to blockstore.Blockstore, root cid.Cid, cp func(block.Block) 
 	return nil
 }
 
-func (vm *VM) StateTree() types.StateTree {
+func (vm *LegacyVM) StateTree() types.StateTree {
 	return vm.cstate
 }
 
-func (vm *VM) SetBlockHeight(h abi.ChainEpoch) {
-	vm.blockHeight = h
-}
-
-func (vm *VM) Invoke(act *types.Actor, rt *Runtime, method abi.MethodNum, params []byte) ([]byte, aerrors.ActorError) {
+func (vm *LegacyVM) Invoke(act *types.Actor, rt *Runtime, method abi.MethodNum, params []byte) ([]byte, aerrors.ActorError) {
 	ctx, span := trace.StartSpan(rt.ctx, "vm.Invoke")
 	defer span.End()
 	if span.IsRecordingEvents() {
@@ -873,51 +875,91 @@ func (vm *VM) Invoke(act *types.Actor, rt *Runtime, method abi.MethodNum, params
 	return ret, nil
 }
 
-func (vm *VM) SetInvoker(i *ActorRegistry) {
+func (vm *LegacyVM) SetInvoker(i *ActorRegistry) {
 	vm.areg = i
 }
 
-func (vm *VM) GetNtwkVersion(ctx context.Context, ce abi.ChainEpoch) network.Version {
-	return vm.ntwkVersion(ctx, ce)
+func (vm *LegacyVM) GetCircSupply(ctx context.Context) (abi.TokenAmount, error) {
+	// Before v15, this was recalculated on each invocation as the state tree was mutated
+	if vm.networkVersion <= network.Version14 {
+		return vm.circSupplyCalc(ctx, vm.blockHeight, vm.cstate)
+	}
+
+	return vm.baseCircSupply, nil
 }
 
-func (vm *VM) GetCircSupply(ctx context.Context) (abi.TokenAmount, error) {
-	return vm.circSupplyCalc(ctx, vm.blockHeight, vm.cstate)
-}
-
-func (vm *VM) incrementNonce(addr address.Address) error {
+func (vm *LegacyVM) incrementNonce(addr address.Address) error {
 	return vm.cstate.MutateActor(addr, func(a *types.Actor) error {
 		a.Nonce++
 		return nil
 	})
 }
 
-func (vm *VM) transfer(from, to address.Address, amt types.BigInt) aerrors.ActorError {
-	if from == to {
-		return nil
-	}
+func (vm *LegacyVM) transfer(from, to address.Address, amt types.BigInt, networkVersion network.Version) aerrors.ActorError {
+	var f *types.Actor
+	var fromID, toID address.Address
+	var err error
+	// switching the order around so that transactions for more than the balance sent to self fail
+	if networkVersion >= network.Version15 {
+		if amt.LessThan(types.NewInt(0)) {
+			return aerrors.Newf(exitcode.SysErrForbidden, "attempted to transfer negative value: %s", amt)
+		}
 
-	fromID, err := vm.cstate.LookupID(from)
-	if err != nil {
-		return aerrors.Fatalf("transfer failed when resolving sender address: %s", err)
-	}
+		fromID, err = vm.cstate.LookupID(from)
+		if err != nil {
+			return aerrors.Fatalf("transfer failed when resolving sender address: %s", err)
+		}
 
-	toID, err := vm.cstate.LookupID(to)
-	if err != nil {
-		return aerrors.Fatalf("transfer failed when resolving receiver address: %s", err)
-	}
+		f, err = vm.cstate.GetActor(fromID)
+		if err != nil {
+			return aerrors.Fatalf("transfer failed when retrieving sender actor: %s", err)
+		}
 
-	if fromID == toID {
-		return nil
-	}
+		if f.Balance.LessThan(amt) {
+			return aerrors.Newf(exitcode.SysErrInsufficientFunds, "transfer failed, insufficient balance in sender actor: %v", f.Balance)
+		}
 
-	if amt.LessThan(types.NewInt(0)) {
-		return aerrors.Newf(exitcode.SysErrForbidden, "attempted to transfer negative value: %s", amt)
-	}
+		if from == to {
+			log.Infow("sending to same address: noop", "from/to addr", from)
+			return nil
+		}
 
-	f, err := vm.cstate.GetActor(fromID)
-	if err != nil {
-		return aerrors.Fatalf("transfer failed when retrieving sender actor: %s", err)
+		toID, err = vm.cstate.LookupID(to)
+		if err != nil {
+			return aerrors.Fatalf("transfer failed when resolving receiver address: %s", err)
+		}
+
+		if fromID == toID {
+			log.Infow("sending to same actor ID: noop", "from/to actor", fromID)
+			return nil
+		}
+	} else {
+		if from == to {
+			return nil
+		}
+
+		fromID, err = vm.cstate.LookupID(from)
+		if err != nil {
+			return aerrors.Fatalf("transfer failed when resolving sender address: %s", err)
+		}
+
+		toID, err = vm.cstate.LookupID(to)
+		if err != nil {
+			return aerrors.Fatalf("transfer failed when resolving receiver address: %s", err)
+		}
+
+		if fromID == toID {
+			return nil
+		}
+
+		if amt.LessThan(types.NewInt(0)) {
+			return aerrors.Newf(exitcode.SysErrForbidden, "attempted to transfer negative value: %s", amt)
+		}
+
+		f, err = vm.cstate.GetActor(fromID)
+		if err != nil {
+			return aerrors.Fatalf("transfer failed when retrieving sender actor: %s", err)
+		}
 	}
 
 	t, err := vm.cstate.GetActor(toID)
@@ -925,23 +967,23 @@ func (vm *VM) transfer(from, to address.Address, amt types.BigInt) aerrors.Actor
 		return aerrors.Fatalf("transfer failed when retrieving receiver actor: %s", err)
 	}
 
-	if err := deductFunds(f, amt); err != nil {
+	if err = deductFunds(f, amt); err != nil {
 		return aerrors.Newf(exitcode.SysErrInsufficientFunds, "transfer failed when deducting funds (%s): %s", types.FIL(amt), err)
 	}
 	depositFunds(t, amt)
 
-	if err := vm.cstate.SetActor(fromID, f); err != nil {
-		return aerrors.Fatalf("transfer failed when setting receiver actor: %s", err)
+	if err = vm.cstate.SetActor(fromID, f); err != nil {
+		return aerrors.Fatalf("transfer failed when setting sender actor: %s", err)
 	}
 
-	if err := vm.cstate.SetActor(toID, t); err != nil {
-		return aerrors.Fatalf("transfer failed when setting sender actor: %s", err)
+	if err = vm.cstate.SetActor(toID, t); err != nil {
+		return aerrors.Fatalf("transfer failed when setting receiver actor: %s", err)
 	}
 
 	return nil
 }
 
-func (vm *VM) transferToGasHolder(addr address.Address, gasHolder *types.Actor, amt types.BigInt) error {
+func (vm *LegacyVM) transferToGasHolder(addr address.Address, gasHolder *types.Actor, amt types.BigInt) error {
 	if amt.LessThan(types.NewInt(0)) {
 		return xerrors.Errorf("attempted to transfer negative value to gas holder")
 	}
@@ -955,7 +997,7 @@ func (vm *VM) transferToGasHolder(addr address.Address, gasHolder *types.Actor, 
 	})
 }
 
-func (vm *VM) transferFromGasHolder(addr address.Address, gasHolder *types.Actor, amt types.BigInt) error {
+func (vm *LegacyVM) transferFromGasHolder(addr address.Address, gasHolder *types.Actor, amt types.BigInt) error {
 	if amt.LessThan(types.NewInt(0)) {
 		return xerrors.Errorf("attempted to transfer negative value from gas holder")
 	}

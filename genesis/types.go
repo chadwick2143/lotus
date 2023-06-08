@@ -3,12 +3,15 @@ package genesis
 import (
 	"encoding/json"
 
+	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p/core/peer"
+
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/ipfs/go-cid"
-	"github.com/libp2p/go-libp2p-core/peer"
+	markettypes "github.com/filecoin-project/go-state-types/builtin/v9/market"
+	"github.com/filecoin-project/go-state-types/network"
 
-	market2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/market"
+	"github.com/filecoin-project/lotus/chain/types"
 )
 
 type ActorType string
@@ -19,11 +22,12 @@ const (
 )
 
 type PreSeal struct {
-	CommR     cid.Cid
-	CommD     cid.Cid
-	SectorID  abi.SectorNumber
-	Deal      market2.DealProposal
-	ProofType abi.RegisteredSealProof
+	CommR         cid.Cid
+	CommD         cid.Cid
+	SectorID      abi.SectorNumber
+	Deal          markettypes.DealProposal
+	DealClientKey types.KeyInfo
+	ProofType     abi.RegisteredSealProof
 }
 
 type Miner struct {
@@ -75,8 +79,9 @@ type Actor struct {
 }
 
 type Template struct {
-	Accounts []Actor
-	Miners   []Miner
+	NetworkVersion network.Version
+	Accounts       []Actor
+	Miners         []Miner
 
 	NetworkName string
 	Timestamp   uint64 `json:",omitempty"`

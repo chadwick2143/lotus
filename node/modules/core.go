@@ -5,16 +5,15 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/gbrlsnchs/jwt/v3"
 	logging "github.com/ipfs/go-log/v2"
-	"github.com/libp2p/go-libp2p-core/peer"
-	"github.com/libp2p/go-libp2p-core/peerstore"
 	record "github.com/libp2p/go-libp2p-record"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/raulk/go-watchdog"
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
@@ -147,7 +146,7 @@ func APISecret(keystore types.KeyStore, lr repo.LockedRepo) (*dtypes.APIAlg, err
 	if errors.Is(err, types.ErrKeyInfoNotFound) {
 		log.Warn("Generating new API secret")
 
-		sk, err := ioutil.ReadAll(io.LimitReader(rand.Reader, 32))
+		sk, err := io.ReadAll(io.LimitReader(rand.Reader, 32))
 		if err != nil {
 			return nil, err
 		}

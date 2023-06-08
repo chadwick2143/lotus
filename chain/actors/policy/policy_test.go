@@ -1,3 +1,4 @@
+// stm: #unit
 package policy
 
 import (
@@ -6,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/network"
 	builtin0 "github.com/filecoin-project/specs-actors/actors/builtin"
 	miner0 "github.com/filecoin-project/specs-actors/actors/builtin/miner"
 	paych0 "github.com/filecoin-project/specs-actors/actors/builtin/paych"
@@ -21,6 +23,7 @@ func TestSupportedProofTypes(t *testing.T) {
 	for t := range miner0.SupportedProofTypes {
 		oldTypes = append(oldTypes, t)
 	}
+	//stm: @BLOCKCHAIN_POLICY_SET_MAX_SUPPORTED_PROOF_TYPES_001
 	t.Cleanup(func() {
 		SetSupportedProofTypes(oldTypes...)
 	})
@@ -32,6 +35,7 @@ func TestSupportedProofTypes(t *testing.T) {
 			abi.RegisteredSealProof_StackedDrg2KiBV1: {},
 		},
 	)
+	//stm: @BLOCKCHAIN_POLICY_ADD_MAX_SUPPORTED_PROOF_TYPES_001
 	AddSupportedProofTypes(abi.RegisteredSealProof_StackedDrg8MiBV1)
 	require.EqualValues(t,
 		miner0.SupportedProofTypes,
@@ -44,6 +48,7 @@ func TestSupportedProofTypes(t *testing.T) {
 
 // Tests assumptions about policies being the same between actor versions.
 func TestAssumptions(t *testing.T) {
+	//stm: @BLOCKCHAIN_POLICY_ASSUMPTIONS_001
 	require.EqualValues(t, miner0.SupportedProofTypes, miner2.PreCommitSealProofTypesV0)
 	require.Equal(t, miner0.PreCommitChallengeDelay, miner2.PreCommitChallengeDelay)
 	require.Equal(t, miner0.MaxSectorExpirationExtension, miner2.MaxSectorExpirationExtension)
@@ -57,6 +62,7 @@ func TestAssumptions(t *testing.T) {
 }
 
 func TestPartitionSizes(t *testing.T) {
+	//stm: @CHAIN_ACTOR_PARTITION_SIZES_001
 	for _, p := range abi.SealProofInfos {
 		sizeNew, err := builtin2.PoStProofWindowPoStPartitionSectors(p.WindowPoStProof)
 		require.NoError(t, err)
@@ -67,4 +73,14 @@ func TestPartitionSizes(t *testing.T) {
 		}
 		require.Equal(t, sizeOld, sizeNew)
 	}
+}
+
+func TestPoStSize(t *testing.T) {
+	//stm: @BLOCKCHAIN_POLICY_GET_MAX_POST_PARTITIONS_001
+	v12PoStSize, err := GetMaxPoStPartitions(network.Version12, abi.RegisteredPoStProof_StackedDrgWindow64GiBV1)
+	require.Equal(t, 4, v12PoStSize)
+	require.NoError(t, err)
+	v13PoStSize, err := GetMaxPoStPartitions(network.Version13, abi.RegisteredPoStProof_StackedDrgWindow64GiBV1)
+	require.NoError(t, err)
+	require.Equal(t, 10, v13PoStSize)
 }

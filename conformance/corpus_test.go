@@ -1,8 +1,10 @@
+// stm: ignore
+// This file does not test any behaviors by itself; rather, it runs other test files
+// Therefore, this file should not be annotated.
 package conformance
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,7 +106,7 @@ func TestConformance(t *testing.T) {
 	// Run a test for each vector.
 	for _, v := range vectors {
 		path := filepath.Join(corpusRoot, v)
-		raw, err := ioutil.ReadFile(path)
+		raw, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("failed to read test raw file: %s", path)
 		}

@@ -3,11 +3,10 @@ package vm
 import (
 	"fmt"
 
-	proof2 "github.com/filecoin-project/specs-actors/v2/actors/runtime/proof"
-
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/crypto"
+	proof7 "github.com/filecoin-project/specs-actors/v7/actors/runtime/proof"
 
 	"github.com/filecoin-project/lotus/chain/actors/builtin"
 )
@@ -15,6 +14,28 @@ import (
 type scalingCost struct {
 	flat  int64
 	scale int64
+}
+
+type stepCost []step
+
+type step struct {
+	start int64
+	cost  int64
+}
+
+func (sc stepCost) Lookup(x int64) int64 {
+	i := 0
+	for ; i < len(sc); i++ {
+		if sc[i].start > x {
+			break
+		}
+	}
+	i-- // look at previous item
+	if i < 0 {
+		return 0
+	}
+
+	return sc[i].cost
 }
 
 type pricelistV0 struct {
@@ -28,7 +49,7 @@ type pricelistV0 struct {
 	// whether it succeeds or fails in application) is given by:
 	//   OnChainMessageBase + len(serialized message)*OnChainMessagePerByte
 	// Together, these account for the cost of message propagation and validation,
-	// up to but excluding any actual processing by the VM.
+	// up to but excluding any actual processing by the LegacyVM.
 	// This is the cost a block producer burns when including an invalid message.
 	onChainMessageComputeBase    int64
 	onChainMessageStorageBase    int64
@@ -61,11 +82,11 @@ type pricelistV0 struct {
 	sendInvokeMethod int64
 
 	// Gas cost for any Get operation to the IPLD store
-	// in the runtime VM context.
+	// in the runtime LegacyVM context.
 	ipldGetBase int64
 
 	// Gas cost (Base + len*PerByte) for any Put operation to the IPLD store
-	// in the runtime VM context.
+	// in the runtime LegacyVM context.
 	//
 	// Note: these costs should be significantly higher than the costs for Get
 	// operations, since they reflect not only serialization/deserialization
@@ -91,9 +112,15 @@ type pricelistV0 struct {
 
 	computeUnsealedSectorCidBase int64
 	verifySealBase               int64
-	verifyPostLookup             map[abi.RegisteredPoStProof]scalingCost
-	verifyPostDiscount           bool
-	verifyConsensusFault         int64
+	verifyAggregateSealBase      int64
+	verifyAggregateSealPer       map[abi.RegisteredSealProof]int64
+	verifyAggregateSealSteps     map[abi.RegisteredSealProof]stepCost
+
+	verifyPostLookup     map[abi.RegisteredPoStProof]scalingCost
+	verifyPostDiscount   bool
+	verifyConsensusFault int64
+
+	verifyReplicaUpdate int64
 }
 
 var _ Pricelist = (*pricelistV0)(nil)
@@ -179,14 +206,35 @@ func (pl *pricelistV0) OnComputeUnsealedSectorCid(proofType abi.RegisteredSealPr
 }
 
 // OnVerifySeal
-func (pl *pricelistV0) OnVerifySeal(info proof2.SealVerifyInfo) GasCharge {
+func (pl *pricelistV0) OnVerifySeal(info proof7.SealVerifyInfo) GasCharge {
 	// TODO: this needs more cost tunning, check with @lotus
 	// this is not used
 	return newGasCharge("OnVerifySeal", pl.verifySealBase, 0)
 }
 
+// OnVerifyAggregateSeals
+func (pl *pricelistV0) OnVerifyAggregateSeals(aggregate proof7.AggregateSealVerifyProofAndInfos) GasCharge {
+	proofType := aggregate.SealProof
+	perProof, ok := pl.verifyAggregateSealPer[proofType]
+	if !ok {
+		perProof = pl.verifyAggregateSealPer[abi.RegisteredSealProof_StackedDrg32GiBV1_1]
+	}
+
+	step, ok := pl.verifyAggregateSealSteps[proofType]
+	if !ok {
+		step = pl.verifyAggregateSealSteps[abi.RegisteredSealProof_StackedDrg32GiBV1_1]
+	}
+	num := int64(len(aggregate.Infos))
+	return newGasCharge("OnVerifyAggregateSeals", perProof*num+step.Lookup(num), 0)
+}
+
+// OnVerifyReplicaUpdate
+func (pl *pricelistV0) OnVerifyReplicaUpdate(update proof7.ReplicaUpdateInfo) GasCharge {
+	return newGasCharge("OnVerifyReplicaUpdate", pl.verifyReplicaUpdate, 0)
+}
+
 // OnVerifyPost
-func (pl *pricelistV0) OnVerifyPost(info proof2.WindowPoStVerifyInfo) GasCharge {
+func (pl *pricelistV0) OnVerifyPost(info proof7.WindowPoStVerifyInfo) GasCharge {
 	sectorSize := "unknown"
 	var proofType abi.RegisteredPoStProof
 

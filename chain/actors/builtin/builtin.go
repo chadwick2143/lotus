@@ -1,105 +1,67 @@
 package builtin
 
 import (
-	"github.com/filecoin-project/go-address"
+	"fmt"
+
 	"github.com/ipfs/go-cid"
-	"golang.org/x/xerrors"
 
-	builtin0 "github.com/filecoin-project/specs-actors/actors/builtin"
-	smoothing0 "github.com/filecoin-project/specs-actors/actors/util/smoothing"
-
-	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
-	smoothing2 "github.com/filecoin-project/specs-actors/v2/actors/util/smoothing"
-
-	builtin3 "github.com/filecoin-project/specs-actors/v3/actors/builtin"
-	smoothing3 "github.com/filecoin-project/specs-actors/v3/actors/util/smoothing"
-
-	builtin4 "github.com/filecoin-project/specs-actors/v4/actors/builtin"
-	smoothing4 "github.com/filecoin-project/specs-actors/v4/actors/util/smoothing"
-
+	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/go-state-types/cbor"
+	"github.com/filecoin-project/go-state-types/builtin"
+	smoothingtypes "github.com/filecoin-project/go-state-types/builtin/v8/util/smoothing"
+	minertypes "github.com/filecoin-project/go-state-types/builtin/v9/miner"
+	"github.com/filecoin-project/go-state-types/manifest"
+	"github.com/filecoin-project/go-state-types/proof"
+	builtin0 "github.com/filecoin-project/specs-actors/actors/builtin"
+	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
+	builtin3 "github.com/filecoin-project/specs-actors/v3/actors/builtin"
+	builtin4 "github.com/filecoin-project/specs-actors/v4/actors/builtin"
+	builtin5 "github.com/filecoin-project/specs-actors/v5/actors/builtin"
+	builtin6 "github.com/filecoin-project/specs-actors/v6/actors/builtin"
+	builtin7 "github.com/filecoin-project/specs-actors/v7/actors/builtin"
 
-	"github.com/filecoin-project/lotus/chain/actors/adt"
-	"github.com/filecoin-project/lotus/chain/types"
-
-	miner4 "github.com/filecoin-project/specs-actors/v4/actors/builtin/miner"
-	proof4 "github.com/filecoin-project/specs-actors/v4/actors/runtime/proof"
+	"github.com/filecoin-project/lotus/chain/actors"
 )
 
-var SystemActorAddr = builtin4.SystemActorAddr
-var BurntFundsActorAddr = builtin4.BurntFundsActorAddr
-var CronActorAddr = builtin4.CronActorAddr
+var SystemActorAddr = builtin.SystemActorAddr
+var BurntFundsActorAddr = builtin.BurntFundsActorAddr
+var CronActorAddr = builtin.CronActorAddr
+var EthereumAddressManagerActorAddr = builtin.EthereumAddressManagerActorAddr
 var SaftAddress = makeAddress("t0122")
 var ReserveAddress = makeAddress("t090")
 var RootVerifierAddress = makeAddress("t080")
 
 var (
-	ExpectedLeadersPerEpoch = builtin4.ExpectedLeadersPerEpoch
+	ExpectedLeadersPerEpoch = builtin.ExpectedLeadersPerEpoch
 )
 
 const (
-	EpochDurationSeconds = builtin4.EpochDurationSeconds
-	EpochsInDay          = builtin4.EpochsInDay
-	SecondsInDay         = builtin4.SecondsInDay
+	EpochDurationSeconds = builtin.EpochDurationSeconds
+	EpochsInDay          = builtin.EpochsInDay
+	SecondsInDay         = builtin.SecondsInDay
 )
 
 const (
-	MethodSend        = builtin4.MethodSend
-	MethodConstructor = builtin4.MethodConstructor
+	MethodSend        = builtin.MethodSend
+	MethodConstructor = builtin.MethodConstructor
 )
 
 // These are all just type aliases across actor versions. In the future, that might change
 // and we might need to do something fancier.
-type SectorInfo = proof4.SectorInfo
-type PoStProof = proof4.PoStProof
-type FilterEstimate = smoothing0.FilterEstimate
+type SectorInfo = proof.SectorInfo
+type ExtendedSectorInfo = proof.ExtendedSectorInfo
+type PoStProof = proof.PoStProof
+type FilterEstimate = smoothingtypes.FilterEstimate
 
 func QAPowerForWeight(size abi.SectorSize, duration abi.ChainEpoch, dealWeight, verifiedWeight abi.DealWeight) abi.StoragePower {
-	return miner4.QAPowerForWeight(size, duration, dealWeight, verifiedWeight)
-}
-
-func FromV0FilterEstimate(v0 smoothing0.FilterEstimate) FilterEstimate {
-
-	return (FilterEstimate)(v0) //nolint:unconvert
-
-}
-
-func FromV2FilterEstimate(v2 smoothing2.FilterEstimate) FilterEstimate {
-
-	return (FilterEstimate)(v2)
-
-}
-
-func FromV3FilterEstimate(v3 smoothing3.FilterEstimate) FilterEstimate {
-
-	return (FilterEstimate)(v3)
-
-}
-
-func FromV4FilterEstimate(v4 smoothing4.FilterEstimate) FilterEstimate {
-
-	return (FilterEstimate)(v4)
-
-}
-
-type ActorStateLoader func(store adt.Store, root cid.Cid) (cbor.Marshaler, error)
-
-var ActorStateLoaders = make(map[cid.Cid]ActorStateLoader)
-
-func RegisterActorState(code cid.Cid, loader ActorStateLoader) {
-	ActorStateLoaders[code] = loader
-}
-
-func Load(store adt.Store, act *types.Actor) (cbor.Marshaler, error) {
-	loader, found := ActorStateLoaders[act.Code]
-	if !found {
-		return nil, xerrors.Errorf("unknown actor code %s", act.Code)
-	}
-	return loader(store, act.Head)
+	return minertypes.QAPowerForWeight(size, duration, dealWeight, verifiedWeight)
 }
 
 func ActorNameByCode(c cid.Cid) string {
+	if name, version, ok := actors.GetActorMetaByCode(c); ok {
+		return fmt.Sprintf("fil/%d/%s", version, name)
+	}
+
 	switch {
 
 	case builtin0.IsBuiltinActor(c):
@@ -114,12 +76,25 @@ func ActorNameByCode(c cid.Cid) string {
 	case builtin4.IsBuiltinActor(c):
 		return builtin4.ActorNameByCode(c)
 
+	case builtin5.IsBuiltinActor(c):
+		return builtin5.ActorNameByCode(c)
+
+	case builtin6.IsBuiltinActor(c):
+		return builtin6.ActorNameByCode(c)
+
+	case builtin7.IsBuiltinActor(c):
+		return builtin7.ActorNameByCode(c)
+
 	default:
 		return "<unknown>"
 	}
 }
 
 func IsBuiltinActor(c cid.Cid) bool {
+	_, _, ok := actors.GetActorMetaByCode(c)
+	if ok {
+		return true
+	}
 
 	if builtin0.IsBuiltinActor(c) {
 		return true
@@ -137,10 +112,26 @@ func IsBuiltinActor(c cid.Cid) bool {
 		return true
 	}
 
+	if builtin5.IsBuiltinActor(c) {
+		return true
+	}
+
+	if builtin6.IsBuiltinActor(c) {
+		return true
+	}
+
+	if builtin7.IsBuiltinActor(c) {
+		return true
+	}
+
 	return false
 }
 
 func IsAccountActor(c cid.Cid) bool {
+	name, _, ok := actors.GetActorMetaByCode(c)
+	if ok {
+		return name == "account"
+	}
 
 	if c == builtin0.AccountActorCodeID {
 		return true
@@ -158,10 +149,26 @@ func IsAccountActor(c cid.Cid) bool {
 		return true
 	}
 
+	if c == builtin5.AccountActorCodeID {
+		return true
+	}
+
+	if c == builtin6.AccountActorCodeID {
+		return true
+	}
+
+	if c == builtin7.AccountActorCodeID {
+		return true
+	}
+
 	return false
 }
 
 func IsStorageMinerActor(c cid.Cid) bool {
+	name, _, ok := actors.GetActorMetaByCode(c)
+	if ok {
+		return name == manifest.MinerKey
+	}
 
 	if c == builtin0.StorageMinerActorCodeID {
 		return true
@@ -179,10 +186,26 @@ func IsStorageMinerActor(c cid.Cid) bool {
 		return true
 	}
 
+	if c == builtin5.StorageMinerActorCodeID {
+		return true
+	}
+
+	if c == builtin6.StorageMinerActorCodeID {
+		return true
+	}
+
+	if c == builtin7.StorageMinerActorCodeID {
+		return true
+	}
+
 	return false
 }
 
 func IsMultisigActor(c cid.Cid) bool {
+	name, _, ok := actors.GetActorMetaByCode(c)
+	if ok {
+		return name == manifest.MultisigKey
+	}
 
 	if c == builtin0.MultisigActorCodeID {
 		return true
@@ -200,10 +223,26 @@ func IsMultisigActor(c cid.Cid) bool {
 		return true
 	}
 
+	if c == builtin5.MultisigActorCodeID {
+		return true
+	}
+
+	if c == builtin6.MultisigActorCodeID {
+		return true
+	}
+
+	if c == builtin7.MultisigActorCodeID {
+		return true
+	}
+
 	return false
 }
 
 func IsPaymentChannelActor(c cid.Cid) bool {
+	name, _, ok := actors.GetActorMetaByCode(c)
+	if ok {
+		return name == "paymentchannel"
+	}
 
 	if c == builtin0.PaymentChannelActorCodeID {
 		return true
@@ -219,6 +258,45 @@ func IsPaymentChannelActor(c cid.Cid) bool {
 
 	if c == builtin4.PaymentChannelActorCodeID {
 		return true
+	}
+
+	if c == builtin5.PaymentChannelActorCodeID {
+		return true
+	}
+
+	if c == builtin6.PaymentChannelActorCodeID {
+		return true
+	}
+
+	if c == builtin7.PaymentChannelActorCodeID {
+		return true
+	}
+
+	return false
+}
+
+func IsPlaceholderActor(c cid.Cid) bool {
+	name, _, ok := actors.GetActorMetaByCode(c)
+	if ok {
+		return name == manifest.PlaceholderKey
+	}
+
+	return false
+}
+
+func IsEvmActor(c cid.Cid) bool {
+	name, _, ok := actors.GetActorMetaByCode(c)
+	if ok {
+		return name == manifest.EvmKey
+	}
+
+	return false
+}
+
+func IsEthAccountActor(c cid.Cid) bool {
+	name, _, ok := actors.GetActorMetaByCode(c)
+	if ok {
+		return name == manifest.EthAccountKey
 	}
 
 	return false

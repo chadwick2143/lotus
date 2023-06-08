@@ -5,18 +5,15 @@ import (
 	"github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-graphsync"
 	exchange "github.com/ipfs/go-ipfs-exchange-interface"
-	format "github.com/ipfs/go-ipld-format"
 
-	"github.com/filecoin-project/go-fil-markets/storagemarket/impl/requestvalidation"
-	"github.com/filecoin-project/go-multistore"
-
-	datatransfer "github.com/filecoin-project/go-data-transfer"
+	datatransfer "github.com/filecoin-project/go-data-transfer/v2"
+	dtnet "github.com/filecoin-project/go-data-transfer/v2/network"
 	"github.com/filecoin-project/go-fil-markets/piecestore"
+	"github.com/filecoin-project/go-fil-markets/storagemarket/impl/requestvalidation"
 	"github.com/filecoin-project/go-statestore"
 
 	"github.com/filecoin-project/lotus/blockstore"
-	"github.com/filecoin-project/lotus/node/repo/importmgr"
-	"github.com/filecoin-project/lotus/node/repo/retrievalstoremgr"
+	"github.com/filecoin-project/lotus/node/repo/imports"
 )
 
 // MetadataDS stores metadata. By default it's namespaced under /metadata in
@@ -24,8 +21,11 @@ import (
 type MetadataDS datastore.Batching
 
 type (
-	// UniversalBlockstore is the cold blockstore.
+	// UniversalBlockstore is the universal blockstore backend.
 	UniversalBlockstore blockstore.Blockstore
+
+	// ColdBlockstore is the Cold blockstore abstraction for the splitstore
+	ColdBlockstore blockstore.Blockstore
 
 	// HotBlockstore is the Hot blockstore abstraction for the splitstore
 	HotBlockstore blockstore.Blockstore
@@ -68,13 +68,11 @@ type (
 type ChainBitswap exchange.Interface
 type ChainBlockService bserv.BlockService
 
-type ClientMultiDstore *multistore.MultiStore
-type ClientImportMgr *importmgr.Mgr
+type ClientImportMgr *imports.Manager
 type ClientBlockstore blockstore.BasicBlockstore
 type ClientDealStore *statestore.StateStore
 type ClientRequestValidator *requestvalidation.UnifiedRequestValidator
 type ClientDatastore datastore.Batching
-type ClientRetrievalStoreManager retrievalstoremgr.RetrievalStoreManager
 
 type Graphsync graphsync.GraphExchange
 
@@ -83,12 +81,12 @@ type ClientDataTransfer datatransfer.Manager
 
 type ProviderDealStore *statestore.StateStore
 type ProviderPieceStore piecestore.PieceStore
+
 type ProviderRequestValidator *requestvalidation.UnifiedRequestValidator
 
 // ProviderDataTransfer is a data transfer manager for the provider
 type ProviderDataTransfer datatransfer.Manager
-
-type StagingDAG format.DAGService
+type ProviderTransferNetwork dtnet.DataTransferNetwork
+type ProviderTransport datatransfer.Transport
 type StagingBlockstore blockstore.BasicBlockstore
 type StagingGraphsync graphsync.GraphExchange
-type StagingMultiDstore *multistore.MultiStore

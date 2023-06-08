@@ -1,3 +1,4 @@
+// stm: #unit
 package store_test
 
 import (
@@ -5,17 +6,23 @@ import (
 	"context"
 	"testing"
 
+	"github.com/ipfs/go-datastore"
+	syncds "github.com/ipfs/go-datastore/sync"
+	"github.com/stretchr/testify/assert"
+
 	"github.com/filecoin-project/go-state-types/abi"
+
 	"github.com/filecoin-project/lotus/blockstore"
+	"github.com/filecoin-project/lotus/chain/consensus/filcns"
 	"github.com/filecoin-project/lotus/chain/gen"
 	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types/mock"
-	datastore "github.com/ipfs/go-datastore"
-	syncds "github.com/ipfs/go-datastore/sync"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestIndexSeeks(t *testing.T) {
+	//stm: @CHAIN_STORE_IMPORT_001
+	//stm: @CHAIN_STORE_GET_TIPSET_BY_HEIGHT_001, @CHAIN_STORE_PUT_TIPSET_001, @CHAIN_STORE_SET_GENESIS_BLOCK_001
+	//stm: @CHAIN_STORE_CLOSE_001
 	cg, err := gen.NewGenerator()
 	if err != nil {
 		t.Fatal(err)
@@ -31,10 +38,10 @@ func TestIndexSeeks(t *testing.T) {
 	ctx := context.TODO()
 
 	nbs := blockstore.NewMemorySync()
-	cs := store.NewChainStore(nbs, nbs, syncds.MutexWrap(datastore.NewMapDatastore()), nil, nil)
+	cs := store.NewChainStore(nbs, nbs, syncds.MutexWrap(datastore.NewMapDatastore()), filcns.Weight, nil)
 	defer cs.Close() //nolint:errcheck
 
-	_, err = cs.Import(bytes.NewReader(gencar))
+	_, err = cs.Import(ctx, bytes.NewReader(gencar))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +50,7 @@ func TestIndexSeeks(t *testing.T) {
 	if err := cs.PutTipSet(ctx, mock.TipSet(gen)); err != nil {
 		t.Fatal(err)
 	}
-	assert.NoError(t, cs.SetGenesis(gen))
+	assert.NoError(t, cs.SetGenesis(ctx, gen))
 
 	// Put 113 blocks from genesis
 	for i := 0; i < 113; i++ {

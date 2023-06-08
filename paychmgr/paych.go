@@ -9,11 +9,12 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	cborutil "github.com/filecoin-project/go-cbor-util"
+	actorstypes "github.com/filecoin-project/go-state-types/actors"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/builtin/v8/paych"
 
 	"github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/chain/actors"
-	"github.com/filecoin-project/lotus/chain/actors/builtin/paych"
+	lpaych "github.com/filecoin-project/lotus/chain/actors/builtin/paych"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/lib/sigs"
 )
@@ -82,27 +83,31 @@ func newChannelAccessor(pm *Manager, from address.Address, to address.Address) *
 	}
 }
 
-func (ca *channelAccessor) messageBuilder(ctx context.Context, from address.Address) (paych.MessageBuilder, error) {
+func (ca *channelAccessor) messageBuilder(ctx context.Context, from address.Address) (lpaych.MessageBuilder, error) {
 	nwVersion, err := ca.api.StateNetworkVersion(ctx, types.EmptyTSK)
 	if err != nil {
 		return nil, err
 	}
 
-	return paych.Message(actors.VersionForNetwork(nwVersion), from), nil
+	av, err := actorstypes.VersionForNetwork(nwVersion)
+	if err != nil {
+		return nil, err
+	}
+	return lpaych.Message(av, from), nil
 }
 
-func (ca *channelAccessor) getChannelInfo(addr address.Address) (*ChannelInfo, error) {
+func (ca *channelAccessor) getChannelInfo(ctx context.Context, addr address.Address) (*ChannelInfo, error) {
 	ca.lk.Lock()
 	defer ca.lk.Unlock()
 
-	return ca.store.ByAddress(addr)
+	return ca.store.ByAddress(ctx, addr)
 }
 
-func (ca *channelAccessor) outboundActiveByFromTo(from, to address.Address) (*ChannelInfo, error) {
+func (ca *channelAccessor) outboundActiveByFromTo(ctx context.Context, from, to address.Address) (*ChannelInfo, error) {
 	ca.lk.Lock()
 	defer ca.lk.Unlock()
 
-	return ca.store.OutboundActiveByFromTo(from, to)
+	return ca.store.OutboundActiveByFromTo(ctx, ca.api, from, to)
 }
 
 // createVoucher creates a voucher with the given specification, setting its
@@ -114,7 +119,7 @@ func (ca *channelAccessor) createVoucher(ctx context.Context, ch address.Address
 	defer ca.lk.Unlock()
 
 	// Find the channel for the voucher
-	ci, err := ca.store.ByAddress(ch)
+	ci, err := ca.store.ByAddress(ctx, ch)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get channel info by address: %w", err)
 	}
@@ -168,16 +173,30 @@ func (ca *channelAccessor) nextNonceForLane(ci *ChannelInfo, lane uint64) uint64
 	return maxnonce + 1
 }
 
-func (ca *channelAccessor) checkVoucherValid(ctx context.Context, ch address.Address, sv *paych.SignedVoucher) (map[uint64]paych.LaneState, error) {
+func (ca *channelAccessor) checkVoucherValid(ctx context.Context, ch address.Address, sv *paych.SignedVoucher) (map[uint64]lpaych.LaneState, error) {
 	ca.lk.Lock()
 	defer ca.lk.Unlock()
 
 	return ca.checkVoucherValidUnlocked(ctx, ch, sv)
 }
 
-func (ca *channelAccessor) checkVoucherValidUnlocked(ctx context.Context, ch address.Address, sv *paych.SignedVoucher) (map[uint64]paych.LaneState, error) {
+func (ca *channelAccessor) checkVoucherValidUnlocked(ctx context.Context, ch address.Address, sv *paych.SignedVoucher) (map[uint64]lpaych.LaneState, error) {
 	if sv.ChannelAddr != ch {
 		return nil, xerrors.Errorf("voucher ChannelAddr doesn't match channel address, got %s, expected %s", sv.ChannelAddr, ch)
+	}
+
+	// check voucher is unlocked
+	if sv.Extra != nil {
+		return nil, xerrors.Errorf("voucher is Message Locked")
+	}
+	if sv.TimeLockMax != 0 {
+		return nil, xerrors.Errorf("voucher is Max Time Locked")
+	}
+	if sv.TimeLockMin != 0 {
+		return nil, xerrors.Errorf("voucher is Min Time Locked")
+	}
+	if len(sv.SecretHash) != 0 {
+		return nil, xerrors.Errorf("voucher is Hash Locked")
 	}
 
 	// Load payment channel actor state
@@ -192,7 +211,7 @@ func (ca *channelAccessor) checkVoucherValidUnlocked(ctx context.Context, ch add
 		return nil, err
 	}
 
-	from, err := ca.api.ResolveToKeyAddress(ctx, f, nil)
+	from, err := ca.api.ResolveToDeterministicAddress(ctx, f, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +230,7 @@ func (ca *channelAccessor) checkVoucherValidUnlocked(ctx context.Context, ch add
 	}
 
 	// Check the voucher against the highest known voucher nonce / value
-	laneStates, err := ca.laneState(pchState, ch)
+	laneStates, err := ca.laneState(ctx, pchState, ch)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +299,7 @@ func (ca *channelAccessor) checkVoucherSpendable(ctx context.Context, ch address
 		return false, err
 	}
 
-	ci, err := ca.store.ByAddress(ch)
+	ci, err := ca.store.ByAddress(ctx, ch)
 	if err != nil {
 		return false, err
 	}
@@ -333,7 +352,7 @@ func (ca *channelAccessor) addVoucher(ctx context.Context, ch address.Address, s
 }
 
 func (ca *channelAccessor) addVoucherUnlocked(ctx context.Context, ch address.Address, sv *paych.SignedVoucher, minDelta types.BigInt) (types.BigInt, error) {
-	ci, err := ca.store.ByAddress(ch)
+	ci, err := ca.store.ByAddress(ctx, ch)
 	if err != nil {
 		return types.BigInt{}, err
 	}
@@ -382,14 +401,14 @@ func (ca *channelAccessor) addVoucherUnlocked(ctx context.Context, ch address.Ad
 		ci.NextLane = sv.Lane + 1
 	}
 
-	return delta, ca.store.putChannelInfo(ci)
+	return delta, ca.store.putChannelInfo(ctx, ci)
 }
 
 func (ca *channelAccessor) submitVoucher(ctx context.Context, ch address.Address, sv *paych.SignedVoucher, secret []byte) (cid.Cid, error) {
 	ca.lk.Lock()
 	defer ca.lk.Unlock()
 
-	ci, err := ca.store.ByAddress(ch)
+	ci, err := ca.store.ByAddress(ctx, ch)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -435,7 +454,7 @@ func (ca *channelAccessor) submitVoucher(ctx context.Context, ch address.Address
 	}
 
 	// Mark the voucher and any lower-nonce vouchers as having been submitted
-	err = ca.store.MarkVoucherSubmitted(ci, sv)
+	err = ca.store.MarkVoucherSubmitted(ctx, ci, sv)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -443,11 +462,11 @@ func (ca *channelAccessor) submitVoucher(ctx context.Context, ch address.Address
 	return smsg.Cid(), nil
 }
 
-func (ca *channelAccessor) allocateLane(ch address.Address) (uint64, error) {
+func (ca *channelAccessor) allocateLane(ctx context.Context, ch address.Address) (uint64, error) {
 	ca.lk.Lock()
 	defer ca.lk.Unlock()
 
-	return ca.store.AllocateLane(ch)
+	return ca.store.AllocateLane(ctx, ch)
 }
 
 func (ca *channelAccessor) listVouchers(ctx context.Context, ch address.Address) ([]*VoucherInfo, error) {
@@ -456,12 +475,12 @@ func (ca *channelAccessor) listVouchers(ctx context.Context, ch address.Address)
 
 	// TODO: just having a passthrough method like this feels odd. Seems like
 	// there should be some filtering we're doing here
-	return ca.store.VouchersForPaych(ch)
+	return ca.store.VouchersForPaych(ctx, ch)
 }
 
 // laneState gets the LaneStates from chain, then applies all vouchers in
 // the data store over the chain state
-func (ca *channelAccessor) laneState(state paych.State, ch address.Address) (map[uint64]paych.LaneState, error) {
+func (ca *channelAccessor) laneState(ctx context.Context, state lpaych.State, ch address.Address) (map[uint64]lpaych.LaneState, error) {
 	// TODO: we probably want to call UpdateChannelState with all vouchers to be fully correct
 	//  (but technically dont't need to)
 
@@ -473,8 +492,8 @@ func (ca *channelAccessor) laneState(state paych.State, ch address.Address) (map
 	// Note: we use a map instead of an array to store laneStates because the
 	// client sets the lane ID (the index) and potentially they could use a
 	// very large index.
-	laneStates := make(map[uint64]paych.LaneState, laneCount)
-	err = state.ForEachLaneState(func(idx uint64, ls paych.LaneState) error {
+	laneStates := make(map[uint64]lpaych.LaneState, laneCount)
+	err = state.ForEachLaneState(func(idx uint64, ls lpaych.LaneState) error {
 		laneStates[idx] = ls
 		return nil
 	})
@@ -483,7 +502,7 @@ func (ca *channelAccessor) laneState(state paych.State, ch address.Address) (map
 	}
 
 	// Apply locally stored vouchers
-	vouchers, err := ca.store.VouchersForPaych(ch)
+	vouchers, err := ca.store.VouchersForPaych(ctx, ch)
 	if err != nil && err != ErrChannelNotTracked {
 		return nil, err
 	}
@@ -517,7 +536,7 @@ func (ca *channelAccessor) laneState(state paych.State, ch address.Address) (map
 }
 
 // Get the total redeemed amount across all lanes, after applying the voucher
-func (ca *channelAccessor) totalRedeemedWithVoucher(laneStates map[uint64]paych.LaneState, sv *paych.SignedVoucher) (big.Int, error) {
+func (ca *channelAccessor) totalRedeemedWithVoucher(laneStates map[uint64]lpaych.LaneState, sv *paych.SignedVoucher) (big.Int, error) {
 	// TODO: merges
 	if len(sv.Merges) != 0 {
 		return big.Int{}, xerrors.Errorf("dont currently support paych lane merges")
@@ -565,7 +584,7 @@ func (ca *channelAccessor) settle(ctx context.Context, ch address.Address) (cid.
 	ca.lk.Lock()
 	defer ca.lk.Unlock()
 
-	ci, err := ca.store.ByAddress(ch)
+	ci, err := ca.store.ByAddress(ctx, ch)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -584,7 +603,7 @@ func (ca *channelAccessor) settle(ctx context.Context, ch address.Address) (cid.
 	}
 
 	ci.Settling = true
-	err = ca.store.putChannelInfo(ci)
+	err = ca.store.putChannelInfo(ctx, ci)
 	if err != nil {
 		log.Errorf("Error marking channel as settled: %s", err)
 	}
@@ -596,7 +615,7 @@ func (ca *channelAccessor) collect(ctx context.Context, ch address.Address) (cid
 	ca.lk.Lock()
 	defer ca.lk.Unlock()
 
-	ci, err := ca.store.ByAddress(ch)
+	ci, err := ca.store.ByAddress(ctx, ch)
 	if err != nil {
 		return cid.Undef, err
 	}

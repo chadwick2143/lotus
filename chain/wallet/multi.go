@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"go.uber.org/fx"
+	"go.uber.org/multierr"
 	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
@@ -56,18 +57,18 @@ func nonNil(wallets ...getif) []api.Wallet {
 func (m MultiWallet) find(ctx context.Context, address address.Address, wallets ...getif) (api.Wallet, error) {
 	ws := nonNil(wallets...)
 
+	var merr error
+
 	for _, w := range ws {
 		have, err := w.WalletHas(ctx, address)
-		if err != nil {
-			return nil, err
-		}
+		merr = multierr.Append(merr, err)
 
-		if have {
+		if err == nil && have {
 			return w, nil
 		}
 	}
 
-	return nil, nil
+	return nil, merr
 }
 
 func (m MultiWallet) WalletNew(ctx context.Context, keyType types.KeyType) (address.Address, error) {
@@ -119,22 +120,22 @@ func (m MultiWallet) WalletSign(ctx context.Context, signer address.Address, toS
 		return nil, err
 	}
 	if w == nil {
-		return nil, xerrors.Errorf("key not found")
+		return nil, xerrors.Errorf("key not found for %s", signer)
 	}
 
 	return w.WalletSign(ctx, signer, toSign, meta)
 }
 
-func (m MultiWallet) WalletExport(ctx context.Context, address address.Address) (*types.KeyInfo, error) {
-	w, err := m.find(ctx, address, m.Remote, m.Local)
+func (m MultiWallet) WalletExport(ctx context.Context, addr address.Address) (*types.KeyInfo, error) {
+	w, err := m.find(ctx, addr, m.Remote, m.Local)
 	if err != nil {
 		return nil, err
 	}
 	if w == nil {
-		return nil, xerrors.Errorf("key not found")
+		return nil, xerrors.Errorf("key not found for %s", addr)
 	}
 
-	return w.WalletExport(ctx, address)
+	return w.WalletExport(ctx, addr)
 }
 
 func (m MultiWallet) WalletImport(ctx context.Context, info *types.KeyInfo) (address.Address, error) {

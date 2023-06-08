@@ -3,12 +3,14 @@ package store
 import (
 	"context"
 
-	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/go-state-types/big"
-	"github.com/filecoin-project/lotus/build"
-	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
+
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
+
+	"github.com/filecoin-project/lotus/build"
+	"github.com/filecoin-project/lotus/chain/types"
 )
 
 func ComputeNextBaseFee(baseFee types.BigInt, gasLimitUsed int64, noOfBlocks int, epoch abi.ChainEpoch) types.BigInt {
@@ -58,7 +60,7 @@ func (cs *ChainStore) ComputeBaseFee(ctx context.Context, ts *types.TipSet) (abi
 	seen := make(map[cid.Cid]struct{})
 
 	for _, b := range ts.Blocks() {
-		msg1, msg2, err := cs.MessagesForBlock(b)
+		msg1, msg2, err := cs.MessagesForBlock(ctx, b)
 		if err != nil {
 			return zero, xerrors.Errorf("error getting messages for: %s: %w", b.Cid(), err)
 		}

@@ -7,27 +7,35 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"go.uber.org/fx"
-
-	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/lotus/node/config"
+	"golang.org/x/xerrors"
 
 	"github.com/filecoin-project/go-address"
-	"github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/builtin"
+	"github.com/filecoin-project/go-state-types/builtin/v9/market"
+	"github.com/filecoin-project/go-state-types/exitcode"
 
+	"github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/actors"
-	"github.com/filecoin-project/lotus/chain/actors/builtin/market"
-	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
 	"github.com/filecoin-project/lotus/chain/types"
-	market2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/market"
-	"github.com/ipfs/go-cid"
-	"golang.org/x/xerrors"
+	"github.com/filecoin-project/lotus/node/config"
+	"github.com/filecoin-project/lotus/storage/ctladdr"
 )
 
 type dealPublisherAPI interface {
 	ChainHead(context.Context) (*types.TipSet, error)
 	MpoolPushMessage(ctx context.Context, msg *types.Message, spec *api.MessageSendSpec) (*types.SignedMessage, error)
-	StateMinerInfo(context.Context, address.Address, types.TipSetKey) (miner.MinerInfo, error)
+	StateMinerInfo(context.Context, address.Address, types.TipSetKey) (api.MinerInfo, error)
+
+	WalletBalance(context.Context, address.Address) (types.BigInt, error)
+	WalletHas(context.Context, address.Address) (bool, error)
+	StateAccountKey(context.Context, address.Address, types.TipSetKey) (address.Address, error)
+	StateLookupID(context.Context, address.Address, types.TipSetKey) (address.Address, error)
+	StateCall(context.Context, *types.Message, types.TipSetKey) (*api.InvocResult, error)
 }
 
 // DealPublisher batches deal publishing so that many deals can be included in
@@ -40,6 +48,7 @@ type dealPublisherAPI interface {
 // publish message with all deals in the queue.
 type DealPublisher struct {
 	api dealPublisherAPI
+	as  *ctladdr.AddressSelector
 
 	ctx      context.Context
 	Shutdown context.CancelFunc
@@ -48,16 +57,17 @@ type DealPublisher struct {
 	publishPeriod         time.Duration
 	publishSpec           *api.MessageSendSpec
 
-	lk                     sync.Mutex
-	pending                []*pendingDeal
-	cancelWaitForMoreDeals context.CancelFunc
-	publishPeriodStart     time.Time
+	lk                      sync.Mutex
+	pending                 []*pendingDeal
+	cancelWaitForMoreDeals  context.CancelFunc
+	publishPeriodStart      time.Time
+	startEpochSealingBuffer abi.ChainEpoch
 }
 
 // A deal that is queued to be published
 type pendingDeal struct {
 	ctx    context.Context
-	deal   market2.ClientDealProposal
+	deal   market.ClientDealProposal
 	Result chan publishResult
 }
 
@@ -67,7 +77,7 @@ type publishResult struct {
 	err    error
 }
 
-func newPendingDeal(ctx context.Context, deal market2.ClientDealProposal) *pendingDeal {
+func newPendingDeal(ctx context.Context, deal market.ClientDealProposal) *pendingDeal {
 	return &pendingDeal{
 		ctx:    ctx,
 		deal:   deal,
@@ -82,19 +92,21 @@ type PublishMsgConfig struct {
 	// The maximum number of deals to include in a single PublishStorageDeals
 	// message
 	MaxDealsPerMsg uint64
+	// Minimum start epoch buffer to give time for sealing of sector with deal
+	StartEpochSealingBuffer uint64
 }
 
 func NewDealPublisher(
 	feeConfig *config.MinerFeeConfig,
 	publishMsgCfg PublishMsgConfig,
-) func(lc fx.Lifecycle, full api.FullNode) *DealPublisher {
-	return func(lc fx.Lifecycle, full api.FullNode) *DealPublisher {
+) func(lc fx.Lifecycle, full api.FullNode, as *ctladdr.AddressSelector) *DealPublisher {
+	return func(lc fx.Lifecycle, full api.FullNode, as *ctladdr.AddressSelector) *DealPublisher {
 		maxFee := abi.NewTokenAmount(0)
 		if feeConfig != nil {
 			maxFee = abi.TokenAmount(feeConfig.MaxPublishDealsFee)
 		}
 		publishSpec := &api.MessageSendSpec{MaxFee: maxFee}
-		dp := newDealPublisher(full, publishMsgCfg, publishSpec)
+		dp := newDealPublisher(full, as, publishMsgCfg, publishSpec)
 		lc.Append(fx.Hook{
 			OnStop: func(ctx context.Context) error {
 				dp.Shutdown()
@@ -107,17 +119,20 @@ func NewDealPublisher(
 
 func newDealPublisher(
 	dpapi dealPublisherAPI,
+	as *ctladdr.AddressSelector,
 	publishMsgCfg PublishMsgConfig,
 	publishSpec *api.MessageSendSpec,
 ) *DealPublisher {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &DealPublisher{
-		api:                   dpapi,
-		ctx:                   ctx,
-		Shutdown:              cancel,
-		maxDealsPerPublishMsg: publishMsgCfg.MaxDealsPerMsg,
-		publishPeriod:         publishMsgCfg.Period,
-		publishSpec:           publishSpec,
+		api:                     dpapi,
+		as:                      as,
+		ctx:                     ctx,
+		Shutdown:                cancel,
+		maxDealsPerPublishMsg:   publishMsgCfg.MaxDealsPerMsg,
+		publishPeriod:           publishMsgCfg.Period,
+		startEpochSealingBuffer: abi.ChainEpoch(publishMsgCfg.StartEpochSealingBuffer),
+		publishSpec:             publishSpec,
 	}
 }
 
@@ -134,7 +149,7 @@ func (p *DealPublisher) PendingDeals() api.PendingDealInfo {
 		}
 	}
 
-	pending := make([]market2.ClientDealProposal, len(deals))
+	pending := make([]market.ClientDealProposal, len(deals))
 	for i, deal := range deals {
 		pending[i] = deal.deal
 	}
@@ -156,7 +171,7 @@ func (p *DealPublisher) ForcePublishPendingDeals() {
 	p.publishAllDeals()
 }
 
-func (p *DealPublisher) Publish(ctx context.Context, deal market2.ClientDealProposal) (cid.Cid, error) {
+func (p *DealPublisher) Publish(ctx context.Context, deal market.ClientDealProposal) (cid.Cid, error) {
 	pdeal := newPendingDeal(ctx, deal)
 
 	// Add the deal to the queue
@@ -189,14 +204,34 @@ func (p *DealPublisher) processNewDeal(pdeal *pendingDeal) {
 		return
 	}
 
+	pdealPropCid, err := pdeal.deal.Proposal.Cid()
+	if err != nil {
+		log.Warn("failed to calculate proposal CID for new pending Deal with piece cid %s", pdeal.deal.Proposal.PieceCID)
+		return
+	}
+
+	// Sanity check that new deal isn't already in the queue
+	for _, pd := range p.pending {
+		pdPropCid, err := pd.deal.Proposal.Cid()
+		if err != nil {
+			log.Warn("failed to calculate proposal CID for pending Deal already in publish queue with piece cid %s", pd.deal.Proposal.PieceCID)
+			return
+		}
+
+		if pdPropCid.Equals(pdealPropCid) {
+			log.Warn("tried to process new pending deal with piece CID %s that is already in publish queue; returning", pdeal.deal.Proposal.PieceCID)
+			return
+		}
+	}
+
 	// Add the new deal to the queue
 	p.pending = append(p.pending, pdeal)
 	log.Infof("add deal with piece CID %s to publish deals queue - %d deals in queue (max queue size %d)",
 		pdeal.deal.Proposal.PieceCID, len(p.pending), p.maxDealsPerPublishMsg)
 
-	// If the maximum number of deals per message has been reached,
-	// send a publish message
-	if uint64(len(p.pending)) >= p.maxDealsPerPublishMsg {
+	// If the maximum number of deals per message has been reached or we're not batching, send a
+	// publish message
+	if uint64(len(p.pending)) >= p.maxDealsPerPublishMsg || p.publishPeriod == 0 {
 		log.Infof("publish deals queue has reached max size of %d, publishing deals", p.maxDealsPerPublishMsg)
 		p.publishAllDeals()
 		return
@@ -209,7 +244,7 @@ func (p *DealPublisher) processNewDeal(pdeal *pendingDeal) {
 func (p *DealPublisher) waitForMoreDeals() {
 	// Check if we're already waiting for deals
 	if !p.publishPeriodStart.IsZero() {
-		elapsed := time.Since(p.publishPeriodStart)
+		elapsed := build.Clock.Since(p.publishPeriodStart)
 		log.Infof("%s elapsed of / %s until publish deals queue is published",
 			elapsed, p.publishPeriod)
 		return
@@ -218,11 +253,15 @@ func (p *DealPublisher) waitForMoreDeals() {
 	// Set a timeout to wait for more deals to arrive
 	log.Infof("waiting publish deals queue period of %s before publishing", p.publishPeriod)
 	ctx, cancel := context.WithCancel(p.ctx)
-	p.publishPeriodStart = time.Now()
+
+	// Create the timer _before_ taking the current time so publishPeriod+timeout is always >=
+	// the actual timer timeout.
+	timer := build.Clock.Timer(p.publishPeriod)
+
+	p.publishPeriodStart = build.Clock.Now()
 	p.cancelWaitForMoreDeals = cancel
 
 	go func() {
-		timer := time.NewTimer(p.publishPeriod)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -247,7 +286,7 @@ func (p *DealPublisher) publishAllDeals() {
 
 	// Filter out any deals that have been cancelled
 	p.filterCancelledDeals()
-	deals := p.pending[:]
+	deals := p.pending
 	p.pending = nil
 
 	// Send the publish message
@@ -276,12 +315,12 @@ func (p *DealPublisher) publishReady(ready []*pendingDeal) {
 
 	// Validate each deal to make sure it can be published
 	validated := make([]*pendingDeal, 0, len(ready))
-	deals := make([]market2.ClientDealProposal, 0, len(ready))
+	deals := make([]market.ClientDealProposal, 0, len(ready))
 	for _, pd := range ready {
 		// Validate the deal
 		if err := p.validateDeal(pd.deal); err != nil {
 			// Validation failed, complete immediately with an error
-			go onComplete(pd, cid.Undef, err)
+			go onComplete(pd, cid.Undef, xerrors.Errorf("publish validation failed: %w", err))
 			continue
 		}
 
@@ -300,21 +339,63 @@ func (p *DealPublisher) publishReady(ready []*pendingDeal) {
 
 // validateDeal checks that the deal proposal start epoch hasn't already
 // elapsed
-func (p *DealPublisher) validateDeal(deal market2.ClientDealProposal) error {
+func (p *DealPublisher) validateDeal(deal market.ClientDealProposal) error {
+	start := time.Now()
+
+	pcid, err := deal.Proposal.Cid()
+	if err != nil {
+		return xerrors.Errorf("computing proposal cid: %w", err)
+	}
+
 	head, err := p.api.ChainHead(p.ctx)
 	if err != nil {
 		return err
 	}
-	if head.Height() > deal.Proposal.StartEpoch {
+	if head.Height()+p.startEpochSealingBuffer > deal.Proposal.StartEpoch {
 		return xerrors.Errorf(
 			"cannot publish deal with piece CID %s: current epoch %d has passed deal proposal start epoch %d",
 			deal.Proposal.PieceCID, head.Height(), deal.Proposal.StartEpoch)
 	}
+
+	mi, err := p.api.StateMinerInfo(p.ctx, deal.Proposal.Provider, types.EmptyTSK)
+	if err != nil {
+		return xerrors.Errorf("getting provider info: %w", err)
+	}
+
+	params, err := actors.SerializeParams(&market.PublishStorageDealsParams{
+		Deals: []market.ClientDealProposal{deal},
+	})
+	if err != nil {
+		return xerrors.Errorf("serializing PublishStorageDeals params failed: %w", err)
+	}
+
+	addr, _, err := p.as.AddressFor(p.ctx, p.api, mi, api.DealPublishAddr, big.Zero(), big.Zero())
+	if err != nil {
+		return xerrors.Errorf("selecting address for publishing deals: %w", err)
+	}
+
+	res, err := p.api.StateCall(p.ctx, &types.Message{
+		To:     builtin.StorageMarketActorAddr,
+		From:   addr,
+		Value:  types.NewInt(0),
+		Method: builtin.MethodsMarket.PublishStorageDeals,
+		Params: params,
+	}, head.Key())
+	if err != nil {
+		return xerrors.Errorf("simulating deal publish message: %w", err)
+	}
+	if res.MsgRct.ExitCode != exitcode.Ok {
+		return xerrors.Errorf("simulating deal publish message: non-zero exitcode %s; message: %s", res.MsgRct.ExitCode, res.Error)
+	}
+
+	took := time.Now().Sub(start)
+	log.Infow("validating deal", "took", took, "proposal", pcid)
+
 	return nil
 }
 
 // Sends the publish message
-func (p *DealPublisher) publishDealProposals(deals []market2.ClientDealProposal) (cid.Cid, error) {
+func (p *DealPublisher) publishDealProposals(deals []market.ClientDealProposal) (cid.Cid, error) {
 	if len(deals) == 0 {
 		return cid.Undef, nil
 	}
@@ -337,7 +418,7 @@ func (p *DealPublisher) publishDealProposals(deals []market2.ClientDealProposal)
 		return cid.Undef, err
 	}
 
-	params, err := actors.SerializeParams(&market2.PublishStorageDealsParams{
+	params, err := actors.SerializeParams(&market.PublishStorageDealsParams{
 		Deals: deals,
 	})
 
@@ -345,11 +426,16 @@ func (p *DealPublisher) publishDealProposals(deals []market2.ClientDealProposal)
 		return cid.Undef, xerrors.Errorf("serializing PublishStorageDeals params failed: %w", err)
 	}
 
+	addr, _, err := p.as.AddressFor(p.ctx, p.api, mi, api.DealPublishAddr, big.Zero(), big.Zero())
+	if err != nil {
+		return cid.Undef, xerrors.Errorf("selecting address for publishing deals: %w", err)
+	}
+
 	smsg, err := p.api.MpoolPushMessage(p.ctx, &types.Message{
-		To:     market.Address,
-		From:   mi.Worker,
+		To:     builtin.StorageMarketActorAddr,
+		From:   addr,
 		Value:  types.NewInt(0),
-		Method: market.Methods.PublishStorageDeals,
+		Method: builtin.MethodsMarket.PublishStorageDeals,
 		Params: params,
 	}, p.publishSpec)
 
@@ -359,7 +445,7 @@ func (p *DealPublisher) publishDealProposals(deals []market2.ClientDealProposal)
 	return smsg.Cid(), nil
 }
 
-func pieceCids(deals []market2.ClientDealProposal) string {
+func pieceCids(deals []market.ClientDealProposal) string {
 	cids := make([]string, 0, len(deals))
 	for _, dl := range deals {
 		cids = append(cids, dl.Proposal.PieceCID.String())
@@ -369,12 +455,12 @@ func pieceCids(deals []market2.ClientDealProposal) string {
 
 // filter out deals that have been cancelled
 func (p *DealPublisher) filterCancelledDeals() {
-	i := 0
+	filtered := p.pending[:0]
 	for _, pd := range p.pending {
-		if pd.ctx.Err() == nil {
-			p.pending[i] = pd
-			i++
+		if pd.ctx.Err() != nil {
+			continue
 		}
+		filtered = append(filtered, pd)
 	}
-	p.pending = p.pending[:i]
+	p.pending = filtered
 }

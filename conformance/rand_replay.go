@@ -6,7 +6,6 @@ import (
 
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/crypto"
-
 	"github.com/filecoin-project/test-vectors/schema"
 
 	"github.com/filecoin-project/lotus/chain/vm"
@@ -57,6 +56,7 @@ func (r *ReplayingRand) GetChainRandomness(ctx context.Context, pers crypto.Doma
 	}
 
 	r.reporter.Logf("returning fallback chain randomness: dst=%d, epoch=%d, entropy=%x", pers, round, entropy)
+
 	return r.fallback.GetChainRandomness(ctx, pers, round, entropy)
 }
 
@@ -74,6 +74,6 @@ func (r *ReplayingRand) GetBeaconRandomness(ctx context.Context, pers crypto.Dom
 	}
 
 	r.reporter.Logf("returning fallback beacon randomness: dst=%d, epoch=%d, entropy=%x", pers, round, entropy)
-	return r.fallback.GetBeaconRandomness(ctx, pers, round, entropy)
 
+	return r.fallback.GetBeaconRandomness(ctx, pers, round, entropy)
 }

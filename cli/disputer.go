@@ -6,25 +6,21 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/filecoin-project/go-state-types/abi"
-
-	"github.com/filecoin-project/go-address"
-
-	"github.com/filecoin-project/lotus/chain/actors"
-
-	miner3 "github.com/filecoin-project/specs-actors/v3/actors/builtin/miner"
-
-	"github.com/filecoin-project/go-state-types/big"
-	lapi "github.com/filecoin-project/lotus/api"
-	"github.com/filecoin-project/lotus/chain/types"
-	builtin3 "github.com/filecoin-project/specs-actors/v3/actors/builtin"
+	logging "github.com/ipfs/go-log/v2"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
 
-	logging "github.com/ipfs/go-log/v2"
+	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/big"
+	builtin3 "github.com/filecoin-project/specs-actors/v3/actors/builtin"
+	miner3 "github.com/filecoin-project/specs-actors/v3/actors/builtin/miner"
 
+	lapi "github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/api/v0api"
+	"github.com/filecoin-project/lotus/chain/actors"
 	"github.com/filecoin-project/lotus/chain/store"
-	"github.com/urfave/cli/v2"
+	"github.com/filecoin-project/lotus/chain/types"
 )
 
 var disputeLog = logging.Logger("disputer")
@@ -62,8 +58,7 @@ var disputerMsgCmd = &cli.Command{
 	Flags:     []cli.Flag{},
 	Action: func(cctx *cli.Context) error {
 		if cctx.NArg() != 3 {
-			fmt.Println("Usage: dispute [minerAddress index postIndex]")
-			return nil
+			return IncorrectNumArgs(cctx)
 		}
 
 		ctx := ReqContext(cctx)
@@ -238,6 +233,9 @@ var disputerStartCmd = &cli.Command{
 
 			dpmsgs := make([]*types.Message, 0)
 
+			startTime := time.Now()
+			proofsChecked := uint64(0)
+
 			// TODO: Parallelizeable
 			for _, dl := range dls {
 				fullDeadlines, err := api.StateMinerDeadlines(ctx, dl.miner, tsk)
@@ -249,7 +247,10 @@ var disputerStartCmd = &cli.Command{
 					return xerrors.Errorf("deadline index %d not found in deadlines", dl.index)
 				}
 
-				ms, err := makeDisputeWindowedPosts(ctx, api, dl, fullDeadlines[dl.index].DisputableProofCount, fromAddr)
+				disputableProofs := fullDeadlines[dl.index].DisputableProofCount
+				proofsChecked += disputableProofs
+
+				ms, err := makeDisputeWindowedPosts(ctx, api, dl, disputableProofs, fromAddr)
 				if err != nil {
 					return xerrors.Errorf("failed to check for disputes: %w", err)
 				}
@@ -263,6 +264,8 @@ var disputerStartCmd = &cli.Command{
 
 				deadlineMap[dClose+Confidence] = append(deadlineMap[dClose+Confidence], *dl)
 			}
+
+			disputeLog.Infow("checked proofs", "count", proofsChecked, "duration", time.Since(startTime))
 
 			// TODO: Parallelizeable / can be integrated into the previous deadline-iterating for loop
 			for _, dpmsg := range dpmsgs {

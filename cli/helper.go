@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	ufcli "github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
@@ -31,7 +33,18 @@ func ShowHelp(cctx *ufcli.Context, err error) error {
 	return &PrintHelpErr{Err: err, Ctx: cctx}
 }
 
+func IncorrectNumArgs(cctx *ufcli.Context) error {
+	return ShowHelp(cctx, fmt.Errorf("incorrect number of arguments, got %d", cctx.NArg()))
+}
+
 func RunApp(app *ufcli.App) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-c
+		os.Exit(1)
+	}()
+
 	if err := app.Run(os.Args); err != nil {
 		if os.Getenv("LOTUS_DEV") != "" {
 			log.Warnf("%+v", err)

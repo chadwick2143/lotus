@@ -5,17 +5,19 @@ import (
 	"context"
 	"errors"
 
-	"github.com/filecoin-project/go-state-types/abi"
-	"github.com/filecoin-project/lotus/extern/sector-storage/ffiwrapper"
-	proof2 "github.com/filecoin-project/specs-actors/v2/actors/runtime/proof"
 	"github.com/ipfs/go-datastore"
 	"github.com/minio/blake2b-simd"
 	cbg "github.com/whyrusleeping/cbor-gen"
+
+	"github.com/filecoin-project/go-state-types/abi"
+	prooftypes "github.com/filecoin-project/go-state-types/proof"
+
+	"github.com/filecoin-project/lotus/storage/sealer/storiface"
 )
 
 type cachingVerifier struct {
 	ds      datastore.Datastore
-	backend ffiwrapper.Verifier
+	backend storiface.Verifier
 }
 
 const bufsize = 128
@@ -35,7 +37,7 @@ func (cv cachingVerifier) withCache(execute func() (bool, error), param cbg.CBOR
 	}
 	hash := hasher.Sum(nil)
 	key := datastore.NewKey(string(hash))
-	fromDs, err := cv.ds.Get(key)
+	fromDs, err := cv.ds.Get(context.Background(), key)
 	if err == nil {
 		switch fromDs[0] {
 		case 's':
@@ -65,7 +67,7 @@ func (cv cachingVerifier) withCache(execute func() (bool, error), param cbg.CBOR
 		}
 
 		if len(save) != 0 {
-			errSave := cv.ds.Put(key, save)
+			errSave := cv.ds.Put(context.Background(), key, save)
 			if errSave != nil {
 				log.Errorf("error saving result: %+v", errSave)
 			}
@@ -78,16 +80,17 @@ func (cv cachingVerifier) withCache(execute func() (bool, error), param cbg.CBOR
 	}
 }
 
-func (cv *cachingVerifier) VerifySeal(svi proof2.SealVerifyInfo) (bool, error) {
+func (cv *cachingVerifier) VerifySeal(svi prooftypes.SealVerifyInfo) (bool, error) {
 	return cv.withCache(func() (bool, error) {
 		return cv.backend.VerifySeal(svi)
 	}, &svi)
 }
 
-func (cv *cachingVerifier) VerifyWinningPoSt(ctx context.Context, info proof2.WinningPoStVerifyInfo) (bool, error) {
+func (cv *cachingVerifier) VerifyWinningPoSt(ctx context.Context, info prooftypes.WinningPoStVerifyInfo) (bool, error) {
 	return cv.backend.VerifyWinningPoSt(ctx, info)
 }
-func (cv *cachingVerifier) VerifyWindowPoSt(ctx context.Context, info proof2.WindowPoStVerifyInfo) (bool, error) {
+
+func (cv *cachingVerifier) VerifyWindowPoSt(ctx context.Context, info prooftypes.WindowPoStVerifyInfo) (bool, error) {
 	return cv.withCache(func() (bool, error) {
 		return cv.backend.VerifyWindowPoSt(ctx, info)
 	}, &info)
@@ -96,4 +99,12 @@ func (cv *cachingVerifier) GenerateWinningPoStSectorChallenge(ctx context.Contex
 	return cv.backend.GenerateWinningPoStSectorChallenge(ctx, proofType, a, rnd, u)
 }
 
-var _ ffiwrapper.Verifier = (*cachingVerifier)(nil)
+func (cv cachingVerifier) VerifyAggregateSeals(aggregate prooftypes.AggregateSealVerifyProofAndInfos) (bool, error) {
+	return cv.backend.VerifyAggregateSeals(aggregate)
+}
+
+func (cv cachingVerifier) VerifyReplicaUpdate(update prooftypes.ReplicaUpdateInfo) (bool, error) {
+	return cv.backend.VerifyReplicaUpdate(update)
+}
+
+var _ storiface.Verifier = (*cachingVerifier)(nil)
