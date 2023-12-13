@@ -1011,6 +1011,11 @@ var sectorsExtendCmd = &cli.Command{
 			Name:  "drop-claims",
 			Usage: "drop claims for sectors that can be extended, but only by dropping some of their verified power claims",
 		},
+		&cli.BoolFlag{
+			Name:     "all-sectors",
+			Usage:    "renews all sectors expiration to <new-expiration> if possible",
+			Required: false,
+		},
 		&cli.Int64Flag{
 			Name:  "tolerance",
 			Usage: "don't try to extend sectors by fewer than this number of epochs, defaults to 7 days",
@@ -1020,6 +1025,12 @@ var sectorsExtendCmd = &cli.Command{
 			Name:  "max-fee",
 			Usage: "use up to this amount of FIL for one message. pass this flag to avoid message congestion.",
 			Value: "0",
+		},
+		&cli.Float64Flag{
+			Name:     "max-base-fee",
+			Value:    1.0,
+			Usage:    "only submit extend message when base fee is lower than this amount of nanoFIL, pass this flag to save your gas",
+			Required: false,
 		},
 		&cli.Int64Flag{
 			Name:  "max-sectors",
@@ -1136,6 +1147,10 @@ var sectorsExtendCmd = &cli.Command{
 			if err != nil {
 				return err
 			}
+		} else if cctx.Bool("all-sectors") {
+			for _, si := range activeSet {
+				sectors = append(sectors, si.SectorNumber)
+			}
 		} else {
 			from := currEpoch + 120
 			to := currEpoch + 92160
@@ -1222,7 +1237,7 @@ var sectorsExtendCmd = &cli.Command{
 			} else {
 				added := false
 				for exp := range es {
-					if withinTolerance(newExp, exp) {
+					if withinTolerance(newExp, exp) && newExp >= exp && exp > si.Expiration {
 						es[exp] = append(es[exp], si.SectorNumber)
 						added = true
 						break
@@ -1367,13 +1382,14 @@ var sectorsExtendCmd = &cli.Command{
 			return nil
 		}
 
+		fmt.Printf("will send %d message to extend all sectors\n", len(params))
 		mi, err := fullApi.StateMinerInfo(ctx, maddr, types.EmptyTSK)
 		if err != nil {
 			return xerrors.Errorf("getting miner info: %w", err)
 		}
 
 		stotal := 0
-
+		maxBaseFee := abi.NewTokenAmount(int64(cctx.Float64("max-base-fee") * 1e9))
 		for i := range params {
 			scount := 0
 			for _, ext := range params[i].Extensions {
@@ -1406,6 +1422,22 @@ var sectorsExtendCmd = &cli.Command{
 				return xerrors.Errorf("serializing params: %w", err)
 			}
 
+			for {
+				head, err := fullApi.ChainHead(ctx)
+				if err != nil {
+					return err
+				}
+
+				curBaseFee := head.Blocks()[0].ParentBaseFee
+				if curBaseFee.LessThanEqual(maxBaseFee) {
+					break
+				}
+
+				fmt.Printf("%d/%d\t\t", i+1, len(params))
+				fmt.Println("current base fee", float64(curBaseFee.Int64())/1e9, "nanoFIL is higher than", cctx.Float64("max-base-fee"), "nanoFIL, just wait")
+				time.Sleep(30 * time.Second)
+			}
+
 			smsg, err := fullApi.MpoolPushMessage(ctx, &types.Message{
 				From:   mi.Worker,
 				To:     maddr,
@@ -1417,7 +1449,19 @@ var sectorsExtendCmd = &cli.Command{
 				return xerrors.Errorf("mpool push message: %w", err)
 			}
 
-			fmt.Println(smsg.Cid())
+			fmt.Printf("%d/%d\t\t%s\n", i+1, len(params), smsg.Cid())
+
+			// wait for it to get mined into a block
+			wait, err := fullApi.StateWaitMsg(ctx, smsg.Cid(), 1)
+			if err != nil {
+				return err
+			}
+
+			// check it executed successfully
+			if wait.Receipt.ExitCode != 0 {
+				fmt.Println("sectors extend failed!")
+				return err
+			}
 		}
 
 		fmt.Printf("%d sectors extended\n", stotal)
