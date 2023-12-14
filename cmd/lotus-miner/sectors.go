@@ -1294,81 +1294,92 @@ var sectorsExtendCmd = &cli.Command{
 		scount := 0
 
 		for l, exts := range extensions {
-			for newExp, numbers := range exts {
-				sectorsWithoutClaimsToExtend := bitfield.New()
-				var sectorsWithClaims []miner.SectorClaim
-				for _, sectorNumber := range numbers {
-					claimIdsToMaintain := make([]verifreg.ClaimId, 0)
-					claimIdsToDrop := make([]verifreg.ClaimId, 0)
-					cannotExtendSector := false
-					claimIds, ok := claimIdsBySector[sectorNumber]
-					// Nothing to check, add to ccSectors
-					if !ok {
-						sectorsWithoutClaimsToExtend.Set(uint64(sectorNumber))
+			for newExp, sectors := range exts {
+				for len(sectors) > 0 {
+					var numbers []abi.SectorNumber
+					count := len(sectors)
+					if count > addrSectors {
+						numbers = sectors[:addrSectors]
+						sectors = sectors[addrSectors:]
 					} else {
-						for _, claimId := range claimIds {
-							claim, ok := claimsMap[claimId]
-							if !ok {
-								return xerrors.Errorf("failed to find claim for claimId %d", claimId)
-							}
-							claimExpiration := claim.TermStart + claim.TermMax
-							// can be maintained in the extended sector
-							if claimExpiration > newExp {
-								claimIdsToMaintain = append(claimIdsToMaintain, claimId)
-							} else {
-								sectorInfo, ok := activeSectorsInfo[sectorNumber]
+						numbers = sectors[:count]
+						sectors = sectors[count:]
+					}
+
+					sectorsWithoutClaimsToExtend := bitfield.New()
+					var sectorsWithClaims []miner.SectorClaim
+					for _, sectorNumber := range numbers {
+						claimIdsToMaintain := make([]verifreg.ClaimId, 0)
+						claimIdsToDrop := make([]verifreg.ClaimId, 0)
+						cannotExtendSector := false
+						claimIds, ok := claimIdsBySector[sectorNumber]
+						// Nothing to check, add to ccSectors
+						if !ok {
+							sectorsWithoutClaimsToExtend.Set(uint64(sectorNumber))
+						} else {
+							for _, claimId := range claimIds {
+								claim, ok := claimsMap[claimId]
 								if !ok {
-									return xerrors.Errorf("failed to find sector in active sector set: %w", err)
+									return xerrors.Errorf("failed to find claim for claimId %d", claimId)
 								}
-								if !cctx.Bool("drop-claims") ||
-									// FIP-0045 requires the claim minimum duration to have passed
-									currEpoch <= (claim.TermStart+claim.TermMin) ||
-									// FIP-0045 requires the sector to be in its last 30 days of life
-									(currEpoch <= sectorInfo.Expiration-builtin.EndOfLifeClaimDropPeriod) {
-									fmt.Printf("skipping sector %d because claim %d does not live long enough \n", sectorNumber, claimId)
-									cannotExtendSector = true
-									break
-								}
+								claimExpiration := claim.TermStart + claim.TermMax
+								// can be maintained in the extended sector
+								if claimExpiration > newExp {
+									claimIdsToMaintain = append(claimIdsToMaintain, claimId)
+								} else {
+									sectorInfo, ok := activeSectorsInfo[sectorNumber]
+									if !ok {
+										return xerrors.Errorf("failed to find sector in active sector set: %w", err)
+									}
+									if !cctx.Bool("drop-claims") ||
+										// FIP-0045 requires the claim minimum duration to have passed
+										currEpoch <= (claim.TermStart+claim.TermMin) ||
+										// FIP-0045 requires the sector to be in its last 30 days of life
+										(currEpoch <= sectorInfo.Expiration-builtin.EndOfLifeClaimDropPeriod) {
+										fmt.Printf("skipping sector %d because claim %d does not live long enough \n", sectorNumber, claimId)
+										cannotExtendSector = true
+										break
+									}
 
-								claimIdsToDrop = append(claimIdsToDrop, claimId)
+									claimIdsToDrop = append(claimIdsToDrop, claimId)
+								}
 							}
-						}
-						if cannotExtendSector {
-							continue
-						}
+							if cannotExtendSector {
+								continue
+							}
 
-						if len(claimIdsToMaintain)+len(claimIdsToDrop) != 0 {
-							sectorsWithClaims = append(sectorsWithClaims, miner.SectorClaim{
-								SectorNumber:   sectorNumber,
-								MaintainClaims: claimIdsToMaintain,
-								DropClaims:     claimIdsToDrop,
-							})
+							if len(claimIdsToMaintain)+len(claimIdsToDrop) != 0 {
+								sectorsWithClaims = append(sectorsWithClaims, miner.SectorClaim{
+									SectorNumber:   sectorNumber,
+									MaintainClaims: claimIdsToMaintain,
+									DropClaims:     claimIdsToDrop,
+								})
+							}
 						}
 					}
+
+					sectorsWithoutClaimsCount, err := sectorsWithoutClaimsToExtend.Count()
+					if err != nil {
+						return xerrors.Errorf("failed to count cc sectors: %w", err)
+					}
+
+					sectorsInDecl := int(sectorsWithoutClaimsCount) + len(sectorsWithClaims)
+					scount += sectorsInDecl
+
+					if scount > addrSectors || len(p.Extensions) >= declMax {
+						params = append(params, p)
+						p = miner.ExtendSectorExpiration2Params{}
+						scount = sectorsInDecl
+					}
+
+					p.Extensions = append(p.Extensions, miner.ExpirationExtension2{
+						Deadline:          l.Deadline,
+						Partition:         l.Partition,
+						Sectors:           SectorNumsToBitfield(numbers),
+						SectorsWithClaims: sectorsWithClaims,
+						NewExpiration:     newExp,
+					})
 				}
-
-				sectorsWithoutClaimsCount, err := sectorsWithoutClaimsToExtend.Count()
-				if err != nil {
-					return xerrors.Errorf("failed to count cc sectors: %w", err)
-				}
-
-				sectorsInDecl := int(sectorsWithoutClaimsCount) + len(sectorsWithClaims)
-				scount += sectorsInDecl
-
-				if scount > addrSectors || len(p.Extensions) >= declMax {
-					params = append(params, p)
-					p = miner.ExtendSectorExpiration2Params{}
-					scount = sectorsInDecl
-				}
-
-				p.Extensions = append(p.Extensions, miner.ExpirationExtension2{
-					Deadline:          l.Deadline,
-					Partition:         l.Partition,
-					Sectors:           SectorNumsToBitfield(numbers),
-					SectorsWithClaims: sectorsWithClaims,
-					NewExpiration:     newExp,
-				})
-
 			}
 		}
 
