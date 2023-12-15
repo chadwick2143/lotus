@@ -84,6 +84,12 @@ butterflynet: build-devnets
 interopnet: GOFLAGS+=-tags=interopnet
 interopnet: build-devnets
 
+block-checker: $(BUILD_DEPS)
+	rm -f block-checker
+	$(GOCC) build $(GOFLAGS) -o block-checker ./cmd/block-checker
+.PHONY: block-checker
+BINS+=block-checker
+
 lotus: $(BUILD_DEPS)
 	rm -f lotus
 	$(GOCC) build $(GOFLAGS) -o lotus ./cmd/lotus
