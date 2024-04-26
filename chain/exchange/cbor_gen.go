@@ -489,7 +489,6 @@ func (t *CompactedMessagesCBOR) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 			}
-
 		}
 	}
 	// t.Secpk ([]*types.SignedMessage) (slice)
@@ -575,7 +574,6 @@ func (t *CompactedMessagesCBOR) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 			}
-
 		}
 	}
 	return nil
