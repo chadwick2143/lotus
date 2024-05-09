@@ -1030,11 +1030,11 @@ var sectorsExtendCmd = &cli.Command{
 			Usage: "don't try to extend sectors by fewer than this number of epochs, defaults to 7 days",
 			Value: 20160,
 		},
-		//&cli.StringFlag{
-		//	Name:  "max-fee",
-		//	Usage: "use up to this amount of FIL for one message. pass this flag to avoid message congestion.",
-		//	Value: "0",
-		//},
+		&cli.Float64Flag{
+			Name:  "bump-gas-ratio",
+			Usage: "bump estimated gas by ratio. pass this flag to avoid message congestion.",
+			Value: 2.0,
+		},
 		&cli.Float64Flag{
 			Name:     "max-base-fee",
 			Value:    1.0,
@@ -1051,12 +1051,7 @@ var sectorsExtendCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		//mf, err := types.ParseFIL(cctx.String("max-fee"))
-		//if err != nil {
-		//	return err
-		//}
-		//
-		//spec := &api.MessageSendSpec{MaxFee: abi.TokenAmount(mf)}
+		ratio := cctx.Float64("bump-gas-ratio")
 
 		fullApi, nCloser, err := lcli.GetFullNodeAPI(cctx)
 		if err != nil {
@@ -1469,6 +1464,8 @@ var sectorsExtendCmd = &cli.Command{
 			if err != nil {
 				return xerrors.Errorf("estimating gas: %w", err)
 			}
+			gasedMsg.GasFeeCap = abi.NewTokenAmount(int64(float64(gasedMsg.GasFeeCap.Int64()) * ratio))
+			gasedMsg.GasPremium = abi.NewTokenAmount(int64(float64(gasedMsg.GasPremium.Int64()) * ratio))
 
 			smsg, err := fullApi.MpoolPushMessage(ctx, gasedMsg, nil)
 			if err != nil {
