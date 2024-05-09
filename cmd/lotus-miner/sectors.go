@@ -1030,11 +1030,11 @@ var sectorsExtendCmd = &cli.Command{
 			Usage: "don't try to extend sectors by fewer than this number of epochs, defaults to 7 days",
 			Value: 20160,
 		},
-		&cli.StringFlag{
-			Name:  "max-fee",
-			Usage: "use up to this amount of FIL for one message. pass this flag to avoid message congestion.",
-			Value: "0",
-		},
+		//&cli.StringFlag{
+		//	Name:  "max-fee",
+		//	Usage: "use up to this amount of FIL for one message. pass this flag to avoid message congestion.",
+		//	Value: "0",
+		//},
 		&cli.Float64Flag{
 			Name:     "max-base-fee",
 			Value:    1.0,
@@ -1051,12 +1051,12 @@ var sectorsExtendCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		mf, err := types.ParseFIL(cctx.String("max-fee"))
-		if err != nil {
-			return err
-		}
-
-		spec := &api.MessageSendSpec{MaxFee: abi.TokenAmount(mf)}
+		//mf, err := types.ParseFIL(cctx.String("max-fee"))
+		//if err != nil {
+		//	return err
+		//}
+		//
+		//spec := &api.MessageSendSpec{MaxFee: abi.TokenAmount(mf)}
 
 		fullApi, nCloser, err := lcli.GetFullNodeAPI(cctx)
 		if err != nil {
@@ -1458,13 +1458,19 @@ var sectorsExtendCmd = &cli.Command{
 				time.Sleep(30 * time.Second)
 			}
 
-			smsg, err := fullApi.MpoolPushMessage(ctx, &types.Message{
+			msg := types.Message{
 				From:   mi.Worker,
 				To:     maddr,
 				Method: builtin.MethodsMiner.ExtendSectorExpiration2,
 				Value:  big.Zero(),
 				Params: sp,
-			}, spec)
+			}
+			gasedMsg, err := fullApi.GasEstimateMessageGas(ctx, &msg, nil, types.EmptyTSK)
+			if err != nil {
+				return xerrors.Errorf("estimating gas: %w", err)
+			}
+
+			smsg, err := fullApi.MpoolPushMessage(ctx, gasedMsg, nil)
 			if err != nil {
 				return xerrors.Errorf("mpool push message: %w", err)
 			}
