@@ -614,15 +614,26 @@ func SectorsExtendCmd(getActorAddress ActorAddressGetter) *cli.Command {
 				Name:  "drop-claims",
 				Usage: "drop claims for sectors that can be extended, but only by dropping some of their verified power claims",
 			},
+			&cli.BoolFlag{
+				Name:     "all-sectors",
+				Usage:    "renews all sectors expiration to <new-expiration> if possible",
+				Required: false,
+			},
 			&cli.Int64Flag{
 				Name:  "tolerance",
 				Usage: "don't try to extend sectors by fewer than this number of epochs, defaults to 7 days",
 				Value: 20160,
 			},
-			&cli.StringFlag{
-				Name:  "max-fee",
-				Usage: "use up to this amount of FIL for one message. pass this flag to avoid message congestion.",
-				Value: "0",
+			&cli.Float64Flag{
+				Name:  "bump-gas-ratio",
+				Usage: "bump estimated gas by ratio. pass this flag to avoid message congestion.",
+				Value: 2.0,
+			},
+			&cli.Float64Flag{
+				Name:     "max-base-fee",
+				Value:    1.0,
+				Usage:    "only submit extend message when base fee is lower than this amount of nanoFIL, pass this flag to save your gas",
+				Required: false,
 			},
 			&cli.Int64Flag{
 				Name:  "max-sectors",
@@ -634,12 +645,7 @@ func SectorsExtendCmd(getActorAddress ActorAddressGetter) *cli.Command {
 			},
 		},
 		Action: func(cctx *cli.Context) error {
-			mf, err := types.ParseFIL(cctx.String("max-fee"))
-			if err != nil {
-				return err
-			}
-
-			spec := &api.MessageSendSpec{MaxFee: abi.TokenAmount(mf)}
+			ratio := cctx.Float64("bump-gas-ratio")
 
 			fullApi, nCloser, err := lcli.GetFullNodeAPI(cctx)
 			if err != nil {
@@ -739,6 +745,10 @@ func SectorsExtendCmd(getActorAddress ActorAddressGetter) *cli.Command {
 				if err != nil {
 					return err
 				}
+			} else if cctx.Bool("all-sectors") {
+				for _, si := range activeSet {
+					sectors = append(sectors, si.SectorNumber)
+				}
 			} else {
 				from := currEpoch + 120
 				to := currEpoch + 92160
@@ -825,7 +835,7 @@ func SectorsExtendCmd(getActorAddress ActorAddressGetter) *cli.Command {
 				} else {
 					added := false
 					for exp := range es {
-						if withinTolerance(newExp, exp) {
+						if withinTolerance(newExp, exp) && newExp >= exp && exp > si.Expiration {
 							es[exp] = append(es[exp], si.SectorNumber)
 							added = true
 							break
@@ -882,85 +892,92 @@ func SectorsExtendCmd(getActorAddress ActorAddressGetter) *cli.Command {
 			scount := 0
 
 			for l, exts := range extensions {
-				for newExp, numbers := range exts {
-					sectorsWithoutClaimsToExtend := bitfield.New()
-					numbersToExtend := make([]abi.SectorNumber, 0, len(numbers))
-					var sectorsWithClaims []miner.SectorClaim
-					for _, sectorNumber := range numbers {
-						claimIdsToMaintain := make([]verifreg.ClaimId, 0)
-						claimIdsToDrop := make([]verifreg.ClaimId, 0)
-						cannotExtendSector := false
-						claimIds, ok := claimIdsBySector[sectorNumber]
-						// Nothing to check, add to ccSectors
-						if !ok {
-							sectorsWithoutClaimsToExtend.Set(uint64(sectorNumber))
-							numbersToExtend = append(numbersToExtend, sectorNumber)
+				for newExp, sectors := range exts {
+					for len(sectors) > 0 {
+						var numbers []abi.SectorNumber
+						count := len(sectors)
+						if count > addrSectors {
+							numbers = sectors[:addrSectors]
+							sectors = sectors[addrSectors:]
 						} else {
-							for _, claimId := range claimIds {
-								claim, ok := claimsMap[claimId]
-								if !ok {
-									return xerrors.Errorf("failed to find claim for claimId %d", claimId)
-								}
-								claimExpiration := claim.TermStart + claim.TermMax
-								// can be maintained in the extended sector
-								if claimExpiration > newExp {
-									claimIdsToMaintain = append(claimIdsToMaintain, claimId)
-								} else {
-									sectorInfo, ok := activeSectorsInfo[sectorNumber]
+							numbers = sectors[:count]
+							sectors = sectors[count:]
+						}
+
+						sectorsWithoutClaimsToExtend := bitfield.New()
+						var sectorsWithClaims []miner.SectorClaim
+						for _, sectorNumber := range numbers {
+							claimIdsToMaintain := make([]verifreg.ClaimId, 0)
+							claimIdsToDrop := make([]verifreg.ClaimId, 0)
+							cannotExtendSector := false
+							claimIds, ok := claimIdsBySector[sectorNumber]
+							// Nothing to check, add to ccSectors
+							if !ok {
+								sectorsWithoutClaimsToExtend.Set(uint64(sectorNumber))
+							} else {
+								for _, claimId := range claimIds {
+									claim, ok := claimsMap[claimId]
 									if !ok {
-										return xerrors.Errorf("failed to find sector in active sector set: %w", err)
+										return xerrors.Errorf("failed to find claim for claimId %d", claimId)
 									}
-									if !cctx.Bool("drop-claims") ||
-										// FIP-0045 requires the claim minimum duration to have passed
-										currEpoch <= (claim.TermStart+claim.TermMin) ||
-										// FIP-0045 requires the sector to be in its last 30 days of life
-										(currEpoch <= sectorInfo.Expiration-builtin.EndOfLifeClaimDropPeriod) {
-										fmt.Printf("skipping sector %d because claim %d (client f0%s, piece %s) does not live long enough \n", sectorNumber, claimId, claim.Client, claim.Data)
-										cannotExtendSector = true
-										break
-									}
+									claimExpiration := claim.TermStart + claim.TermMax
+									// can be maintained in the extended sector
+									if claimExpiration > newExp {
+										claimIdsToMaintain = append(claimIdsToMaintain, claimId)
+									} else {
+										sectorInfo, ok := activeSectorsInfo[sectorNumber]
+										if !ok {
+											return xerrors.Errorf("failed to find sector in active sector set: %w", err)
+										}
+										if !cctx.Bool("drop-claims") ||
+											// FIP-0045 requires the claim minimum duration to have passed
+											currEpoch <= (claim.TermStart+claim.TermMin) ||
+											// FIP-0045 requires the sector to be in its last 30 days of life
+											(currEpoch <= sectorInfo.Expiration-builtin.EndOfLifeClaimDropPeriod) {
+											fmt.Printf("skipping sector %d because claim %d does not live long enough \n", sectorNumber, claimId)
+											cannotExtendSector = true
+											break
+										}
 
-									claimIdsToDrop = append(claimIdsToDrop, claimId)
+										claimIdsToDrop = append(claimIdsToDrop, claimId)
+									}
+								}
+								if cannotExtendSector {
+									continue
 								}
 
-								numbersToExtend = append(numbersToExtend, sectorNumber)
-							}
-							if cannotExtendSector {
-								continue
-							}
-
-							if len(claimIdsToMaintain)+len(claimIdsToDrop) != 0 {
-								sectorsWithClaims = append(sectorsWithClaims, miner.SectorClaim{
-									SectorNumber:   sectorNumber,
-									MaintainClaims: claimIdsToMaintain,
-									DropClaims:     claimIdsToDrop,
-								})
+								if len(claimIdsToMaintain)+len(claimIdsToDrop) != 0 {
+									sectorsWithClaims = append(sectorsWithClaims, miner.SectorClaim{
+										SectorNumber:   sectorNumber,
+										MaintainClaims: claimIdsToMaintain,
+										DropClaims:     claimIdsToDrop,
+									})
+								}
 							}
 						}
+
+						sectorsWithoutClaimsCount, err := sectorsWithoutClaimsToExtend.Count()
+						if err != nil {
+							return xerrors.Errorf("failed to count cc sectors: %w", err)
+						}
+
+						sectorsInDecl := int(sectorsWithoutClaimsCount) + len(sectorsWithClaims)
+						scount += sectorsInDecl
+
+						if scount > addrSectors || len(p.Extensions) >= declMax {
+							params = append(params, p)
+							p = miner.ExtendSectorExpiration2Params{}
+							scount = sectorsInDecl
+						}
+
+						p.Extensions = append(p.Extensions, miner.ExpirationExtension2{
+							Deadline:          l.Deadline,
+							Partition:         l.Partition,
+							Sectors:           SectorNumsToBitfield(numbers),
+							SectorsWithClaims: sectorsWithClaims,
+							NewExpiration:     newExp,
+						})
 					}
-
-					sectorsWithoutClaimsCount, err := sectorsWithoutClaimsToExtend.Count()
-					if err != nil {
-						return xerrors.Errorf("failed to count cc sectors: %w", err)
-					}
-
-					sectorsInDecl := int(sectorsWithoutClaimsCount) + len(sectorsWithClaims)
-					scount += sectorsInDecl
-
-					if scount > addrSectors || len(p.Extensions) >= declMax {
-						params = append(params, p)
-						p = miner.ExtendSectorExpiration2Params{}
-						scount = sectorsInDecl
-					}
-
-					p.Extensions = append(p.Extensions, miner.ExpirationExtension2{
-						Deadline:          l.Deadline,
-						Partition:         l.Partition,
-						Sectors:           SectorNumsToBitfield(numbersToExtend),
-						SectorsWithClaims: sectorsWithClaims,
-						NewExpiration:     newExp,
-					})
-
 				}
 			}
 
@@ -974,13 +991,14 @@ func SectorsExtendCmd(getActorAddress ActorAddressGetter) *cli.Command {
 				return nil
 			}
 
+			fmt.Printf("will send %d message to extend all sectors\n", len(params))
 			mi, err := fullApi.StateMinerInfo(ctx, maddr, types.EmptyTSK)
 			if err != nil {
 				return xerrors.Errorf("getting miner info: %w", err)
 			}
 
 			stotal := 0
-
+			maxBaseFee := abi.NewTokenAmount(int64(cctx.Float64("max-base-fee") * 1e9))
 			for i := range params {
 				scount := 0
 				for _, ext := range params[i].Extensions {
@@ -992,19 +1010,6 @@ func SectorsExtendCmd(getActorAddress ActorAddressGetter) *cli.Command {
 				}
 				fmt.Printf("Extending %d sectors: ", scount)
 				stotal += scount
-
-				sp, aerr := actors.SerializeParams(&params[i])
-				if aerr != nil {
-					return xerrors.Errorf("serializing params: %w", err)
-				}
-
-				m := &types.Message{
-					From:   mi.Worker,
-					To:     maddr,
-					Method: builtin.MethodsMiner.ExtendSectorExpiration2,
-					Value:  big.Zero(),
-					Params: sp,
-				}
 
 				if !cctx.Bool("really-do-it") {
 					pp, err := NewPseudoExtendParams(&params[i])
@@ -1018,21 +1023,62 @@ func SectorsExtendCmd(getActorAddress ActorAddressGetter) *cli.Command {
 					}
 
 					fmt.Println("\n", string(data))
-
-					_, err = fullApi.GasEstimateMessageGas(ctx, m, spec, types.EmptyTSK)
-					if err != nil {
-						return xerrors.Errorf("simulating message execution: %w", err)
-					}
-
 					continue
 				}
 
-				smsg, err := fullApi.MpoolPushMessage(ctx, m, spec)
+				sp, aerr := actors.SerializeParams(&params[i])
+				if aerr != nil {
+					return xerrors.Errorf("serializing params: %w", err)
+				}
+
+				for {
+					head, err := fullApi.ChainHead(ctx)
+					if err != nil {
+						return err
+					}
+
+					curBaseFee := head.Blocks()[0].ParentBaseFee
+					if curBaseFee.LessThanEqual(maxBaseFee) {
+						break
+					}
+
+					fmt.Printf("%d/%d\t\t", i+1, len(params))
+					fmt.Println("current base fee", float64(curBaseFee.Int64())/1e9, "nanoFIL is higher than", cctx.Float64("max-base-fee"), "nanoFIL, just wait")
+					time.Sleep(30 * time.Second)
+				}
+
+				msg := types.Message{
+					From:   mi.Worker,
+					To:     maddr,
+					Method: builtin.MethodsMiner.ExtendSectorExpiration2,
+					Value:  big.Zero(),
+					Params: sp,
+				}
+				gasedMsg, err := fullApi.GasEstimateMessageGas(ctx, &msg, nil, types.EmptyTSK)
+				if err != nil {
+					return xerrors.Errorf("estimating gas: %w", err)
+				}
+				gasedMsg.GasFeeCap = abi.NewTokenAmount(int64(float64(gasedMsg.GasFeeCap.Int64()) * ratio))
+				gasedMsg.GasPremium = abi.NewTokenAmount(int64(float64(gasedMsg.GasPremium.Int64()) * ratio))
+
+				smsg, err := fullApi.MpoolPushMessage(ctx, gasedMsg, nil)
 				if err != nil {
 					return xerrors.Errorf("mpool push message: %w", err)
 				}
 
-				fmt.Println(smsg.Cid())
+				fmt.Printf("%d/%d\t\t%s\n", i+1, len(params), smsg.Cid())
+
+				// wait for it to get mined into a block
+				wait, err := fullApi.StateWaitMsg(ctx, smsg.Cid(), 1)
+				if err != nil {
+					return err
+				}
+
+				// check it executed successfully
+				if wait.Receipt.ExitCode != 0 {
+					fmt.Println("sectors extend failed!")
+					return err
+				}
 			}
 
 			fmt.Printf("%d sectors extended\n", stotal)
