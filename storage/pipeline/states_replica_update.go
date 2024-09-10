@@ -11,7 +11,6 @@ import (
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/builtin"
 	"github.com/filecoin-project/go-state-types/exitcode"
-	"github.com/filecoin-project/go-state-types/network"
 	"github.com/filecoin-project/go-statemachine"
 
 	"github.com/filecoin-project/lotus/api"
@@ -144,6 +143,13 @@ func (m *Sealing) handleSubmitReplicaUpdate(ctx statemachine.Context, sector Sec
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
 
+	log.Infow("submitting replica update",
+		"sector", sector.SectorNumber,
+		"weight", types.FIL(weightUpdate),
+		"totalPledge", types.FIL(collateral),
+		"initialPledge", types.FIL(onChainInfo.InitialPledge),
+		"toPledge", types.FIL(big.Sub(collateral, onChainInfo.InitialPledge)))
+
 	collateral = big.Sub(collateral, onChainInfo.InitialPledge)
 	if collateral.LessThan(big.Zero()) {
 		collateral = big.Zero()
@@ -169,69 +175,28 @@ func (m *Sealing) handleSubmitReplicaUpdate(ctx statemachine.Context, sector Sec
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
 
-	// figure out message type
-
-	nv, err := m.Api.StateNetworkVersion(ctx.Context(), ts.Key())
-	if err != nil {
-		log.Errorf("failed to get network version: %+v", err)
-	}
-
-	pams, deals, err := m.processPieces(ctx.Context(), sector, nv >= network.Version22)
+	pams, err := m.processPieces(ctx.Context(), sector)
 	if err != nil {
 		log.Errorf("failed to process pieces: %+v", err)
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
 
-	if len(pams) > 0 {
-		// PRU3
-
-		params := &miner.ProveReplicaUpdates3Params{
-			SectorUpdates: []miner.SectorUpdateManifest{
-				{
-					Sector:       sector.SectorNumber,
-					Deadline:     sl.Deadline,
-					Partition:    sl.Partition,
-					NewSealedCID: *sector.UpdateSealed,
-					Pieces:       pams,
-				},
-			},
-			SectorProofs:     [][]byte{sector.ReplicaUpdateProof},
-			UpdateProofsType: updateProof,
-			//AggregateProof
-			//AggregateProofType
-			RequireActivationSuccess:   cfg.RequireActivationSuccessUpdate,
-			RequireNotificationSuccess: cfg.RequireNotificationSuccessUpdate,
-		}
-
-		enc := new(bytes.Buffer)
-		if err := params.MarshalCBOR(enc); err != nil {
-			log.Errorf("failed to serialize update replica params: %w", err)
-			return ctx.Send(SectorSubmitReplicaUpdateFailed{})
-		}
-
-		mcid, err := sendMsg(ctx.Context(), m.Api, from, m.maddr, builtin.MethodsMiner.ProveReplicaUpdates3, collateral, big.Int(m.feeCfg.MaxCommitGasFee), enc.Bytes())
-		if err != nil {
-			log.Errorf("handleSubmitReplicaUpdate: error sending message: %+v", err)
-			return ctx.Send(SectorSubmitReplicaUpdateFailed{})
-		}
-
-		return ctx.Send(SectorReplicaUpdateSubmitted{Message: mcid})
-	}
-
-	// PRU2
-	params := &miner.ProveReplicaUpdatesParams2{
-		Updates: []miner.ReplicaUpdate2{
+	params := &miner.ProveReplicaUpdates3Params{
+		SectorUpdates: []miner.SectorUpdateManifest{
 			{
-				SectorID:             sector.SectorNumber,
-				Deadline:             sl.Deadline,
-				Partition:            sl.Partition,
-				NewSealedSectorCID:   *sector.UpdateSealed,
-				NewUnsealedSectorCID: *sector.UpdateUnsealed,
-				UpdateProofType:      updateProof,
-				ReplicaProof:         sector.ReplicaUpdateProof,
-				Deals:                deals,
+				Sector:       sector.SectorNumber,
+				Deadline:     sl.Deadline,
+				Partition:    sl.Partition,
+				NewSealedCID: *sector.UpdateSealed,
+				Pieces:       pams,
 			},
 		},
+		SectorProofs:     [][]byte{sector.ReplicaUpdateProof},
+		UpdateProofsType: updateProof,
+		//AggregateProof
+		//AggregateProofType
+		RequireActivationSuccess:   cfg.RequireActivationSuccessUpdate,
+		RequireNotificationSuccess: cfg.RequireNotificationSuccessUpdate,
 	}
 
 	enc := new(bytes.Buffer)
@@ -240,14 +205,13 @@ func (m *Sealing) handleSubmitReplicaUpdate(ctx statemachine.Context, sector Sec
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
 
-	mcid, err := sendMsg(ctx.Context(), m.Api, from, m.maddr, builtin.MethodsMiner.ProveReplicaUpdates2, collateral, big.Int(m.feeCfg.MaxCommitGasFee), enc.Bytes())
+	mcid, err := sendMsg(ctx.Context(), m.Api, from, m.maddr, builtin.MethodsMiner.ProveReplicaUpdates3, collateral, big.Int(m.feeCfg.MaxCommitGasFee), enc.Bytes())
 	if err != nil {
 		log.Errorf("handleSubmitReplicaUpdate: error sending message: %+v", err)
 		return ctx.Send(SectorSubmitReplicaUpdateFailed{})
 	}
 
 	return ctx.Send(SectorReplicaUpdateSubmitted{Message: mcid})
-
 }
 
 func (m *Sealing) handleWaitMutable(ctx statemachine.Context, sector SectorInfo) error {
